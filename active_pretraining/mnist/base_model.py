@@ -54,7 +54,7 @@ class MNISTBaseModel(BaseModel[FlowTensor]):
         cache_dir = os.path.expanduser("~/.cache/mnist_unet")
         os.makedirs(cache_dir, exist_ok=True)
         digits_str = "_".join(map(str, self.digits))
-        cache_path = os.path.join(cache_dir, f"{digits_str}_TEST.pt")
+        cache_path = os.path.join(cache_dir, f"{digits_str}.pt")
 
         # Load from cache if available, else train and save
         if os.path.exists(cache_path):

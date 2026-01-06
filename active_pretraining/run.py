@@ -35,7 +35,7 @@ def main(args):
         discretization_steps=args.num_steps,
         reward_scale=args.uncertainty_weight,
         ft_batch_size=args.ft_batch_size,
-        ft_epochs=args.ft_steps,
+        ft_epochs=args.ft_epochs,
         ft_lr=args.ft_lr,
         video_fps=args.video_fps,
     )
@@ -256,7 +256,7 @@ if __name__ == "__main__":
         help="Weight of the uncertainty reward for finding informative samples.",
     )
     parser.add_argument(
-        "--ft_steps",
+        "--ft_epochs",
         type=int,
         default=100,
         help="Number of optimization steps for fine-tuning the base model on informative samples.",
@@ -282,7 +282,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--video_fps",
         type=int,
-        default=10,
+        default=4,
         help="Frames per second for the output video.",
     )
 

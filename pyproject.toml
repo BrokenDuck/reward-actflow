@@ -25,9 +25,11 @@ active_pretraining = { path = ".", editable = true }
 matplotlib = "*"
 gpytorch = ">=1.14"
 diffusers = "==0.33.1"
+torch_scatter = "==2.1.2"
+torch_cluster = "==1.6.3"
 flowmol = { git = "https://github.com/cristianpjensen/FlowMol.git", rev = "8f4c98cbe68111e4e63480b250d925b6d960d3bc" }
 clip = { git = "https://github.com/openai/CLIP.git" }
-flowgym = "==1.6"
+flowgym = "==1.8"
 
 [tool.pixi.activation]
 env = { DGLBACKEND = "pytorch" }
