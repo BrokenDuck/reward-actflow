@@ -7,10 +7,11 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 import argparse
 from tqdm import trange
-import yaml
-import os
-import glob
 import imageio.v2 as imageio
+import yaml
+import glob
+import shutil
+import os
 
 from .gp import GPUncertaintyReward, FlowFeatureExtractor
 from .guidance import RewardGradient
@@ -37,6 +38,8 @@ def main(args):
         ft_batch_size=args.ft_batch_size,
         ft_epochs=args.ft_epochs,
         ft_lr=args.ft_lr,
+        eval_samples=args.eval_samples,
+        eval_every=args.eval_every,
         video_fps=args.video_fps,
     )
 
@@ -58,19 +61,22 @@ class ActivePretraining(Generic[D]):
         ft_batch_size: int = 32,
         ft_epochs: int = 10,
         ft_lr: float = 1e-4,
+        eval_samples: int = 0,
+        eval_every: int = 5,
         video_fps: int = 10,
     ):
         assert (
             feat_timestep > 0 and feat_timestep <= 1
         ), "feat_timestep must be in (0, 1]"
 
-        self.valid_fn = problem_setup.validity
+        self.problem = problem_setup
+
         self.dir = dir
-        self.visualize_fn = problem_setup.visualize_sample
-        self.sample_postprocess = problem_setup.sample_postprocess
         self.ft_batch_size = ft_batch_size
         self.ft_epochs = ft_epochs
         self.ft_lr = ft_lr
+        self.eval_samples = eval_samples
+        self.eval_every = eval_every
         self.video_fps = video_fps
 
         feat_extractor = FlowFeatureExtractor(
@@ -106,23 +112,35 @@ class ActivePretraining(Generic[D]):
         self.reward = reward
         self.env = env
 
-    def update_models(self, data: list[D], valids: list[torch.Tensor]) -> None:
+    def update_models(self, latents: list[D], valids: list[torch.Tensor]) -> None:
+        """Update the uncertainty estimator and fine-tune the base model on valid samples.
+
+        Parameters
+        ----------
+        latents : list[D]
+            List of latent samples obtained so far, where each element corresponds to the latents
+            from one iteration.
+
+        valids : list[torch.Tensor]
+            List of boolean tensors indicating the validity of samples obtained so far, where each
+            element corresponds to the valids from one iteration.
+        """
         # Update uncertainty model
-        self.reward.add_data(data[-1].to(self.env.device))
+        self.reward.add_data(latents[-1].to(self.env.device))
 
         # Do not fine-tune the base model on the first iteration's samples. Those are only used for
         # initializing the uncertainty model.
-        if len(data) <= 1:
+        if len(latents) <= 1:
             return
 
         # Extract valid samples
-        valid_data = []
-        for d, v in zip(data, valids):
+        valid_latents = []
+        for d, v in zip(latents, valids):
             for j in range(len(d)):
                 if v[j]:
-                    valid_data.append(d[j])
+                    valid_latents.append(d[j])
 
-        if len(valid_data) == 0:
+        if len(valid_latents) == 0:
             print("No valid data to fine-tune")
             return
 
@@ -130,7 +148,7 @@ class ActivePretraining(Generic[D]):
         opt = torch.optim.AdamW(self.env.base_model.parameters(), lr=self.ft_lr)
         train_base_model(
             self.env.base_model,
-            valid_data,
+            valid_latents,
             epochs=self.ft_epochs,
             batch_size=self.ft_batch_size,
             opt=opt,
@@ -141,29 +159,45 @@ class ActivePretraining(Generic[D]):
         self.reward.update_feats()
 
     @torch.no_grad()
-    def get_samples(self, num_samples: int, guided: bool = True) -> D:
+    def get_samples(self, num_samples: int, guided: bool = True) -> tuple[D, D]:
+        """Obtain samples from the environment, optionally using uncertainty guidance.
+
+        Parameters
+        ----------
+        num_samples : int
+            Number of samples to obtain.
+
+        guided : bool, default=True
+            Whether to use uncertainty guidance when obtaining samples.
+
+        Returns
+        -------
+        samples : D
+            The obtained samples in data space (e.g., pixel space for images).
+
+        latents : D
+            The obtained samples in latent space.
+        """
         # Use uncertainty gradients to guide the base model
         if guided:
             self.env.control_policy = RewardGradient(self.env)
 
-        samples = self.env.sample(num_samples, pbar=False)[1][-1]
-        samples = self.sample_postprocess(samples)
+        # Obtain the final samples (converted to data space) and latents (terminator of SDE)
+        # For validity, the samples are more important, but the latents are used for updating the
+        # models
+        output = self.env.sample(num_samples, pbar=False)
+        samples = output[0]
+        latents = output[1][-1]
+
+        latents = self.problem.latent_postprocess(latents)
 
         # Reset control policy
         self.env.control_policy = None
-        return samples
-
-    def _save_frame(self, fig: Figure, filename: str):
-        directory = os.path.join(self.dir, "frames")
-        os.makedirs(directory, exist_ok=True)
-        fig_path = os.path.join(directory, filename)
-        fig.savefig(fig_path, dpi=150)
-        plt.close(fig)
-        return fig_path
+        return samples, latents
 
     def _write_video(self) -> None:
         frame_dir = os.path.join(self.dir, "frames")
-        frame_paths = sorted(glob.glob(os.path.join(frame_dir, "iter_*.png")))
+        frame_paths = sorted(glob.glob(os.path.join(frame_dir, "*.png")))
         if len(frame_paths) == 0:
             print("No frames found; skipping video creation.")
             return
@@ -177,40 +211,101 @@ class ActivePretraining(Generic[D]):
 
         print(f"Wrote video to {video_path}")
 
+    def visualize_iter(self, samples: list[D], valids: list[torch.Tensor], iteration: int) -> None:
+        # Problem-dependent visualization
+        fig = self.problem.visualize_sample(self.env, samples, valids)
+
+        # Save frame
+        directory = os.path.join(self.dir, "frames")
+        os.makedirs(directory, exist_ok=True)
+        fig_path = os.path.join(directory, f"{iteration:04d}.png")
+        fig.savefig(fig_path, dpi=150)
+        plt.close(fig)
+
+    @torch.no_grad()
+    def eval_model(self, iteration: int) -> dict[str, float]:
+        n = self.eval_samples
+        bs = self.ft_batch_size
+
+        if n <= 0:
+            return dict()
+
+        samples: list[D] = []
+        valids: list[torch.Tensor] = []
+
+        # Obtain samples in batches
+        for i in range(0, n, bs):
+            bsz = min(bs, n - i)
+            batch_samples, _ = self.get_samples(bsz, guided=False)
+            batch_valids = self.problem.validity(batch_samples.to(self.env.device)).cpu()
+
+            samples.append(batch_samples)
+            valids.append(batch_valids)
+
+        # Save samples
+        directory = os.path.join(self.dir, "eval", f"{iteration:04d}")
+        os.makedirs(directory, exist_ok=True)
+
+        count = 0
+        for i, sample in enumerate(samples):
+            for j in range(len(sample)):
+                self.problem.save_sample(sample[j], os.path.join(directory, f"{count:04d}"))
+                count += 1
+
+        torch.save(
+            torch.cat(valids, dim=0),
+            os.path.join(directory, "valids.pt"),
+        )
+
+        # Compute and save evaluation metrics
+        metrics = self.problem.compute_metrics(samples, valids)
+        metrics["model_valid"] = torch.cat(valids, dim=0).float().mean().item()
+        with open(os.path.join(directory, "metrics.yaml"), "w") as f:
+            yaml.dump(metrics, f)
+
+        # Zip and delete folder
+        shutil.make_archive(directory, "zip", directory)
+        shutil.rmtree(directory)
+
+        return metrics
+
     def explore_loop(self, num_iterations: int, samples_per_iter: int):
-        all_data = [self.get_samples(samples_per_iter, guided=False)]
-        all_valids = [self.valid_fn(all_data[0].to(self.env.device)).cpu()]
-
-        self.update_models(all_data, all_valids)
-
-        fig = self.visualize_fn(self.env, all_data, all_valids)
-        self._save_frame(fig, "iter_0000.png")
+        metrics = dict()
+        all_samples: list[D] = []
+        all_latents: list[D] = []
+        all_valids: list[torch.Tensor] = []
 
         pbar = trange(num_iterations)
         for i in pbar:
             # Fetch data and evaluate their validity
-            data = self.get_samples(samples_per_iter, guided=True)
-            valids = self.valid_fn(data.to(self.env.device)).cpu()
-            all_data.append(data)
+            samples, latents = self.get_samples(samples_per_iter, guided=i > 0)
+            valids = self.problem.validity(samples.to(self.env.device)).cpu()
+
+            # Add to data buffer
+            all_samples.append(samples)
+            all_latents.append(latents)
             all_valids.append(valids)
 
-            # Update models and visualize current state
-            self.update_models(all_data, all_valids)
+            # Update models with full buffer
+            self.update_models(all_latents, all_valids)
 
-            fig = self.visualize_fn(self.env, all_data, all_valids)
-            self._save_frame(fig, f"iter_{i+1:04d}.png")
+            # Visualize and evaluate current model state
+            self.visualize_iter(all_samples, all_valids, i)
+            if i % self.eval_every == 0:
+                metrics = self.eval_model(i)
 
             # Logging
             pbar.set_postfix(
                 {
-                    "valid_frac": valids.float().mean().item(),
+                    **metrics,
+                    "biased_valid": valids.float().mean().item(),
                     "vram (gb)": torch.cuda.memory_allocated() * 1e-9,
                     "max_vram (gb)": torch.cuda.max_memory_allocated() * 1e-9,
                 }
             )
 
         self._write_video()
-        return all_data, all_valids
+        return all_samples, all_valids
 
 
 if __name__ == "__main__":
@@ -278,6 +373,18 @@ if __name__ == "__main__":
         type=int,
         default=100,
         help="Number of diffusion ODE/SDE discretization steps.",
+    )
+    parser.add_argument(
+        "--eval_samples",
+        type=int,
+        default=0,
+        help="Number of samples for computing metrics.",
+    )
+    parser.add_argument(
+        "--eval_every",
+        type=int,
+        default=5,
+        help="Frequency (in iterations) of computing metrics.",
     )
     parser.add_argument(
         "--video_fps",

@@ -32,7 +32,7 @@ class FlowFeatureExtractor(nn.Module, Generic[D]):
         base_model: BaseModel[D],
         layer: str,
         timestep: float,
-        postprocess: Optional[Callable[[Any], torch.Tensor]] = None,
+        postprocess: Optional[Callable[[D, Any], torch.Tensor]] = None,
     ):
         super().__init__()
         self.base_model = base_model
@@ -41,7 +41,7 @@ class FlowFeatureExtractor(nn.Module, Generic[D]):
         self._features = None
 
         if postprocess is None:
-            postprocess = lambda x: x
+            postprocess = lambda x, feat: feat
 
         self.postprocess = postprocess
 
@@ -68,7 +68,7 @@ class FlowFeatureExtractor(nn.Module, Generic[D]):
 
     def forward(self, x1: D, **kwargs: Any) -> torch.Tensor:
         if self.layer == "input":
-            return self.postprocess(x1)
+            return self.postprocess(x1, x1)
 
         self._features = None
 
@@ -84,7 +84,7 @@ class FlowFeatureExtractor(nn.Module, Generic[D]):
         if self._features is None:
             raise RuntimeError(f"No features captured from layer '{self.layer}'")
 
-        feats = self.postprocess(self._features)
+        feats = self.postprocess(x1, self._features)
         return feats / feats.norm(dim=-1, keepdim=True)
 
     def remove_hook(self):
@@ -109,6 +109,8 @@ class GPUncertaintyReward(Reward[D]):
     device : Optional[torch.device | str]
         Device on which to run the GP model.
     """
+
+    latent_space = True
 
     def __init__(
         self,

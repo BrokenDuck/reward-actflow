@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 import torch
 from flowgym import D, BaseModel, Environment
 from matplotlib.figure import Figure
+import os
 
 
 class ProblemSetup(ABC, Generic[D]):
@@ -45,12 +46,12 @@ class ProblemSetup(ABC, Generic[D]):
         """The name of the layer from which to extract features for the GP."""
         raise NotImplementedError
 
-    def sample_postprocess(self, x: D) -> D:
-        """Post-process samples generated from the base model.
+    def latent_postprocess(self, samples: D) -> D:
+        """Post-process latents generated from the base model.
 
         Parameters
         ----------
-        x : D
+        samples : D
             The sample to post-process.
 
         Returns
@@ -58,14 +59,17 @@ class ProblemSetup(ABC, Generic[D]):
         D
             The post-processed sample.
         """
-        return x
+        return samples
 
     @abstractmethod
-    def feature_postprocess(self, feats: Any) -> torch.Tensor:
+    def feature_postprocess(self, x: D, feats: Any) -> torch.Tensor:
         """Post-process features extracted from the base model.
 
         Parameters
         ----------
+        x : D
+            The input sample corresponding to the features.
+
         feats : Any
             The raw features extracted from the base model.
 
@@ -94,3 +98,36 @@ class ProblemSetup(ABC, Generic[D]):
             The validity tensors corresponding to the samples.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def save_sample(self, sample: D, filename: os.PathLike | str):
+        """Save a sample to the disk.
+        
+        Parameters
+        ----------
+        sample : D
+            The sample to save.
+
+        filename : os.PathLike | str
+            The file path where to save the sample, without extension. The method will add the
+            appropriate extension.
+        """
+        raise NotImplementedError
+
+    def compute_metrics(self, samples: list[D], valids: list[torch.Tensor]) -> dict[str, float]:
+        """Compute relevant metrics for the problem setup.
+        
+        Parameters
+        ----------
+        samples : list[D]
+            The samples for which to compute metrics.
+
+        valids : list[torch.Tensor]
+            The validity tensor corresponding to the samples.
+
+        Returns
+        -------
+        dict[str, float]
+            A dictionary of computed metrics.
+        """
+        return dict()
