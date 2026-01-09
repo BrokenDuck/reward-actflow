@@ -3,7 +3,6 @@ from typing import Generic
 import torch
 from flowgym import construct_env, D
 from flowgym.utils import train_base_model
-from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 import argparse
 from tqdm import trange
@@ -14,7 +13,8 @@ import shutil
 import os
 
 from .gp import GPUncertaintyReward, FlowFeatureExtractor
-from .guidance import RewardGradient
+from .dps import RewardGradient
+from .svdd import sample_svdd_pm
 from .problem_setup import ProblemSetup
 from .setups import setups as problem_setups
 
@@ -41,6 +41,7 @@ def main(args):
         eval_samples=args.eval_samples,
         eval_every=args.eval_every,
         video_fps=args.video_fps,
+        reward_opt_algo=args.reward_opt_algo,
     )
 
     active_pre.explore_loop(
@@ -64,6 +65,7 @@ class ActivePretraining(Generic[D]):
         eval_samples: int = 0,
         eval_every: int = 5,
         video_fps: int = 10,
+        reward_opt_algo: str = "dps",
     ):
         assert (
             feat_timestep > 0 and feat_timestep <= 1
@@ -78,6 +80,7 @@ class ActivePretraining(Generic[D]):
         self.eval_samples = eval_samples
         self.eval_every = eval_every
         self.video_fps = video_fps
+        self.reward_opt_algo = reward_opt_algo
 
         feat_extractor = FlowFeatureExtractor(
             problem_setup.base_model,
@@ -180,19 +183,23 @@ class ActivePretraining(Generic[D]):
         """
         # Use uncertainty gradients to guide the base model
         if guided:
-            self.env.control_policy = RewardGradient(self.env)
+            if self.reward_opt_algo == "svdd":
+                output = sample_svdd_pm(self.env, num_samples, m=4, alpha=1 / self.env.reward_scale, pbar=False)
+            elif self.reward_opt_algo == "dps":
+                self.env.control_policy = RewardGradient(self.env)
+                output = self.env.sample(num_samples, pbar=False)
+                self.env.control_policy = None
+            else:
+                raise ValueError(f"Unknown reward optimization algorithm: {self.reward_opt_algo}")
+        else:
+            output = self.env.sample(num_samples, pbar=False)
 
-        # Obtain the final samples (converted to data space) and latents (terminator of SDE)
-        # For validity, the samples are more important, but the latents are used for updating the
-        # models
-        output = self.env.sample(num_samples, pbar=False)
+        # Obtain the final samples (converted to data space) and latents (terminator of SDE). For
+        # validity, the samples are more important, but the latents are used for updating the models.
         samples = output[0]
         latents = output[1][-1]
-
         latents = self.problem.latent_postprocess(latents)
 
-        # Reset control policy
-        self.env.control_policy = None
         return samples, latents
 
     def _write_video(self) -> None:
@@ -391,6 +398,13 @@ if __name__ == "__main__":
         type=int,
         default=4,
         help="Frames per second for the output video.",
+    )
+    parser.add_argument(
+        "--reward_opt_algo",
+        type=str,
+        choices=["dps", "svdd"],
+        default="dps",
+        help="Optimization algorithm for obtaining samples with uncertainty reward.",
     )
 
     # MNIST-specific arguments

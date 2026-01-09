@@ -181,6 +181,7 @@ class GPModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, lengthscale=0.1):
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean()
+
         self.covar_module = gpytorch.kernels.RBFKernel()
         self.covar_module.lengthscale = lengthscale  # type: ignore
 

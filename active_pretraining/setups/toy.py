@@ -39,8 +39,8 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
     def feature_layer(self) -> str:
         return "input"
 
-    def feature_postprocess(self, x: FlowTensor, feats: FlowTensor) -> torch.Tensor:
-        return feats.data
+    def feature_postprocess(self, x: FlowTensor, feats: torch.Tensor) -> torch.Tensor:
+        return x.data
 
     @torch.no_grad()
     def visualize_sample(
