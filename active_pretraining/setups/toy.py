@@ -39,7 +39,7 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
     def feature_layer(self) -> str:
         return "input"
 
-    def feature_postprocess(self, x: FlowTensor, feats: torch.Tensor) -> torch.Tensor:
+    def feature_postprocess(self, x: FlowTensor, feats: FlowTensor) -> torch.Tensor:
         return x.data
 
     @torch.no_grad()
@@ -107,7 +107,6 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
         pass
 
 
-
 class ToyBaseModel(BaseModel[FlowTensor]):
     output_type = "velocity"
 
@@ -121,7 +120,7 @@ class ToyBaseModel(BaseModel[FlowTensor]):
         data_mean = torch.tensor([-1, 1.5])
         data = data_mean.unsqueeze(0) + 0.1 * torch.randn(512, 2)
         opt = torch.optim.Adam(self.parameters(), lr=1e-3)
-        train_base_model(self, [FlowTensor(data)], epochs=1000, batch_size=256, opt=opt, pbar=True)
+        train_base_model(self, [FlowTensor(data)], steps=2500, batch_size=256, opt=opt, pbar=True)
 
     @property
     def scheduler(self) -> Scheduler[FlowTensor]:

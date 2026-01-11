@@ -5,8 +5,8 @@ from flowgym import construct_env, D
 from flowgym.utils import train_base_model
 import matplotlib.pyplot as plt
 import argparse
-from tqdm import trange
 import imageio.v2 as imageio
+import logging
 import yaml
 import glob
 import shutil
@@ -19,12 +19,34 @@ from .problem_setup import ProblemSetup
 from .setups import setups as problem_setups
 
 
+logging.getLogger().setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+
 def main(args):
+    os.makedirs(args.dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    os.makedirs(args.dir, exist_ok=True)
+    # Save arguments
     with open(os.path.join(args.dir, "args.yaml"), "w") as f:
         yaml.dump(vars(args), f)
+
+    # Set up logging
+    logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        "[%(asctime)s] (%(levelname)s) %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler(os.path.join(args.dir, "log.txt"))
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
     problem_setup = problem_setups[args.problem_setup](vars(args), device=device)
 
@@ -36,12 +58,15 @@ def main(args):
         discretization_steps=args.num_steps,
         reward_scale=args.uncertainty_weight,
         ft_batch_size=args.ft_batch_size,
-        ft_epochs=args.ft_epochs,
+        ft_steps=args.ft_steps,
         ft_lr=args.ft_lr,
         eval_samples=args.eval_samples,
+        eval_batch_size=args.eval_batch_size,
         eval_every=args.eval_every,
         video_fps=args.video_fps,
         reward_opt_algo=args.reward_opt_algo,
+        no_uncertainty=args.no_uncertainty,
+        no_verifier=args.no_verifier,
     )
 
     active_pre.explore_loop(
@@ -60,12 +85,16 @@ class ActivePretraining(Generic[D]):
         discretization_steps: int = 100,
         reward_scale: float = 1.0,
         ft_batch_size: int = 32,
-        ft_epochs: int = 10,
+        ft_steps: int = 10,
         ft_lr: float = 1e-4,
+        ft_weight_decay: float = 0.0,
         eval_samples: int = 0,
+        eval_batch_size: int = 256,
         eval_every: int = 5,
         video_fps: int = 10,
         reward_opt_algo: str = "dps",
+        no_uncertainty: bool = False,
+        no_verifier: bool = False,
     ):
         assert (
             feat_timestep > 0 and feat_timestep <= 1
@@ -75,9 +104,11 @@ class ActivePretraining(Generic[D]):
 
         self.dir = dir
         self.ft_batch_size = ft_batch_size
-        self.ft_epochs = ft_epochs
+        self.ft_steps = ft_steps
         self.ft_lr = ft_lr
+        self.ft_weight_decay = ft_weight_decay
         self.eval_samples = eval_samples
+        self.eval_batch_size = eval_batch_size
         self.eval_every = eval_every
         self.video_fps = video_fps
         self.reward_opt_algo = reward_opt_algo
@@ -115,6 +146,16 @@ class ActivePretraining(Generic[D]):
         self.reward = reward
         self.env = env
 
+        # For baselines
+        self.no_uncertainty = no_uncertainty
+        self.no_verifier = no_verifier
+
+        self.opt = torch.optim.Adam(
+            self.base_model.parameters(),
+            lr=self.ft_lr,
+            weight_decay=self.ft_weight_decay,
+        )
+
     def update_models(self, latents: list[D], valids: list[torch.Tensor]) -> None:
         """Update the uncertainty estimator and fine-tune the base model on valid samples.
 
@@ -128,38 +169,46 @@ class ActivePretraining(Generic[D]):
             List of boolean tensors indicating the validity of samples obtained so far, where each
             element corresponds to the valids from one iteration.
         """
-        # Update uncertainty model
-        self.reward.add_data(latents[-1].to(self.env.device))
-
-        # Do not fine-tune the base model on the first iteration's samples. Those are only used for
+        # Do not fine-tune the base model on the first iteration's samples, which are used for
         # initializing the uncertainty model.
-        if len(latents) <= 1:
+        if len(latents) > 1:
+            # Extract valid samples
+            valid_latents = []
+            for d, v in zip(latents, valids):
+                for j in range(len(d)):
+                    if v[j]:
+                        valid_latents.append(d[j])
+
+            if len(valid_latents) == 0:
+                logging.warning("No valid data to fine-tune")
+                return
+
+            if self.no_verifier:
+                valid_latents = latents
+
+            logger.debug(f"fine-tuning the base model on {len(valid_latents)} samples")
+
+            # Fine-tune base model
+            self.opt = torch.optim.Adam(
+                self.base_model.parameters(),
+                lr=self.ft_lr,
+                weight_decay=self.ft_weight_decay,
+            )
+            train_base_model(
+                self.env.base_model,
+                valid_latents,
+                steps=self.ft_steps,
+                batch_size=self.ft_batch_size,
+                opt=self.opt,
+                pbar=False,
+            )
+
+        if self.no_uncertainty:
             return
 
-        # Extract valid samples
-        valid_latents = []
-        for d, v in zip(latents, valids):
-            for j in range(len(d)):
-                if v[j]:
-                    valid_latents.append(d[j])
-
-        if len(valid_latents) == 0:
-            print("No valid data to fine-tune")
-            return
-
-        # Fine-tune base model
-        opt = torch.optim.AdamW(self.env.base_model.parameters(), lr=self.ft_lr)
-        train_base_model(
-            self.env.base_model,
-            valid_latents,
-            epochs=self.ft_epochs,
-            batch_size=self.ft_batch_size,
-            opt=opt,
-            pbar=False,
-        )
-
-        # Update features of the uncertainty model after fine-tuning the base model
-        self.reward.update_feats()
+        # Update uncertainty model
+        logger.debug("updating uncertainty model")
+        self.reward.set_data(latents, valids)
 
     @torch.no_grad()
     def get_samples(self, num_samples: int, guided: bool = True) -> tuple[D, D]:
@@ -181,6 +230,11 @@ class ActivePretraining(Generic[D]):
         latents : D
             The obtained samples in latent space.
         """
+        if self.no_uncertainty:
+            guided = False
+
+        logger.debug(f"obtaining {num_samples} samples (guided={guided})")
+
         # Use uncertainty gradients to guide the base model
         if guided:
             if self.reward_opt_algo == "svdd":
@@ -203,10 +257,12 @@ class ActivePretraining(Generic[D]):
         return samples, latents
 
     def _write_video(self) -> None:
+        logger.debug("writing video")
+
         frame_dir = os.path.join(self.dir, "frames")
         frame_paths = sorted(glob.glob(os.path.join(frame_dir, "*.png")))
         if len(frame_paths) == 0:
-            print("No frames found; skipping video creation.")
+            logging.warning("No frames found; skipping video creation.")
             return
 
         video_path = os.path.join(self.dir, "video.mp4")
@@ -216,9 +272,11 @@ class ActivePretraining(Generic[D]):
             for frame_path in frame_paths:
                 writer.append_data(imageio.imread(frame_path))  # type: ignore
 
-        print(f"Wrote video to {video_path}")
+        logger.info(f"Wrote video to {video_path}")
 
     def visualize_iter(self, samples: list[D], valids: list[torch.Tensor], iteration: int) -> None:
+        logger.debug(f"visualizing iteration {iteration}")
+
         # Problem-dependent visualization
         fig = self.problem.visualize_sample(self.env, samples, valids)
 
@@ -232,7 +290,9 @@ class ActivePretraining(Generic[D]):
     @torch.no_grad()
     def eval_model(self, iteration: int) -> dict[str, float]:
         n = self.eval_samples
-        bs = self.ft_batch_size
+        bs = self.eval_batch_size
+
+        logger.debug(f"evaluating model at iteration {iteration} (n={n}, bs={bs})")
 
         if n <= 0:
             return dict()
@@ -282,8 +342,13 @@ class ActivePretraining(Generic[D]):
         all_latents: list[D] = []
         all_valids: list[torch.Tensor] = []
 
-        pbar = trange(num_iterations)
-        for i in pbar:
+        for i in range(num_iterations):
+            # Evaluate current model state
+            if i % self.eval_every == 0:
+                metrics = self.eval_model(i)
+            else:
+                metrics = dict()
+
             # Fetch data and evaluate their validity
             samples, latents = self.get_samples(samples_per_iter, guided=i > 0)
             valids = self.problem.validity(samples.to(self.env.device)).cpu()
@@ -293,23 +358,17 @@ class ActivePretraining(Generic[D]):
             all_latents.append(latents)
             all_valids.append(valids)
 
-            # Update models with full buffer
-            self.update_models(all_latents, all_valids)
-
-            # Visualize and evaluate current model state
+            # Visualize current state
             self.visualize_iter(all_samples, all_valids, i)
-            if i % self.eval_every == 0:
-                metrics = self.eval_model(i)
 
             # Logging
-            pbar.set_postfix(
-                {
-                    **metrics,
-                    "biased_valid": valids.float().mean().item(),
-                    "vram (gb)": torch.cuda.memory_allocated() * 1e-9,
-                    "max_vram (gb)": torch.cuda.max_memory_allocated() * 1e-9,
-                }
-            )
+            metrics["biased_valid"] = valids.float().mean().item()
+            metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
+
+            logger.info(f"(iter={i:05d}) {f', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+
+            # Update models with full buffer
+            self.update_models(all_latents, all_valids)
 
         self._write_video()
         return all_samples, all_valids
@@ -327,6 +386,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dir", type=str, required=True, help="Directory to save outputs."
     )
+    parser.add_argument(
+        "--no_uncertainty",
+        action="store_true",
+        help="Whether to disable uncertainty-guided sampling.",
+    )
+    parser.add_argument(
+        "--no_verifier",
+        action="store_true",
+        help="Whether to filter out invalid samples when fine-tuning.",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Whether to enable verbose logging.")
     parser.add_argument(
         "--feature_timestep",
         type=float,
@@ -358,9 +428,9 @@ if __name__ == "__main__":
         help="Weight of the uncertainty reward for finding informative samples.",
     )
     parser.add_argument(
-        "--ft_epochs",
+        "--ft_steps",
         type=int,
-        default=100,
+        default=500,
         help="Number of optimization steps for fine-tuning the base model on informative samples.",
     )
     parser.add_argument(
@@ -376,6 +446,12 @@ if __name__ == "__main__":
         help="Learning rate for fine-tuning the base model on informative samples.",
     )
     parser.add_argument(
+        "--ft_weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for fine-tuning the base model on informative samples.",
+    )
+    parser.add_argument(
         "--num_steps",
         type=int,
         default=100,
@@ -386,6 +462,12 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Number of samples for computing metrics.",
+    )
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=256,
+        help="Batch size for evaluation sampling.",
     )
     parser.add_argument(
         "--eval_every",

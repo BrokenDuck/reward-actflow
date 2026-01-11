@@ -131,30 +131,18 @@ class GPUncertaintyReward(Reward[D]):
         model.eval()
         likelihood.eval()
 
-        self.data = []
         self.feats = feats
         self.feat_extractor = feat_extractor
         self.likelihood = likelihood
         self.model = model
         self.device = device
 
-    def add_data(self, new_data: D):
-        new_data.to(self.device)
-        self.data.append(new_data)
-        with torch.no_grad():
-            new_feats = self.feat_extractor(new_data)
-
-        self.feats = torch.cat([self.feats, new_feats], dim=0)
-
-        labels = torch.zeros(self.feats.shape[0], device=self.device)
-        self.model.set_train_data(self.feats, labels, strict=False)
-
-    def update_feats(self):
-        """Re-compute all features."""
+    def set_data(self, data: list[D], valids: list[torch.Tensor]):
+        """Set data by computing features and storing."""
         feats = []
         with torch.no_grad():
-            for data_points in self.data:
-                feat = self.feat_extractor(data_points).detach()
+            for x in data:
+                feat = self.feat_extractor(x.to(self.device)).detach()
                 feats.append(feat)
 
         self.feats = torch.cat(feats, dim=0)
@@ -181,9 +169,9 @@ class GPModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, lengthscale=0.1):
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean()
-
-        self.covar_module = gpytorch.kernels.RBFKernel()
-        self.covar_module.lengthscale = lengthscale  # type: ignore
+        kernel = gpytorch.kernels.RBFKernel()
+        kernel.lengthscale = lengthscale  # type: ignore
+        self.covar_module = kernel
 
     def forward(self, x):
         mean = self.mean_module(x)

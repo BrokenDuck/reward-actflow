@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import dgl
 from rdkit import Chem, RDLogger
-from rdkit.Chem import Draw
+from rdkit.Chem import Draw, AllChem
 from flowmol.analysis.molecule_builder import SampledMolecule
 from flowgym import  BaseModel, Environment
 from flowgym.molecules import FlowGraph, QM9BaseModel
@@ -74,18 +74,32 @@ class QM9ProblemSetup(ProblemSetup[FlowGraph]):
         return graph_sums / graph_counts.unsqueeze(1)
 
     def latent_postprocess(self, samples: FlowGraph) -> FlowGraph:
-        # Set categorical features to be one-hot vectors over dim -1
-        g = samples.graph.clone()
+        graph = samples.graph.clone()
 
         def _discretize(x):
             # argmax finds the class index, one_hot creates the vector
             # type_as ensures we match the original float precision and device
             return F.one_hot(x.argmax(dim=-1), num_classes=x.shape[-1]).type_as(x)
 
-        g.ndata["a_t"] = _discretize(g.ndata["a_t"])
-        g.ndata["c_t"] = _discretize(g.ndata["c_t"])
-        g.edata["e_t"] = _discretize(g.edata["e_t"])
-        return FlowGraph(g, samples.ue_mask, samples.n_idx, samples.e_idx)
+        # Set categorical features to be one-hot vectors over dim -1
+        graph.ndata["a_t"] = _discretize(graph.ndata["a_t"])
+        graph.ndata["c_t"] = _discretize(graph.ndata["c_t"])
+        graph.edata["e_t"] = _discretize(graph.edata["e_t"])
+
+        # Relax the geometry, otherwise the structures will become increasingly distorted
+        graph.edata["ue_mask"] = samples.ue_mask
+        graphs = []
+        for g in dgl.unbatch(graph):
+            g = relax_positions(g, self.base_model.model.atom_type_map)
+            graphs.append(g)
+
+        graph = dgl.batch(graphs)
+
+        # Remove center of mass
+        init_coms = dgl.readout_nodes(graph, feat="x_t", op="mean")
+        graph.ndata["x_t"] = graph.ndata["x_t"] - init_coms[samples.n_idx]
+
+        return FlowGraph(graph, samples.ue_mask, samples.n_idx, samples.e_idx)
 
     def _to_mols(self, samples: FlowGraph) -> list[Chem.Mol]:
         mols = []
@@ -155,6 +169,29 @@ class QM9ProblemSetup(ProblemSetup[FlowGraph]):
         vendi_score = vendi.score_K(K)
 
         return { "vendi": float(vendi_score) }
+
+
+def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str]) -> dgl.DGLGraph:
+    g_relaxed = g.clone()
+
+    g_relaxed.ndata["x_1"] = g_relaxed.ndata["x_t"]
+    g_relaxed.ndata["a_1"] = g_relaxed.ndata["a_t"]
+    g_relaxed.ndata["c_1"] = g_relaxed.ndata["c_t"]
+    g_relaxed.edata["e_1"] = g_relaxed.edata["e_t"]
+
+    mol = SampledMolecule(g_relaxed, atom_type_map).rdkit_mol
+    if mol is None:
+        return g
+
+    mol = validate_mol(mol)
+    if mol is None:
+        return g
+
+    AllChem.MMFFOptimizeMolecule(mol)  # type: ignore
+    positions = torch.from_numpy(mol.GetConformer().GetPositions())
+    g.ndata["x_t"] = positions.to(g.device).type_as(g.ndata["x_t"])  # type: ignore
+
+    return g
 
 
 def validate_mol(mol: Chem.Mol) -> Optional[Chem.Mol]:
