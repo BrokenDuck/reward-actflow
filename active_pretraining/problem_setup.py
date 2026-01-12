@@ -115,7 +115,7 @@ class ProblemSetup(ABC, Generic[D]):
         raise NotImplementedError
 
     def compute_metrics(self, samples: list[D], valids: list[torch.Tensor]) -> dict[str, float]:
-        """Compute relevant metrics for the problem setup.
+        """Compute relevant (global) metrics for the problem setup.
         
         Parameters
         ----------
@@ -129,5 +129,20 @@ class ProblemSetup(ABC, Generic[D]):
         -------
         dict[str, float]
             A dictionary of computed metrics.
+        """
+        return dict()
+
+    def compute_sample_metrics(self, samples_dir: str) -> dict[str, dict[str, float]]:
+        """Compute relevant metrics on individual samples.
+
+        Parameters
+        ----------
+        samples_dir : str
+            Directory containing samples saved using `save_sample`.
+
+        Returns
+        -------
+        dict[str, dict[str, float]]
+            A dictionary mapping sample names to their computed metrics.
         """
         return dict()

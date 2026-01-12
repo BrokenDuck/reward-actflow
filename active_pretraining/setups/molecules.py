@@ -1,5 +1,6 @@
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import dgl
@@ -8,10 +9,15 @@ from rdkit.Chem import Draw, AllChem
 from flowmol.analysis.molecule_builder import SampledMolecule
 from flowgym import  BaseModel, Environment
 from flowgym.molecules import FlowGraph, QM9BaseModel
+from flowgym.utils import temporary_workdir
 from vendi_score import vendi
 from vendi_score import molecule_utils
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+from glob import glob
+import json
+from json import JSONDecodeError
+import re
 import os
 
 from active_pretraining.problem_setup import ProblemSetup
@@ -170,6 +176,30 @@ class QM9ProblemSetup(ProblemSetup[FlowGraph]):
 
         return { "vendi": float(vendi_score) }
 
+    def compute_sample_metrics(self, samples_dir: str) -> dict[str, dict[str, float]]:
+        metric_names = [
+            "energy", "homo", "lumo", "homo_lumo_gap", "dipole_moment", "polarizability", "heat_capacity"
+        ]
+
+        mols = []
+        mol_files = sorted(glob(os.path.join(samples_dir, "*.mol")))
+        for path in mol_files:
+            mol = Chem.MolFromMolFile(path, sanitize=False, removeHs=False, strictParsing=False)
+            mols.append(mol)
+
+        res = parallel_xtb(mols)
+        out = dict()
+
+        for mol_file, xtb_res in zip(mol_files, res):
+            if xtb_res is None:
+                continue
+
+            sample_name = os.path.basename(mol_file).replace(".mol", "")
+            metrics = { name: getattr(xtb_res, name) for name in metric_names }
+            out[sample_name] = metrics
+
+        return out
+
 
 def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str]) -> dgl.DGLGraph:
     g_relaxed = g.clone()
@@ -237,3 +267,135 @@ def validate_mol(mol: Chem.Mol) -> Optional[Chem.Mol]:
         return mol
     except:
         return None
+
+
+class XTBResult:
+    """Class to parse the output of GFN2-xTB."""
+
+    def __init__(self, filename: str):
+        assert filename.endswith(".json"), f"Filename ({filename}) must end with .json"
+        
+        # Load JSON data
+        with open(filename, "r") as f:
+            self.data = json.load(f)
+
+        # Load Log data (assumes .out file exists next to .json)
+        # The parallel_xtb function saves JSON as *.xtbout.json and log as *.out
+        log_filename = filename.replace(".xtbout.json", ".out").replace(".json", ".out")
+        
+        if os.path.exists(log_filename):
+            with open(log_filename, "r") as f:
+                self.log_content = f.read()
+        else:
+            self.log_content = ""
+
+    @property
+    def energy(self) -> float:
+        """Energy (Hartree)."""
+        return float(self.data["total energy"])
+
+    @property
+    def homo(self) -> float:
+        """Highest occupied molecular orbital (eV)."""
+        occupation = np.asarray(self.data["fractional occupation"])
+        energies = np.asarray(self.data["orbital energies/eV"])
+
+        occupied_indices = np.where(occupation > 0)[0]
+        if len(occupied_indices) == 0:
+            raise ValueError("No occupied orbitals found.")
+
+        highest_occupied_orbital = occupied_indices[-1]
+        return float(energies[highest_occupied_orbital])
+
+    @property
+    def lumo(self) -> float:
+        """Lowest unoccupied molecular orbital (eV)."""
+        occupation = np.asarray(self.data["fractional occupation"])
+        energies = np.asarray(self.data["orbital energies/eV"])
+
+        unoccupied_indices = np.where(occupation == 0)[0]
+        if len(unoccupied_indices) == 0:
+            raise ValueError("No unoccupied orbitals found.")
+
+        lowest_unoccupied_orbital = unoccupied_indices[0]
+        return float(energies[lowest_unoccupied_orbital])
+
+    @property
+    def homo_lumo_gap(self) -> float:
+        """HOMO-LUMO gap (eV)."""
+        return self.lumo - self.homo
+
+    @property
+    def dipole_moment(self) -> float:
+        """Dipole moment (Debye)."""
+        return 2.5417 * float(np.linalg.norm(self.data["dipole"]))
+
+    @property
+    def polarizability(self) -> float:
+        """Polarizability (Bohr^3)."""
+        # Regex to find: Mol. α(0) /au      :         <val>
+        match = re.search(r"Mol\.\s+α\(0\)\s+/au\s+:\s+([\d\.]+)", self.log_content)
+        if not match:
+            raise ValueError("Polarizability not found in log output.")
+
+        return float(match.group(1))
+
+    @property
+    def heat_capacity(self) -> float:
+        """Heat Capacity (cal/K/mol) at 298.15K."""
+        # Look for the TOT line in the thermodynamic table.
+        # Format: TOT     enthalpy    heat_capacity    entropy    entropy(J)
+        # Example: TOT    5299.6013   30.4586          85.7819    358.9115
+        # We search for TOT, skipping the enthalpy (first number), capturing the second number.
+        # [+-]?\d+ matches integers, floats, scientific notation
+        number_pattern = r"[+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?"
+        pattern = fr"TOT\s+{number_pattern}\s+({number_pattern})"
+        
+        match = re.search(pattern, self.log_content)
+        if not match:
+            raise ValueError("Heat capacity (TOT row) not found in log output. Did you run with --ohess?")
+            
+        return float(match.group(1))
+
+
+def parallel_xtb(mols: list[Chem.Mol]):
+    """Run GFN2-xTB in parallel for molecules in the graph."""
+    results = []
+    with temporary_workdir():
+        i = 0
+        for mol in mols:
+            i += 1
+            Chem.MolToXYZFile(mol, f"{i}.xyz")
+
+        ncpus = len(os.sched_getaffinity(0))
+
+        # Compute properties using GFN2-xTB
+        # Added --ohess to calculate Hessian (needed for Heat Capacity)
+        os.system(
+            f"parallel -j {ncpus} "
+            f"'xtb {{}} --ohess --parallel 1 --namespace {{/.}} --json > {{/.}}.out 2>&1' "
+            "::: *.xyz"
+        )
+
+        # Read results
+        for i in range(1, len(mols) + 1):
+            path = f"{i}.xtbout.json"
+
+            try:
+                res = XTBResult(path) if os.path.exists(path) else None
+            except JSONDecodeError:
+                res = None
+
+            results.append(res)
+
+    return results
+
+
+def top_k(vals: np.ndarray, k: int = 1, high: bool = True) -> float:
+    """Return the top-k average from the array of values, from either end."""
+    sorted_vals = np.sort(vals) # sorted in ascending order
+    if high:
+        sorted_vals = sorted_vals[::-1]  # Sort in decending order
+
+    top_k_vals = sorted_vals[:k]
+    return float(np.mean(top_k_vals))
