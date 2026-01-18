@@ -11,6 +11,7 @@ import shutil
 import os
 
 from .setups import setups as problem_setups
+from .problem_setup import SampleFile
 
 
 def main(args):
@@ -22,23 +23,43 @@ def main(args):
 
     problem_setup = problem_setups[exp_args["problem_setup"]](exp_args, device=device)
 
-    zip_files = list(sorted(glob(os.path.join(exp_dir, "eval", "*.zip"))))
-    for zip_file in tqdm(zip_files):
-        iteration = os.path.basename(zip_file).replace(".zip", "")
-        metrics_file = os.path.join(exp_dir, "eval", f"{iteration}_metrics.yaml")
+    eval_dirs = list(sorted(glob(os.path.join(exp_dir, "eval", "*"))))
+    for eval_dir in tqdm(eval_dirs):
+        if not os.path.isdir(eval_dir):
+            continue
+
+        sample_zip = os.path.join(eval_dir, "samples.zip")
+        valids_file = os.path.join(eval_dir, "valids.pt")
+
+        # Make sure this is a valid evaluation folder
+        if not os.path.exists(sample_zip) or not os.path.exists(valids_file):
+            continue
+
+        metrics_file = os.path.join(eval_dir, "sample_metrics.yaml")
+
+        # Make sure we have not already computed the metrics
         if os.path.exists(metrics_file):
             continue
 
-        output_dir = zip_file.replace(".zip", "_extracted")
-        with zipfile.ZipFile(zip_file, "r") as zip_ref:
-            zip_ref.extractall(output_dir)
+        # Extract samples
+        sample_dir = os.path.join(eval_dir, "samples_extracted")
+        with zipfile.ZipFile(sample_zip, "r") as zip_ref:
+            zip_ref.extractall(sample_dir)
 
-        sample_metrics = problem_setup.compute_sample_metrics(output_dir)
+        # Load validity tensor
+        valids: torch.Tensor = torch.load(valids_file)
+
+        sample_files: list[SampleFile] = []
+        for fn in glob(os.path.join(sample_dir, "*")):
+            no_ext = os.path.splitext(os.path.basename(fn))[0]
+            is_valid = bool(valids[int(no_ext)].item())
+            sample_files.append(SampleFile(is_valid=is_valid, file=fn))
+
+        sample_metrics = problem_setup.compute_sample_metrics(sample_files)
         with open(metrics_file, "w") as f:
             yaml.dump(sample_metrics, f)
 
-        # clean up extracted directory
-        shutil.rmtree(output_dir)
+        shutil.rmtree(sample_dir)
 
 
 if __name__ == "__main__":

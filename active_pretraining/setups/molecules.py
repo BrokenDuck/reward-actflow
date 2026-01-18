@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
 import torch
@@ -8,35 +8,43 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import Draw, AllChem
 from flowmol.analysis.molecule_builder import SampledMolecule
 from flowgym import  BaseModel, Environment
-from flowgym.molecules import FlowGraph, QM9BaseModel
+from flowgym.molecules import FlowGraph, QM9BaseModel, GEOMBaseModel
 from flowgym.utils import temporary_workdir
 from vendi_score import vendi
 from vendi_score import molecule_utils
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
-from glob import glob
 import json
 from json import JSONDecodeError
 import re
 import os
 
-from active_pretraining.problem_setup import ProblemSetup
+from active_pretraining.problem_setup import ProblemSetup, SampleFile
 
 
-class QM9ProblemSetup(ProblemSetup[FlowGraph]):
-    def __init__(self, args: dict[str, Any], device: Optional[torch.device]=None):
+class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
+    def __init__(self, dataset: str, args: dict, device: Optional[torch.device] = None):
         RDLogger.DisableLog("rdApp.*")  # type: ignore
+
+        self.geometry_opt: str = args["mol_geometry_opt"]
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self._base_model = QM9BaseModel(device=device)
+        if dataset == "qm9":
+            self._base_model = QM9BaseModel(device=device)
+            self.div_valid = 2
+        elif dataset == "geom_drugs":
+            self._base_model = GEOMBaseModel(device=device)
+            self.div_valid = 4
+        else:
+            raise ValueError(f"Unknown dataset: {dataset}")
 
     @property
     def base_model(self) -> BaseModel[FlowGraph]:
         return self._base_model
 
-    def validity(self, x: FlowGraph) -> torch.Tensor:
+    def validity(self, x: FlowGraph, kwargs: dict) -> torch.Tensor:
         valids = torch.ones(len(x), dtype=torch.bool)
 
         x.graph.edata["ue_mask"] = x.ue_mask
@@ -50,7 +58,7 @@ class QM9ProblemSetup(ProblemSetup[FlowGraph]):
             if mol is None:
                 valids[i] = False
                 continue
-            
+
             # Check if it has only a single connected component
             if len(Chem.GetMolFrags(mol)) != 1:
                 valids[i] = False
@@ -79,8 +87,8 @@ class QM9ProblemSetup(ProblemSetup[FlowGraph]):
         # Mean pooling
         return graph_sums / graph_counts.unsqueeze(1)
 
-    def latent_postprocess(self, samples: FlowGraph) -> FlowGraph:
-        graph = samples.graph.clone()
+    def latent_postprocess(self, latents: FlowGraph, valids: torch.Tensor, kwargs: dict) -> FlowGraph:
+        graph = latents.graph.clone()
 
         def _discretize(x):
             # argmax finds the class index, one_hot creates the vector
@@ -93,25 +101,29 @@ class QM9ProblemSetup(ProblemSetup[FlowGraph]):
         graph.edata["e_t"] = _discretize(graph.edata["e_t"])
 
         # Relax the geometry, otherwise the structures will become increasingly distorted
-        graph.edata["ue_mask"] = samples.ue_mask
-        graphs = []
-        for g in dgl.unbatch(graph):
-            g = relax_positions(g, self.base_model.model.atom_type_map)
-            graphs.append(g)
+        graph.edata["ue_mask"] = latents.ue_mask
+        if self.geometry_opt != "none":
+            graphs = []
+            for i, g in enumerate(dgl.unbatch(graph)):
+                if valids[i]:
+                    g = relax_positions(g, self.base_model.model.atom_type_map, self.geometry_opt)
 
-        graph = dgl.batch(graphs)
+                graphs.append(g)
+
+            graph = dgl.batch(graphs)
 
         # Remove center of mass
         init_coms = dgl.readout_nodes(graph, feat="x_t", op="mean")
-        graph.ndata["x_t"] = graph.ndata["x_t"] - init_coms[samples.n_idx]
+        graph.ndata["x_t"] = graph.ndata["x_t"] - init_coms[latents.n_idx]
 
-        return FlowGraph(graph, samples.ue_mask, samples.n_idx, samples.e_idx)
+        return FlowGraph(graph, latents.ue_mask, latents.n_idx, latents.e_idx)
 
     def _to_mols(self, samples: FlowGraph) -> list[Chem.Mol]:
         mols = []
-        for i, sample in enumerate(dgl.unbatch(samples.graph)):
+        for sample in dgl.unbatch(samples.graph):
             mol = SampledMolecule(sample.cpu(), self.base_model.model.atom_type_map).rdkit_mol
             mols.append(mol)
+
         return mols
 
     @torch.no_grad()
@@ -139,7 +151,29 @@ class QM9ProblemSetup(ProblemSetup[FlowGraph]):
 
         return fig
 
-    def save_sample(self, sample: FlowGraph, filename: os.PathLike | str):
+    def eval_sampling_kwargs(self, n: int) -> dict:
+        probs = self.base_model.model.n_atoms_dist.probs
+
+        expected = n * probs
+        counts = expected.round().long()
+
+        # Correct for rounding errors
+        remainder = n - counts.sum()
+        if remainder > 0:
+            fractional = expected - counts
+            extra = torch.topk(fractional, remainder).indices
+            counts[extra] += 1
+
+        indices = torch.arange(len(counts), device=counts.device)
+        result = torch.repeat_interleave(indices, counts)
+
+        # Randomly order result
+        perm = torch.randperm(result.numel(), device=result.device)
+        result = result[perm]
+
+        return {"n_atoms": result}
+
+    def save_sample(self, sample: FlowGraph, kwargs: dict, filename: os.PathLike | str):
         if len(sample) != 1:
             raise ValueError("Can only save a single sample at a time.")
 
@@ -151,7 +185,12 @@ class QM9ProblemSetup(ProblemSetup[FlowGraph]):
 
         Chem.MolToMolFile(mol, f"{filename}.mol")
 
-    def compute_metrics(self, samples: list[FlowGraph], valids: list[torch.Tensor]) -> dict[str, float]:
+    def compute_metrics(
+        self,
+        samples: list[FlowGraph],
+        valids: list[torch.Tensor],
+        kwargs: list[dict],
+    ) -> dict[str, float]:
         n_samples = 0
         mols = []
         for d, v in zip(samples, valids):
@@ -167,41 +206,52 @@ class QM9ProblemSetup(ProblemSetup[FlowGraph]):
                 if mol is not None:
                     mols.append(mol)
 
-        # Limit to only half the generated molecules, because there are some invalid ones, and we
-        # need to keep the number of samples for computing diversity constant
-        # Generally it does not go below 50% validity anyway
-        mols = mols[:n_samples // 2]
+        # We want to make sure the number of samples we compute the diversity on is constant between iterations
+        mols = mols[:n_samples // self.div_valid]
         K = molecule_utils.get_tanimoto_K(mols)
         vendi_score = vendi.score_K(K)
 
         return { "vendi": float(vendi_score) }
 
-    def compute_sample_metrics(self, samples_dir: str) -> dict[str, dict[str, float]]:
-        metric_names = [
-            "energy", "homo", "lumo", "homo_lumo_gap", "dipole_moment", "polarizability", "heat_capacity"
-        ]
+    def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
+        # Load molecule samples
+        valid_mols = []
+        valid_files = []
+        for sample_file in sample_files:
+            if sample_file.is_valid:
+                mol = Chem.MolFromMolFile(sample_file.file, sanitize=False, removeHs=False, strictParsing=False)
+                if mol is not None:
+                    valid_files.append(sample_file.file)
+                    valid_mols.append(mol)
 
-        mols = []
-        mol_files = sorted(glob(os.path.join(samples_dir, "*.mol")))
-        for path in mol_files:
-            mol = Chem.MolFromMolFile(path, sanitize=False, removeHs=False, strictParsing=False)
-            mols.append(mol)
+        # Compute quantum chemistry properties
+        res = parallel_xtb(valid_mols)
 
-        res = parallel_xtb(mols)
+        # Return in nice format
+        metric_names = ["energy", "homo", "lumo", "homo_lumo_gap", "dipole_moment", "polarizability", "heat_capacity"]
         out = dict()
-
-        for mol_file, xtb_res in zip(mol_files, res):
+        for fn, xtb_res in zip(valid_files, res):
             if xtb_res is None:
                 continue
 
-            sample_name = os.path.basename(mol_file).replace(".mol", "")
+            sample_name = os.path.basename(fn).replace(".mol", "")
             metrics = { name: getattr(xtb_res, name) for name in metric_names }
             out[sample_name] = metrics
 
         return out
 
 
-def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str]) -> dgl.DGLGraph:
+class QM9ProblemSetup(MoleculeProblemSetup):
+    def __init__(self, args: dict, device: Optional[torch.device] = None):
+        super().__init__(dataset="qm9", args=args, device=device)
+
+
+class GEOMDrugsProblemSetup(MoleculeProblemSetup):
+    def __init__(self, args: dict, device: Optional[torch.device] = None):
+        super().__init__(dataset="geom_drugs", args=args, device=device)
+
+
+def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff") -> dgl.DGLGraph:
     g_relaxed = g.clone()
 
     g_relaxed.ndata["x_1"] = g_relaxed.ndata["x_t"]
@@ -217,11 +267,70 @@ def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str]) -> dgl.DGLGraph:
     if mol is None:
         return g
 
-    AllChem.MMFFOptimizeMolecule(mol)  # type: ignore
+    if alg == "mmff":
+        # Sometimes it crashes in the middle of a run, so we guard with try-except
+        try:
+            AllChem.MMFFOptimizeMolecule(mol)  # type: ignore
+        except RuntimeError:
+            pass
+    elif alg == "uff":
+        try:
+            AllChem.UFFOptimizeMolecule(mol)  # type: ignore
+        except RuntimeError:
+            pass
+    elif alg == "gfn2":
+        mol = xtb_relax_geometry(mol)
+    else:
+        raise ValueError(f"Unknown geometry optimization algorithm: {alg}")
+
+    if mol is None:
+        return g
+
     positions = torch.from_numpy(mol.GetConformer().GetPositions())
     g.ndata["x_t"] = positions.to(g.device).type_as(g.ndata["x_t"])  # type: ignore
 
     return g
+
+
+def xtb_relax_geometry(mol: Chem.Mol) -> Chem.Mol | None:
+    """Relax the geometry of a molecule using GFN2-xTB optimization.
+
+    Parameters
+    ----------
+    mol : Chem.Mol
+        The molecule to relax.
+
+    Returns
+    -------
+    relaxed_mol : Chem.Mol | None
+        The molecule with relaxed geometry. If any runtime errors, returns None.
+    """
+    with temporary_workdir():
+        # Write molecule to XYZ file
+        xyz_file = "input.xyz"
+        output_file = "xtbopt.xyz"
+
+        # Convert RDKit mol to XYZ format
+        Chem.MolToXYZFile(mol, xyz_file)
+
+        # Optimize geometry
+        os.system(f"xtb {xyz_file} --opt --gfn 2 > /dev/null 2>&1")
+
+        if not os.path.exists(output_file):
+            return None
+
+        # Load optimized structure back into RDKit
+        opt_mol = Chem.MolFromXYZFile(output_file)  # type: ignore
+        if opt_mol is None:
+            return None
+
+        # Copy the optimized coordinates to the original molecule
+        opt_conf = opt_mol.GetConformer()
+        conf = mol.GetConformer()
+        for i in range(mol.GetNumAtoms()):
+            conf.SetAtomPosition(i, opt_conf.GetAtomPosition(i))  # type: ignore
+
+    return mol
 
 
 def validate_mol(mol: Chem.Mol) -> Optional[Chem.Mol]:
@@ -389,13 +498,3 @@ def parallel_xtb(mols: list[Chem.Mol]):
             results.append(res)
 
     return results
-
-
-def top_k(vals: np.ndarray, k: int = 1, high: bool = True) -> float:
-    """Return the top-k average from the array of values, from either end."""
-    sorted_vals = np.sort(vals) # sorted in ascending order
-    if high:
-        sorted_vals = sorted_vals[::-1]  # Sort in decending order
-
-    top_k_vals = sorted_vals[:k]
-    return float(np.mean(top_k_vals))

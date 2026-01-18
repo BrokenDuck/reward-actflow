@@ -12,6 +12,7 @@ from pathlib import Path
 import os
 
 from active_pretraining.problem_setup import ProblemSetup
+from active_pretraining.utils import add_valid_border
 from .mnist_classifier.lenet import LeNet5
 
 
@@ -47,7 +48,7 @@ class MNISTProblemSetup(ProblemSetup[FlowTensor]):
     def base_model(self) -> BaseModel[FlowTensor]:
         return self._base_model
 
-    def validity(self, x: FlowTensor) -> torch.Tensor:
+    def validity(self, x: FlowTensor, kwargs: dict) -> torch.Tensor:
         y = x.data
         probs = self.classifier(y).softmax(dim=1)
         digit_probs = probs[:, self.valid_digits].max(dim=1)[0]
@@ -57,15 +58,20 @@ class MNISTProblemSetup(ProblemSetup[FlowTensor]):
     def feature_layer(self) -> str:
         return "unet.mid_block"
 
-    def latent_postprocess(self, samples: FlowTensor) -> FlowTensor:
-        samples = samples.clone()
-        samples.data = samples.data.clamp(-1, 1)
-        return samples
+    def latent_postprocess(self, latents: FlowTensor, valids: torch.Tensor, kwargs: dict) -> FlowTensor:
+        latents = latents.clone()
+        latents.data = latents.data.clamp(-1, 1)
+        return latents
 
     def feature_postprocess(self, x: FlowTensor, feats: torch.Tensor) -> torch.Tensor:
         return feats.flatten(start_dim=1)
 
-    def compute_metrics(self, samples: list[FlowTensor], valids: list[torch.Tensor]) -> dict[str, float]:
+    def compute_metrics(
+        self,
+        samples: list[FlowTensor],
+        valids: list[torch.Tensor],
+        kwargs: list[dict],
+    ) -> dict[str, float]:
         # For each valid digit, compute the mean probability assigned by the classifier
         digit_probs = { digit: 0.0 for digit in self.valid_digits }
         for x, v in zip(samples, valids):
@@ -84,36 +90,18 @@ class MNISTProblemSetup(ProblemSetup[FlowTensor]):
     ) -> Figure:
         x = samples[-1].data.cpu()
         v = valids[-1].cpu()
-        x_bordered = add_valid_border(x, v, thickness=1)
+        grid = make_grid(add_valid_border(x, v, thickness=1), nrow=8)
 
         fig = Figure(figsize=(8, 8))
         ax = fig.add_subplot(1, 1, 1)
-        ax.imshow(
-            make_grid(x_bordered[:32], nrow=8, value_range=(0, 1), normalize=True).permute(1, 2, 0).numpy(),
-            cmap="gray",
-        )
+        ax.imshow(grid.permute(1, 2, 0).numpy())
         ax.axis("off")
 
         return fig
 
-    def save_sample(self, sample: FlowTensor, filename: os.PathLike | str):
+    def save_sample(self, sample: FlowTensor, kwargs: dict, filename: os.PathLike | str):
         x = sample.data.cpu()
         save_image(x, f"{filename}.png")
-
-
-def add_valid_border(images: torch.Tensor, valids: torch.Tensor, thickness: int = 2) -> torch.Tensor:
-    images = images.clone()
-    if images.shape[1] == 1:
-        images = torch.cat([images, images, images], dim=1)
-
-    for i, valid in enumerate(valids):
-        if valid:
-            images[i, 1, :thickness, :] = 1.0
-            images[i, 1, -thickness:, :] = 1.0
-            images[i, 1, :, :thickness] = 1.0
-            images[i, 1, :, -thickness:] = 1.0
-
-    return images
 
 
 class MNISTBaseModel(BaseModel[FlowTensor]):
@@ -173,7 +161,7 @@ class MNISTBaseModel(BaseModel[FlowTensor]):
             torch.save(self.unet.state_dict(), cache_path)
             print(f"Saved UNet weights to {cache_path}")
 
-    def _train_unet(self, epochs=100, batch_size=128, lr=1e-4):
+    def _train_unet(self, steps=1000, batch_size=128, lr=1e-4):
         dataset = torchvision.datasets.MNIST(
             os.path.expanduser("~/.cache"),
             train=True,
@@ -199,10 +187,10 @@ class MNISTBaseModel(BaseModel[FlowTensor]):
         opt = torch.optim.AdamW(self.unet.parameters(), lr=lr)
         train_base_model(
             self,
+            opt,
             [FlowTensor(data)],
-            epochs=epochs,
+            steps=steps,
             batch_size=batch_size,
-            opt=opt,
             pbar=True,
         )
 

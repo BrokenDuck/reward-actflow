@@ -24,7 +24,7 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
     def base_model(self) -> BaseModel[FlowTensor]:
         return self._base_model
 
-    def validity(self, x: FlowTensor) -> torch.Tensor:
+    def validity(self, x: FlowTensor, kwargs: dict) -> torch.Tensor:
         xx = x.data[:, 0] + 0.5
         yy = x.data[:, 1]
 
@@ -97,13 +97,13 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
         )
         axes[1].set_title(r"Model Support (1-$\delta$)")
 
-        V = self.validity(FlowTensor(XY)).reshape(X.shape)
+        V = self.validity(FlowTensor(XY), {}).reshape(X.shape)
         for i in range(2):
             axes[i].contour(X.cpu(), Y.cpu(), V.cpu(), levels=[0.5], colors="black", alpha=0.3)
 
         return fig
 
-    def save_sample(self, sample: FlowTensor, filename: os.PathLike | str):
+    def save_sample(self, sample: FlowTensor, kwargs: dict, filename: os.PathLike | str):
         pass
 
 
@@ -120,7 +120,7 @@ class ToyBaseModel(BaseModel[FlowTensor]):
         data_mean = torch.tensor([-1, 1.5])
         data = data_mean.unsqueeze(0) + 0.1 * torch.randn(512, 2)
         opt = torch.optim.Adam(self.parameters(), lr=1e-3)
-        train_base_model(self, [FlowTensor(data)], steps=2500, batch_size=256, opt=opt, pbar=True)
+        train_base_model(self, opt, [FlowTensor(data)], steps=2500, batch_size=256, pbar=True)
 
     @property
     def scheduler(self) -> Scheduler[FlowTensor]:

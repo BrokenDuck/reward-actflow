@@ -1,4 +1,6 @@
-from typing import Generic
+from typing import Generic, Any, Optional
+from typing_extensions import Self
+from dataclasses import dataclass
 
 import torch
 from flowgym import construct_env, D
@@ -6,6 +8,7 @@ from flowgym.utils import train_base_model
 import matplotlib.pyplot as plt
 import argparse
 import imageio.v2 as imageio
+from pathlib import Path
 import logging
 import yaml
 import glob
@@ -17,18 +20,103 @@ from .dps import RewardGradient
 from .svdd import sample_svdd_pm
 from .problem_setup import ProblemSetup
 from .setups import setups as problem_setups
+from .utils import index_dict
 
 
 logging.getLogger().setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ActivePretrainingConfig:
+    # Experiment directory
+    folder: Path
+
+    # Feature extraction and Gaussian Process
+    feat_timestep: float = 0.9
+    gp_kernel: str = "rbf"
+    gp_lengthscale: float = 0.1
+
+    # Uncertainty reward and uncertainty sampling algorithm
+    reward_scale: float = 100.0
+    reward_opt_algo: str = "dps"
+    
+    # Fine-tuning
+    ft_min_dataset_size: int = 64
+    ft_batch_size: int = 64
+    ft_accumulate_steps: int = 1
+    ft_steps: int = 500
+    ft_lr: float = 1e-4
+    ft_weight_decay: float = 0.0
+
+    # Sampling and evaluation
+    num_steps: int = 100
+    eval_samples: int = 0
+    eval_batch_size: int = 64
+    eval_every: int = 10
+    video_fps: int = 4
+    
+    # Flags
+    no_uncertainty: bool = False
+    no_verifier: bool = False
+
+    def __post_init__(self):
+        # Create experiment directory if it doesn't exist
+        self.folder.mkdir(parents=True, exist_ok=True)
+
+        # Validation
+        if not (0 <= self.feat_timestep <= 1):
+            raise ValueError(f"feat_timestep must be in [0, 1], got {self.feat_timestep}")
+
+        if self.reward_scale < 0:
+            raise ValueError(f"reward_scale cannot be negative, got {self.reward_scale}")
+
+        if self.gp_lengthscale < 0:
+            raise ValueError(f"gp_lengthscale cannot be negative, got {self.gp_lengthscale}")
+
+        allowed_algos = { "dps", "svdd" }
+        if self.reward_opt_algo not in allowed_algos:
+            raise ValueError(f"reward_opt_algo must be one of {allowed_algos}")
+
+        allowed_kernels = { "rbf", "linear" }
+        if self.gp_kernel not in allowed_kernels:
+            raise ValueError(f"gp_kernel must be one of {allowed_kernels}")
+
+    @staticmethod
+    def construct_from_args(args: argparse.Namespace | dict) -> "ActivePretrainingConfig":
+        if isinstance(args, argparse.Namespace):
+            args = vars(args)
+
+        # Map argparse flags to config names
+        name_mapping = {
+            "dir": "folder",
+            "feature_timestep": "feat_timestep",
+            "uncertainty_weight": "reward_scale",
+        }
+        
+        # We only take keys that exist in the dataclass fields
+        config_fields = {f.name for f in ActivePretrainingConfig.__dataclass_fields__.values()}
+        clean_kwargs = {}
+
+        for key, value in args.items():
+            # Check if the key needs a rename
+            target_key = name_mapping.get(key, key)
+            
+            # Only add if it's a valid field in our config
+            if target_key in config_fields:
+                clean_kwargs[target_key] = value
+
+        return ActivePretrainingConfig(**clean_kwargs)
+
+
 def main(args):
-    os.makedirs(args.dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    config = ActivePretrainingConfig.construct_from_args(args)
+    problem_setup = problem_setups[args.problem_setup](vars(args), device=device)
+
     # Save arguments
-    with open(os.path.join(args.dir, "args.yaml"), "w") as f:
+    with open(config.folder / "args.yaml", "w") as f:
         yaml.dump(vars(args), f)
 
     # Set up logging
@@ -44,84 +132,29 @@ def main(args):
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler(os.path.join(args.dir, "log.txt"))
+    file_handler = logging.FileHandler(config.folder / "log.txt")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    problem_setup = problem_setups[args.problem_setup](vars(args), device=device)
-
-    active_pre = ActivePretraining(
-        problem_setup,
-        args.dir,
-        feat_timestep=args.feature_timestep,
-        gp_lengthscale=args.gp_lengthscale,
-        discretization_steps=args.num_steps,
-        reward_scale=args.uncertainty_weight,
-        ft_batch_size=args.ft_batch_size,
-        ft_steps=args.ft_steps,
-        ft_lr=args.ft_lr,
-        eval_samples=args.eval_samples,
-        eval_batch_size=args.eval_batch_size,
-        eval_every=args.eval_every,
-        video_fps=args.video_fps,
-        reward_opt_algo=args.reward_opt_algo,
-        no_uncertainty=args.no_uncertainty,
-        no_verifier=args.no_verifier,
-    )
-
-    active_pre.explore_loop(
-        num_iterations=args.num_iters,
-        samples_per_iter=args.samples_per_iter,
-    )
+    apt = ActivePretraining(problem_setup=problem_setup, config=config)
+    apt.explore_loop(args.num_iters, args.samples_per_iter)
 
 
 class ActivePretraining(Generic[D]):
-    def __init__(
-        self,
-        problem_setup: ProblemSetup[D],
-        dir: os.PathLike,
-        feat_timestep: float = 0.5,
-        gp_lengthscale: float = 0.1,
-        discretization_steps: int = 100,
-        reward_scale: float = 1.0,
-        ft_batch_size: int = 32,
-        ft_steps: int = 10,
-        ft_lr: float = 1e-4,
-        ft_weight_decay: float = 0.0,
-        eval_samples: int = 0,
-        eval_batch_size: int = 256,
-        eval_every: int = 5,
-        video_fps: int = 10,
-        reward_opt_algo: str = "dps",
-        no_uncertainty: bool = False,
-        no_verifier: bool = False,
-    ):
-        assert (
-            feat_timestep > 0 and feat_timestep <= 1
-        ), "feat_timestep must be in (0, 1]"
-
+    def __init__(self, problem_setup: ProblemSetup[D], config: ActivePretrainingConfig):
         self.problem = problem_setup
-
-        self.dir = dir
-        self.ft_batch_size = ft_batch_size
-        self.ft_steps = ft_steps
-        self.ft_lr = ft_lr
-        self.ft_weight_decay = ft_weight_decay
-        self.eval_samples = eval_samples
-        self.eval_batch_size = eval_batch_size
-        self.eval_every = eval_every
-        self.video_fps = video_fps
-        self.reward_opt_algo = reward_opt_algo
+        self.config = config
 
         feat_extractor = FlowFeatureExtractor(
             problem_setup.base_model,
             layer=problem_setup.feature_layer,
-            timestep=feat_timestep,
+            timestep=config.feat_timestep,
             postprocess=problem_setup.feature_postprocess,
         )
 
         # Probe the feature extractor for testing and obtaining the dimensionality of the features
         x, kwargs = problem_setup.base_model.sample_p0(1)
+        x, kwargs = problem_setup.base_model.preprocess(x, **kwargs)
         feat = feat_extractor(x, **kwargs)
 
         assert isinstance(
@@ -132,31 +165,29 @@ class ActivePretraining(Generic[D]):
         reward = GPUncertaintyReward(
             feat_extractor=feat_extractor,
             feat_dim=feat.shape[1],
-            lengthscale=gp_lengthscale,
+            kernel=config.gp_kernel,
+            lengthscale=config.gp_lengthscale,
             device=x.device,
         )
         env = construct_env(
             problem_setup.base_model,
             reward,
-            discretization_steps=discretization_steps,
-            reward_scale=reward_scale,
+            discretization_steps=config.num_steps,
+            reward_scale=config.reward_scale,
         )
 
         self.base_model = problem_setup.base_model
         self.reward = reward
         self.env = env
 
-        # For baselines
-        self.no_uncertainty = no_uncertainty
-        self.no_verifier = no_verifier
-
-        self.opt = torch.optim.Adam(
-            self.base_model.parameters(),
-            lr=self.ft_lr,
-            weight_decay=self.ft_weight_decay,
-        )
-
-    def update_models(self, latents: list[D], valids: list[torch.Tensor]) -> None:
+    def update_models(
+        self,
+        latents: list[D],
+        valids: list[torch.Tensor],
+        kwargs: list[dict[str, Any]],
+        update_base_model: bool = True,
+        update_uncertainty: bool = True,
+    ) -> None:
         """Update the uncertainty estimator and fine-tune the base model on valid samples.
 
         Parameters
@@ -168,56 +199,73 @@ class ActivePretraining(Generic[D]):
         valids : list[torch.Tensor]
             List of boolean tensors indicating the validity of samples obtained so far, where each
             element corresponds to the valids from one iteration.
+
+        kwargs : list[dict[str, Any]]
+            Keyword arguments used for sampling.
+
+        update_base_model : bool, default: True
+            Whether to fine-tune the base model on valid samples.
+
+        update_uncertainty : bool, default: True
+            Whether to update the uncertainty estimator.
         """
-        # Do not fine-tune the base model on the first iteration's samples, which are used for
-        # initializing the uncertainty model.
-        if len(latents) > 1:
+        if update_base_model:
             # Extract valid samples
             valid_latents = []
-            for d, v in zip(latents, valids):
+            valid_kwargs = []
+            for d, v, k in zip(latents, valids, kwargs):
                 for j in range(len(d)):
                     if v[j]:
                         valid_latents.append(d[j])
+                        valid_kwargs.append(index_dict(k, j))
 
             if len(valid_latents) == 0:
-                logging.warning("No valid data to fine-tune")
+                logger.warning("No valid data to fine-tune")
                 return
 
-            if self.no_verifier:
+            if self.config.no_verifier:
                 valid_latents = latents
 
             logger.debug(f"fine-tuning the base model on {len(valid_latents)} samples")
 
             # Fine-tune base model
-            self.opt = torch.optim.Adam(
+            opt = torch.optim.Adam(
                 self.base_model.parameters(),
-                lr=self.ft_lr,
-                weight_decay=self.ft_weight_decay,
+                lr=self.config.ft_lr,
+                weight_decay=self.config.ft_weight_decay,
             )
             train_base_model(
                 self.env.base_model,
+                opt,
                 valid_latents,
-                steps=self.ft_steps,
-                batch_size=self.ft_batch_size,
-                opt=self.opt,
+                valid_kwargs,
+                steps=self.config.ft_steps,
+                batch_size=self.config.ft_batch_size,
+                accumulate_steps=self.config.ft_accumulate_steps,
                 pbar=False,
             )
 
-        if self.no_uncertainty:
-            return
-
-        # Update uncertainty model
-        logger.debug("updating uncertainty model")
-        self.reward.set_data(latents, valids)
+        if update_uncertainty:
+            # Update uncertainty model
+            logger.debug("updating uncertainty model")
+            self.reward.set_data(latents, valids, kwargs)
 
     @torch.no_grad()
-    def get_samples(self, num_samples: int, guided: bool = True) -> tuple[D, D]:
+    def get_samples(
+        self,
+        num_samples: int,
+        kwargs: Optional[dict] = None,
+        guided: bool = True,
+    ) -> tuple[D, D, dict[str, Any]]:
         """Obtain samples from the environment, optionally using uncertainty guidance.
 
         Parameters
         ----------
         num_samples : int
             Number of samples to obtain.
+
+        kwargs : Optional[dict], default=None
+            Keyword arguments for sampling.
 
         guided : bool, default=True
             Whether to use uncertainty guidance when obtaining samples.
@@ -229,45 +277,54 @@ class ActivePretraining(Generic[D]):
 
         latents : D
             The obtained samples in latent space.
+
+        kwargs : dict[str, Any]
+            Keyword arguments output.
         """
-        if self.no_uncertainty:
-            guided = False
+        if kwargs is None:
+            kwargs = {}
 
         logger.debug(f"obtaining {num_samples} samples (guided={guided})")
 
         # Use uncertainty gradients to guide the base model
         if guided:
-            if self.reward_opt_algo == "svdd":
-                output = sample_svdd_pm(self.env, num_samples, m=4, alpha=1 / self.env.reward_scale, pbar=False)
-            elif self.reward_opt_algo == "dps":
+            if self.config.reward_opt_algo == "svdd":
+                output = sample_svdd_pm(
+                    self.env,
+                    num_samples,
+                    m=4,
+                    alpha=1 / self.env.reward_scale,
+                    pbar=False,
+                    **kwargs,
+                )
+            elif self.config.reward_opt_algo == "dps":
                 self.env.control_policy = RewardGradient(self.env)
-                output = self.env.sample(num_samples, pbar=False)
+                output = self.env.sample(num_samples, pbar=False, **kwargs)
                 self.env.control_policy = None
             else:
-                raise ValueError(f"Unknown reward optimization algorithm: {self.reward_opt_algo}")
+                raise ValueError
         else:
-            output = self.env.sample(num_samples, pbar=False)
+            output = self.env.sample(num_samples, pbar=False, **kwargs)
 
         # Obtain the final samples (converted to data space) and latents (terminator of SDE). For
         # validity, the samples are more important, but the latents are used for updating the models.
         samples = output[0]
         latents = output[1][-1]
-        latents = self.problem.latent_postprocess(latents)
+        kwargs = output[-1]
 
-        return samples, latents
+        return samples, latents, kwargs
 
     def _write_video(self) -> None:
         logger.debug("writing video")
 
-        frame_dir = os.path.join(self.dir, "frames")
-        frame_paths = sorted(glob.glob(os.path.join(frame_dir, "*.png")))
+        frame_paths = sorted(glob.glob(str(self.config.folder / "frames" / "*.png")))
         if len(frame_paths) == 0:
             logging.warning("No frames found; skipping video creation.")
             return
 
-        video_path = os.path.join(self.dir, "video.mp4")
+        video_path = self.config.folder / "video.mp4"
         with imageio.get_writer(
-            video_path, fps=self.video_fps, codec="libx264"
+            video_path, fps=self.config.video_fps, codec="libx264"
         ) as writer:
             for frame_path in frame_paths:
                 writer.append_data(imageio.imread(frame_path))  # type: ignore
@@ -281,16 +338,16 @@ class ActivePretraining(Generic[D]):
         fig = self.problem.visualize_sample(self.env, samples, valids)
 
         # Save frame
-        directory = os.path.join(self.dir, "frames")
+        directory = self.config.folder / "frames"
         os.makedirs(directory, exist_ok=True)
-        fig_path = os.path.join(directory, f"{iteration:04d}.png")
+        fig_path = directory / f"{iteration:04d}.png"
         fig.savefig(fig_path, dpi=150)
         plt.close(fig)
 
     @torch.no_grad()
     def eval_model(self, iteration: int) -> dict[str, float]:
-        n = self.eval_samples
-        bs = self.eval_batch_size
+        n = self.config.eval_samples
+        bs = self.config.eval_batch_size
 
         logger.debug(f"evaluating model at iteration {iteration} (n={n}, bs={bs})")
 
@@ -299,40 +356,46 @@ class ActivePretraining(Generic[D]):
 
         samples: list[D] = []
         valids: list[torch.Tensor] = []
+        kwargs: list[dict] = []
 
         # Obtain samples in batches
+        eval_kwargs = self.problem.eval_sampling_kwargs(n)
         for i in range(0, n, bs):
             bsz = min(bs, n - i)
-            batch_samples, _ = self.get_samples(bsz, guided=False)
-            batch_valids = self.problem.validity(batch_samples.to(self.env.device)).cpu()
+            batch_kwargs = index_dict(eval_kwargs, i, i + bsz)
+            batch_samples, _, batch_kwargs = self.get_samples(bsz, batch_kwargs, guided=False)
+            batch_valids = self.problem.validity(batch_samples, batch_kwargs).cpu()
 
             samples.append(batch_samples)
             valids.append(batch_valids)
+            kwargs.append(batch_kwargs)
 
         # Save samples
-        directory = os.path.join(self.dir, "eval", f"{iteration:04d}")
-        os.makedirs(directory, exist_ok=True)
+        directory = self.config.folder / "eval" / f"{iteration:04d}"
+        samples_dir = directory / "samples"
+        os.makedirs(samples_dir, exist_ok=True)
 
         count = 0
-        for i, sample in enumerate(samples):
+        for i, (sample, kwarg) in enumerate(zip(samples, kwargs)):
             for j in range(len(sample)):
-                self.problem.save_sample(sample[j], os.path.join(directory, f"{count:04d}"))
+                self.problem.save_sample(
+                    sample[j],
+                    index_dict(kwarg, j),
+                    samples_dir / f"{count:04d}",
+                )
                 count += 1
 
-        torch.save(
-            torch.cat(valids, dim=0),
-            os.path.join(directory, "valids.pt"),
-        )
+        torch.save(torch.cat(valids, dim=0), directory / "valids.pt")
 
         # Compute and save evaluation metrics
-        metrics = self.problem.compute_metrics(samples, valids)
+        metrics = self.problem.compute_metrics(samples, valids, kwargs)
         metrics["model_valid"] = torch.cat(valids, dim=0).float().mean().item()
-        with open(os.path.join(directory, "metrics.yaml"), "w") as f:
+        with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
 
         # Zip and delete folder
-        shutil.make_archive(directory, "zip", directory)
-        shutil.rmtree(directory)
+        shutil.make_archive(str(samples_dir), "zip", samples_dir)
+        shutil.rmtree(samples_dir)
 
         return metrics
 
@@ -341,22 +404,32 @@ class ActivePretraining(Generic[D]):
         all_samples: list[D] = []
         all_latents: list[D] = []
         all_valids: list[torch.Tensor] = []
+        all_kwargs: list[dict[str, Any]] = []
+        n_valids = 0
 
         for i in range(num_iterations):
             # Evaluate current model state
-            if i % self.eval_every == 0:
+            if i % self.config.eval_every == 0:
                 metrics = self.eval_model(i)
             else:
                 metrics = dict()
 
             # Fetch data and evaluate their validity
-            samples, latents = self.get_samples(samples_per_iter, guided=i > 0)
-            valids = self.problem.validity(samples.to(self.env.device)).cpu()
+            samples, latents, kwargs = self.get_samples(
+                samples_per_iter,
+                guided=(n_valids > self.config.ft_min_dataset_size) and (not self.config.no_uncertainty),
+            )
+            valids = self.problem.validity(samples, kwargs).cpu()
+            n_valids += valids.float().sum().item()
+
+            # Postprocess latents
+            latents = self.problem.latent_postprocess(latents, valids, kwargs)
 
             # Add to data buffer
             all_samples.append(samples)
             all_latents.append(latents)
             all_valids.append(valids)
+            all_kwargs.append(kwargs)
 
             # Visualize current state
             self.visualize_iter(all_samples, all_valids, i)
@@ -368,10 +441,19 @@ class ActivePretraining(Generic[D]):
             logger.info(f"(iter={i:05d}) {f', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
 
             # Update models with full buffer
-            self.update_models(all_latents, all_valids)
+            self.update_models(
+                all_latents,
+                all_valids,
+                all_kwargs,
+                update_base_model=n_valids > self.config.ft_min_dataset_size,
+                update_uncertainty=(not self.config.no_uncertainty),
+            )
+
+            # Save checkpoint
+            torch.save(self.base_model.state_dict(), self.config.folder / "base_model.pt")
 
         self._write_video()
-        return all_samples, all_valids
+        return all_samples, all_valids, all_kwargs
 
 
 if __name__ == "__main__":
@@ -384,7 +466,7 @@ if __name__ == "__main__":
         help="Problem setup.",
     )
     parser.add_argument(
-        "--dir", type=str, required=True, help="Directory to save outputs."
+        "--dir", type=Path, required=True, help="Directory to save outputs."
     )
     parser.add_argument(
         "--no_uncertainty",
@@ -400,7 +482,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--feature_timestep",
         type=float,
-        default=0.5,
+        default=0.9,
         help="Which timestep to use for obtaining features. Earlier timesteps give more high-level semantic information whereas later timesteps give more texture information.",
     )
     parser.add_argument(
@@ -416,6 +498,13 @@ if __name__ == "__main__":
         help="Number of 'informative' samples to generate per iteration.",
     )
     parser.add_argument(
+        "--gp_kernel",
+        type=str,
+        choices=["rbf", "linear"],
+        default="rbf",
+        help="Kernel type for the Gaussian process.",
+    )
+    parser.add_argument(
         "--gp_lengthscale",
         type=float,
         default=0.1,
@@ -424,8 +513,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--uncertainty_weight",
         type=float,
-        default=10.0,
+        default=100,
         help="Weight of the uncertainty reward for finding informative samples.",
+    )
+    parser.add_argument(
+        "--ft_min_dataset_size",
+        type=int,
+        default=64,
+        help="Minimum number of samples required to fine-tune the base model.",
     )
     parser.add_argument(
         "--ft_steps",
@@ -436,8 +531,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ft_batch_size",
         type=int,
-        default=256,
+        default=64,
         help="Batch size for fine-tuning the base model on informative samples.",
+    )
+    parser.add_argument(
+        "--ft_accumulate_steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation steps for fine-tuning the base model on informative samples.",
     )
     parser.add_argument(
         "--ft_lr",
@@ -466,13 +567,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval_batch_size",
         type=int,
-        default=256,
+        default=64,
         help="Batch size for evaluation sampling.",
     )
     parser.add_argument(
         "--eval_every",
         type=int,
-        default=5,
+        default=10,
         help="Frequency (in iterations) of computing metrics.",
     )
     parser.add_argument(
@@ -503,6 +604,36 @@ if __name__ == "__main__":
         nargs="+",
         default=[3, 5, 8],
         help="Digits considered valid for the MNIST validity function.",
+    )
+
+    # Stable Diffusion-specific arguments
+    parser.add_argument(
+        "--sd_prompts",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Text prompts for Stable Diffusion sampling.",
+    )
+    parser.add_argument(
+        "--sd_cfg_scale",
+        type=float,
+        default=0.0,
+        help="Classifier-free guidance scale for Stable Diffusion sampling.",
+    )
+    parser.add_argument(
+        "--sd_score_threshold",
+        type=float,
+        default=20.0,
+        help="Threshold for the Stable Diffusion validity function.",
+    )
+
+    # Molecule-specific arguments
+    parser.add_argument(
+        "--mol_geometry_opt",
+        type=str,
+        choices=["none", "mmff", "uff", "gfn2"],
+        default="mmff",
+        help="Geometry optimization method for molecules.",
     )
 
     args = parser.parse_args()

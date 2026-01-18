@@ -1,10 +1,17 @@
 from typing import Generic, Any
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
 from flowgym import D, BaseModel, Environment
 from matplotlib.figure import Figure
 import os
+
+
+@dataclass
+class SampleFile:
+    is_valid: bool
+    file: str
 
 
 class ProblemSetup(ABC, Generic[D]):
@@ -25,13 +32,16 @@ class ProblemSetup(ABC, Generic[D]):
         raise NotImplementedError
 
     @abstractmethod
-    def validity(self, x: D) -> torch.Tensor:
+    def validity(self, x: D, kwargs: dict) -> torch.Tensor:
         """Validity/verifier function that checks whether a sample is valid or not.
 
         Parameters
         ----------
         x : D
             The sample to check.
+
+        kwargs : Any
+            Additional keyword arguments that may be needed for validity checking.
 
         Returns
         -------
@@ -46,20 +56,26 @@ class ProblemSetup(ABC, Generic[D]):
         """The name of the layer from which to extract features for the GP."""
         raise NotImplementedError
 
-    def latent_postprocess(self, samples: D) -> D:
+    def latent_postprocess(self, latents: D, valids: torch.Tensor, kwargs: dict) -> D:
         """Post-process latents generated from the base model.
 
         Parameters
         ----------
-        samples : D
-            The sample to post-process.
+        latents : D
+            The latents to post-process.
+
+        valids : torch.Tensor
+            A boolean tensor indicating whether each latent is valid.
+
+        kwargs : dict
+            Keyword arguments.
 
         Returns
         -------
         D
             The post-processed sample.
         """
-        return samples
+        return latents
 
     @abstractmethod
     def feature_postprocess(self, x: D, feats: Any) -> torch.Tensor:
@@ -100,7 +116,7 @@ class ProblemSetup(ABC, Generic[D]):
         raise NotImplementedError
 
     @abstractmethod
-    def save_sample(self, sample: D, filename: os.PathLike | str):
+    def save_sample(self, sample: D, kwargs: dict, filename: os.PathLike | str):
         """Save a sample to the disk.
         
         Parameters
@@ -108,13 +124,36 @@ class ProblemSetup(ABC, Generic[D]):
         sample : D
             The sample to save.
 
+        kwargs : dict
+            Additional keyword arguments that may be needed to save the sample.
+
         filename : os.PathLike | str
             The file path where to save the sample, without extension. The method will add the
             appropriate extension.
         """
         raise NotImplementedError
 
-    def compute_metrics(self, samples: list[D], valids: list[torch.Tensor]) -> dict[str, float]:
+    def eval_sampling_kwargs(self, n: int) -> dict:
+        """Provide keyword arguments for sampling during evaluation.
+
+        Parameters
+        ----------
+        n : int
+            The number of samples to be drawn.
+
+        Returns
+        -------
+        dict
+            A dictionary of keyword arguments for sampling.
+        """
+        return {}
+
+    def compute_metrics(
+        self,
+        samples: list[D],
+        valids: list[torch.Tensor],
+        kwargs: list[dict],
+    ) -> dict[str, float]:
         """Compute relevant (global) metrics for the problem setup.
         
         Parameters
@@ -125,6 +164,9 @@ class ProblemSetup(ABC, Generic[D]):
         valids : list[torch.Tensor]
             The validity tensor corresponding to the samples.
 
+        kwargs : list[dict]
+            Keyword arguments corresponding to the samples.
+
         Returns
         -------
         dict[str, float]
@@ -132,13 +174,13 @@ class ProblemSetup(ABC, Generic[D]):
         """
         return dict()
 
-    def compute_sample_metrics(self, samples_dir: str) -> dict[str, dict[str, float]]:
+    def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
         """Compute relevant metrics on individual samples.
 
         Parameters
         ----------
-        samples_dir : str
-            Directory containing samples saved using `save_sample`.
+        sample_files : list[SampleFile]
+            List of files containing the samples to compute metrics on.
 
         Returns
         -------

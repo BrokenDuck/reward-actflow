@@ -103,6 +103,9 @@ class GPUncertaintyReward(Reward[D]):
     feat_dim : int
         Dimensionality of the extracted features.
 
+    kernel : "rbf" | "linear"
+        Kernel type for the Gaussian process.
+
     lengthscale : float
         Lengthscale parameter for the RBF kernel of the GP.
 
@@ -116,6 +119,7 @@ class GPUncertaintyReward(Reward[D]):
         self,
         feat_extractor: FlowFeatureExtractor[D],
         feat_dim: int,
+        kernel: str = "rbf",
         lengthscale: float = 0.1,
         device: Optional[torch.device | str] = None,
     ):
@@ -126,7 +130,7 @@ class GPUncertaintyReward(Reward[D]):
 
         likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
         labels = torch.zeros(feats.shape[0], device=device)
-        model = GPModel(feats, labels, likelihood, lengthscale=lengthscale).to(device)
+        model = GPModel(feats, labels, likelihood, kernel_type=kernel, lengthscale=lengthscale).to(device)
 
         model.eval()
         likelihood.eval()
@@ -137,12 +141,12 @@ class GPUncertaintyReward(Reward[D]):
         self.model = model
         self.device = device
 
-    def set_data(self, data: list[D], valids: list[torch.Tensor]):
+    def set_data(self, data: list[D], valids: list[torch.Tensor], kwargs: list[dict]):
         """Set data by computing features and storing."""
         feats = []
         with torch.no_grad():
-            for x in data:
-                feat = self.feat_extractor(x.to(self.device)).detach()
+            for x, k in zip(data, kwargs):
+                feat = self.feat_extractor(x.to(self.device), **k).detach()
                 feats.append(feat)
 
         self.feats = torch.cat(feats, dim=0)
@@ -154,9 +158,7 @@ class GPUncertaintyReward(Reward[D]):
         x = x.to(self.device)
         feats = self.feat_extractor(x, **kwargs)
 
-        with gpytorch.settings.fast_pred_var(), gpytorch.settings.max_root_decomposition_size(
-            500
-        ):
+        with gpytorch.settings.fast_pred_var(), gpytorch.settings.max_root_decomposition_size(500):
             posterior = self.likelihood(self.model(feats))
 
         uncertainty = posterior.variance
@@ -166,11 +168,18 @@ class GPUncertaintyReward(Reward[D]):
 class GPModel(gpytorch.models.ExactGP):
     """Gaussian Process model with RBF kernel."""
 
-    def __init__(self, train_x, train_y, likelihood, lengthscale=0.1):
+    def __init__(self, train_x, train_y, likelihood, kernel_type: str = "rbf", lengthscale=0.1):
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean()
-        kernel = gpytorch.kernels.RBFKernel()
-        kernel.lengthscale = lengthscale  # type: ignore
+
+        if kernel_type == "rbf":
+            kernel = gpytorch.kernels.RBFKernel()
+            kernel.lengthscale = lengthscale  # type: ignore
+        elif kernel_type == "linear":
+            kernel = gpytorch.kernels.LinearKernel()
+        else:
+            raise ValueError(f"Unsupported kernel type: {kernel_type}")
+
         self.covar_module = kernel
 
     def forward(self, x):
