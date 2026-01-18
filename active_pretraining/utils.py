@@ -1,12 +1,37 @@
-from typing import Any, TypeVar, Optional
+from typing import Any, TypeVar, Optional, Generic
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from flowgym import D
 from PIL import Image
 import open_clip
 
 
 T = TypeVar("T")
+
+
+@dataclass
+class Batch(Generic[D]):
+    samples: D
+    latents: D
+    valids: torch.Tensor
+    kwargs: dict[str, Any]
+
+    def __post_init__(self):
+        if len(self.samples) != len(self.latents) or len(self.samples) != len(self.valids):
+            raise ValueError(f"Length of samples, latents, and valids must be the same, got ({len(self.samples)}, {len(self.latents)}, {len(self.valids)})")
+
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx: int) -> "Batch[D]":
+        return Batch(
+            samples=self.samples[idx],
+            latents=self.latents[idx],
+            valids=self.valids[idx:idx+1],
+            kwargs=index_dict(self.kwargs, idx),
+        )
 
 
 def index_dict(d: T, start: int, end: Optional[int] = None) -> T:
@@ -34,10 +59,10 @@ def index_dict(d: T, start: int, end: Optional[int] = None) -> T:
         idx = slice(start, end)
 
     if isinstance(d, dict):
-        return {k: index_dict(v, start, end) for k, v in d.items()}
+        return {k: index_dict(v, start, end) for k, v in d.items()}  # type: ignore
 
     elif isinstance(d, (list, tuple, torch.Tensor)):
-        return d[idx]
+        return d[idx]  # type: ignore
 
     elif isinstance(d, (float, int, str)):
         return d

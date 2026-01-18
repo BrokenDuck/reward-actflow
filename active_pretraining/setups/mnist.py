@@ -1,6 +1,7 @@
 from typing import Any, Optional
 
 import torch
+import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
 from torchvision.transforms.functional import to_pil_image
@@ -11,14 +12,9 @@ from flowgym.utils import train_base_model
 from PIL import Image
 from matplotlib.figure import Figure
 from pathlib import Path
-import os
 
 from active_pretraining.problem_setup import ProblemSetup
-from active_pretraining.utils import add_valid_border
-
-
-import torch.nn as nn
-import torch.nn.functional as F
+from active_pretraining.utils import add_valid_border, Batch
 
 
 class AutoEncoder(nn.Module):
@@ -90,33 +86,28 @@ class MNISTProblemSetup(ProblemSetup[FlowTensor]):
         return img_list
 
     @torch.no_grad()
-    def validity(self, x: FlowTensor, kwargs: dict) -> torch.Tensor:
-        y = x.data
-        _, _, scores = self.ae_loss(y)
+    def validity(self, samples: FlowTensor, kwargs: dict) -> torch.Tensor:
+        x = samples.data
+        _, _, scores = self.ae_loss(x)
         # All-black images are easy for the autoencoder, but should not count as valid
-        black_prop = (y < 0.1).float().mean(dim=[1,2,3])
+        black_prop = (x < 0.1).float().mean(dim=[1,2,3])
         return (scores < -3) & (black_prop < 0.9)
 
     @property
     def feature_layer(self) -> str:
         return "unet.mid_block"
 
-    def latent_postprocess(self, latents: FlowTensor, valids: torch.Tensor, kwargs: dict) -> FlowTensor:
-        latents = latents.clone()
+    def postprocess_latents(self, batch: Batch[FlowTensor]) -> FlowTensor:
+        latents = batch.latents.clone()
         latents.data = latents.data.clamp(-1, 1)
         return latents
 
-    def feature_postprocess(self, x: FlowTensor, feats: torch.Tensor) -> torch.Tensor:
+    def postprocess_features(self, latents: FlowTensor, feats: torch.Tensor) -> torch.Tensor:
         return feats.mean(dim=[-2, -1])
 
-    def visualize_sample(
-        self,
-        env: Environment[FlowTensor],
-        samples: list[FlowTensor],
-        valids: list[torch.Tensor],
-    ) -> Figure:
-        x = samples[-1].data.cpu()
-        v = valids[-1].cpu()
+    def visualize_batch(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
+        x = batch.samples.data.cpu()
+        v = batch.valids.cpu()
         grid = make_grid(add_valid_border(x, v, thickness=1), nrow=8)
 
         fig = Figure(figsize=(8, 8))
@@ -126,7 +117,7 @@ class MNISTProblemSetup(ProblemSetup[FlowTensor]):
 
         return fig
 
-    def save_sample(self, sample: FlowTensor, kwargs: dict, filename: os.PathLike | str):
+    def save_sample(self, sample: FlowTensor, kwargs: dict[str, Any], filename: Path):
         x = sample.data.cpu()
         save_image(x, f"{filename}.png")
 
@@ -157,13 +148,14 @@ class MNISTBaseModel(BaseModel[FlowTensor]):
 
     def _load_or_train_unet(self):
         # Derive cache directory and file path
-        cache_dir = os.path.expanduser("~/.cache/mnist_unet")
-        os.makedirs(cache_dir, exist_ok=True)
+        cache_dir = Path.home() / ".cache" / "mnist_unet"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
         digits_str = "_".join(map(str, self.digits))
-        cache_path = os.path.join(cache_dir, f"{digits_str}.pt")
+        cache_path = cache_dir / f"{digits_str}.pt"
 
         # Load from cache if available, else train and save
-        if os.path.exists(cache_path):
+        if cache_path.exists():
             print(f"Loading cached UNet weights from {cache_path}")
             self.unet.load_state_dict(torch.load(cache_path, map_location=self.device))
         else:
@@ -174,7 +166,7 @@ class MNISTBaseModel(BaseModel[FlowTensor]):
 
     def _train_unet(self, steps=10_000, batch_size=128, lr=1e-4):
         dataset = torchvision.datasets.MNIST(
-            os.path.expanduser("~/.cache"),
+            root=Path.home() / ".cache" / "mnist",
             train=True,
             download=True,
         )

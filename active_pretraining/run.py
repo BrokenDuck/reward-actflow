@@ -1,5 +1,4 @@
-from typing import Generic, Any, Optional
-from typing_extensions import Self
+from typing import Generic, Optional
 from dataclasses import dataclass
 
 import torch
@@ -20,7 +19,7 @@ from .dps import RewardGradient
 from .svdd import sample_svdd_pm
 from .problem_setup import ProblemSetup
 from .setups import setups as problem_setups
-from .utils import index_dict
+from .utils import index_dict, Batch
 
 
 logging.getLogger().setLevel(logging.WARNING)
@@ -149,7 +148,7 @@ class ActivePretraining(Generic[D]):
             problem_setup.base_model,
             layer=problem_setup.feature_layer,
             timestep=config.feat_timestep,
-            postprocess=problem_setup.feature_postprocess,
+            postprocess=problem_setup.postprocess_features,
         )
 
         # Probe the feature extractor for testing and obtaining the dimensionality of the features
@@ -182,9 +181,7 @@ class ActivePretraining(Generic[D]):
 
     def update_models(
         self,
-        latents: list[D],
-        valids: list[torch.Tensor],
-        kwargs: list[dict[str, Any]],
+        batches: list[Batch[D]],
         update_base_model: bool = True,
         update_uncertainty: bool = True,
     ) -> None:
@@ -192,16 +189,8 @@ class ActivePretraining(Generic[D]):
 
         Parameters
         ----------
-        latents : list[D]
-            List of latent samples obtained so far, where each element corresponds to the latents
-            from one iteration.
-
-        valids : list[torch.Tensor]
-            List of boolean tensors indicating the validity of samples obtained so far, where each
-            element corresponds to the valids from one iteration.
-
-        kwargs : list[dict[str, Any]]
-            Keyword arguments used for sampling.
+        batches : list[Batch[D]]
+            Data batches obtained so far, where one batch comes from one iteration in the order.
 
         update_base_model : bool, default: True
             Whether to fine-tune the base model on valid samples.
@@ -213,20 +202,15 @@ class ActivePretraining(Generic[D]):
             # Extract valid samples
             valid_latents = []
             valid_kwargs = []
-            for d, v, k in zip(latents, valids, kwargs):
-                for j in range(len(d)):
-                    if v[j]:
-                        valid_latents.append(d[j])
-                        valid_kwargs.append(index_dict(k, j))
+            for batch in batches:
+                for j in range(len(batch)):
+                    if batch.valids[j] or self.config.no_verifier:
+                        valid_latents.append(batch.latents[j])
+                        valid_kwargs.append(index_dict(batch.kwargs, j))
 
             if len(valid_latents) == 0:
                 logger.warning("No valid data to fine-tune")
                 return
-
-            if self.config.no_verifier:
-                valid_latents = latents
-
-            logger.debug(f"fine-tuning the base model on {len(valid_latents)} samples")
 
             # Fine-tune base model
             opt = torch.optim.Adam(
@@ -246,9 +230,7 @@ class ActivePretraining(Generic[D]):
             )
 
         if update_uncertainty:
-            # Update uncertainty model
-            logger.debug("updating uncertainty model")
-            self.reward.set_data(latents, valids, kwargs)
+            self.reward.set_data(batches)
 
     @torch.no_grad()
     def get_samples(
@@ -256,7 +238,7 @@ class ActivePretraining(Generic[D]):
         num_samples: int,
         kwargs: Optional[dict] = None,
         guided: bool = True,
-    ) -> tuple[D, D, dict[str, Any]]:
+    ) -> Batch[D]:
         """Obtain samples from the environment, optionally using uncertainty guidance.
 
         Parameters
@@ -272,19 +254,11 @@ class ActivePretraining(Generic[D]):
 
         Returns
         -------
-        samples : D
-            The obtained samples in data space (e.g., pixel space for images).
-
-        latents : D
-            The obtained samples in latent space.
-
-        kwargs : dict[str, Any]
-            Keyword arguments output.
+        batch : Batch[D]
+            Obtained samples, latents, and kwargs.
         """
         if kwargs is None:
             kwargs = {}
-
-        logger.debug(f"obtaining {num_samples} samples (guided={guided})")
 
         # Use uncertainty gradients to guide the base model
         if guided:
@@ -306,13 +280,14 @@ class ActivePretraining(Generic[D]):
         else:
             output = self.env.sample(num_samples, pbar=False, **kwargs)
 
-        # Obtain the final samples (converted to data space) and latents (terminator of SDE). For
-        # validity, the samples are more important, but the latents are used for updating the models.
+        # Obtain the final samples (converted to data space) and latents (terminator of SDE). We use
+        # samples for validity and latents for updating the models.
         samples = output[0]
         latents = output[1][-1]
         kwargs = output[-1]
+        valids = self.problem.validity(samples, kwargs).cpu()
 
-        return samples, latents, kwargs
+        return Batch(samples, latents, valids, kwargs)
 
     def _write_video(self) -> None:
         logger.debug("writing video")
@@ -331,11 +306,9 @@ class ActivePretraining(Generic[D]):
 
         logger.info(f"Wrote video to {video_path}")
 
-    def visualize_iter(self, samples: list[D], valids: list[torch.Tensor], iteration: int) -> None:
-        logger.debug(f"visualizing iteration {iteration}")
-
-        # Problem-dependent visualization
-        fig = self.problem.visualize_sample(self.env, samples, valids)
+    def visualize_iter(self, batch: Batch[D], iteration: int) -> None:
+        # Visualizing an iteration is problem-dependent
+        fig = self.problem.visualize_batch(self.env, batch)
 
         # Save frame
         directory = self.config.folder / "frames"
@@ -349,26 +322,18 @@ class ActivePretraining(Generic[D]):
         n = self.config.eval_samples
         bs = self.config.eval_batch_size
 
-        logger.debug(f"evaluating model at iteration {iteration} (n={n}, bs={bs})")
-
         if n <= 0:
             return dict()
 
-        samples: list[D] = []
-        valids: list[torch.Tensor] = []
-        kwargs: list[dict] = []
+        batches: list[Batch[D]] = []
 
         # Obtain samples in batches
         eval_kwargs = self.problem.eval_sampling_kwargs(n)
         for i in range(0, n, bs):
             bsz = min(bs, n - i)
             batch_kwargs = index_dict(eval_kwargs, i, i + bsz)
-            batch_samples, _, batch_kwargs = self.get_samples(bsz, batch_kwargs, guided=False)
-            batch_valids = self.problem.validity(batch_samples, batch_kwargs).cpu()
-
-            samples.append(batch_samples)
-            valids.append(batch_valids)
-            kwargs.append(batch_kwargs)
+            batch = self.get_samples(bsz,  batch_kwargs, guided=False)
+            batches.append(batch)
 
         # Save samples
         directory = self.config.folder / "eval" / f"{iteration:04d}"
@@ -376,20 +341,21 @@ class ActivePretraining(Generic[D]):
         os.makedirs(samples_dir, exist_ok=True)
 
         count = 0
-        for i, (sample, kwarg) in enumerate(zip(samples, kwargs)):
-            for j in range(len(sample)):
+        for i, batch in enumerate(batches):
+            for j in range(len(batch)):
                 self.problem.save_sample(
-                    sample[j],
-                    index_dict(kwarg, j),
+                    batch.samples[j],
+                    index_dict(batch.kwargs, j),
                     samples_dir / f"{count:04d}",
                 )
                 count += 1
 
-        torch.save(torch.cat(valids, dim=0), directory / "valids.pt")
+        all_valids = torch.cat([batch.valids for batch in batches], dim=0)
+        torch.save(all_valids, directory / "valids.pt")
 
         # Compute and save evaluation metrics
-        metrics = self.problem.compute_metrics(samples, valids, kwargs)
-        metrics["model_valid"] = torch.cat(valids, dim=0).float().mean().item()
+        metrics = self.problem.compute_metrics(batches)
+        metrics["model_valid"] = all_valids.float().mean().item()
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
 
@@ -401,10 +367,7 @@ class ActivePretraining(Generic[D]):
 
     def explore_loop(self, num_iterations: int, samples_per_iter: int):
         metrics = dict()
-        all_samples: list[D] = []
-        all_latents: list[D] = []
-        all_valids: list[torch.Tensor] = []
-        all_kwargs: list[dict[str, Any]] = []
+        batches: list[Batch[D]] = []
         n_valids = 0
 
         for i in range(num_iterations):
@@ -415,36 +378,28 @@ class ActivePretraining(Generic[D]):
                 metrics = dict()
 
             # Fetch data and evaluate their validity
-            samples, latents, kwargs = self.get_samples(
-                samples_per_iter,
-                guided=(n_valids > self.config.ft_min_dataset_size) and (not self.config.no_uncertainty),
-            )
-            valids = self.problem.validity(samples, kwargs).cpu()
-            n_valids += valids.float().sum().item()
+            guided = (n_valids > self.config.ft_min_dataset_size) and (not self.config.no_uncertainty)
+            batch = self.get_samples(samples_per_iter, guided=guided)
+            n_valids += batch.valids.int().sum().item()
 
             # Postprocess latents
-            latents = self.problem.latent_postprocess(latents, valids, kwargs)
+            batch.latents = self.problem.postprocess_latents(batch)
 
             # Add to data buffer
-            all_samples.append(samples)
-            all_latents.append(latents)
-            all_valids.append(valids)
-            all_kwargs.append(kwargs)
+            batches.append(batch)
 
             # Visualize current state
-            self.visualize_iter(all_samples, all_valids, i)
+            self.visualize_iter(batch, i)
 
             # Logging
-            metrics["biased_valid"] = valids.float().mean().item()
+            metrics["biased_valid"] = batch.valids.float().mean().item()
             metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
 
             logger.info(f"(iter={i:05d}) {f', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
 
             # Update models with full buffer
             self.update_models(
-                all_latents,
-                all_valids,
-                all_kwargs,
+                batches,
                 update_base_model=n_valids > self.config.ft_min_dataset_size,
                 update_uncertainty=(not self.config.no_uncertainty),
             )
@@ -453,7 +408,6 @@ class ActivePretraining(Generic[D]):
             torch.save(self.base_model.state_dict(), self.config.folder / "base_model.pt")
 
         self._write_video()
-        return all_samples, all_valids, all_kwargs
 
 
 if __name__ == "__main__":

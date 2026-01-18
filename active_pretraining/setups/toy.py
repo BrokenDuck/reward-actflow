@@ -7,10 +7,11 @@ from flowgym.utils import train_base_model
 from flowgym.base_models.one_dim_gmm import MLP
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
+from pathlib import Path
 import math
-import os
 
 from active_pretraining.problem_setup import ProblemSetup
+from active_pretraining.utils import Batch
 
 
 class ToyProblemSetup(ProblemSetup[FlowTensor]):
@@ -24,14 +25,13 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
     def base_model(self) -> BaseModel[FlowTensor]:
         return self._base_model
 
-    def validity(self, x: FlowTensor, kwargs: dict) -> torch.Tensor:
-        xx = x.data[:, 0] + 0.5
-        yy = x.data[:, 1]
+    def validity(self, samples: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
+        x = samples.data[:, 0] + 0.5
+        y = samples.data[:, 1]
 
-        top = (xx >= -2) & (xx <= 1) & (yy >= 1) & (yy <= 2)
-        middle = (xx >= -2) & (xx <= -1) & (yy >= -1) & (yy <= 1)
-        bottom = (xx >= -2) & (xx <= 3) & (yy >= -2) & (yy <= -1)
-
+        top = (x >= -2) & (x <= 1) & (y >= 1) & (y <= 2)
+        middle = (x >= -2) & (x <= -1) & (y >= -1) & (y <= 1)
+        bottom = (x >= -2) & (x <= 3) & (y >= -2) & (y <= -1)
         inside = top | middle | bottom
         return inside.bool()
 
@@ -39,16 +39,11 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
     def feature_layer(self) -> str:
         return "input"
 
-    def feature_postprocess(self, x: FlowTensor, feats: FlowTensor) -> torch.Tensor:
-        return x.data
+    def postprocess_features(self, latents: FlowTensor, feats: FlowTensor) -> torch.Tensor:
+        return latents.data
 
     @torch.no_grad()
-    def visualize_sample(
-        self,
-        env: Environment[FlowTensor],
-        samples: list[FlowTensor],
-        valids: list[torch.Tensor],
-    ) -> Figure:
+    def visualize_batch(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
         xmin = -3.5
         xmax = 3.5
         delta = 0.05
@@ -65,8 +60,8 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
         axes[0].set_title("Uncertainty") 
         fig.colorbar(im, ax=axes[0], shrink=0.8)
 
-        data = samples[-1].data
-        valid = valids[-1]
+        data = batch.samples.data
+        valid = batch.valids
 
         axes[0].scatter(data[valid][:, 0].cpu(), data[valid][:, 1].cpu(), s=2, alpha=1.0)
         axes[0].scatter(data[~valid][:, 0].cpu(), data[~valid][:, 1].cpu(), s=2, alpha=1.0)
@@ -103,7 +98,7 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
 
         return fig
 
-    def save_sample(self, sample: FlowTensor, kwargs: dict, filename: os.PathLike | str):
+    def save_sample(self, sample: FlowTensor, kwargs: dict, filename: Path):
         pass
 
 
