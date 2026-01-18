@@ -12,6 +12,7 @@ from flowgym.utils import train_base_model
 from PIL import Image
 from matplotlib.figure import Figure
 from pathlib import Path
+from argparse import ArgumentParser
 
 from active_pretraining.problem_setup import ProblemSetup
 from active_pretraining.utils import add_valid_border, Batch
@@ -74,6 +75,10 @@ class MNISTProblemSetup(ProblemSetup[FlowTensor]):
         state_dict = torch.load(Path(__file__).resolve().parent / "auto_encoder.pth", map_location=device)
         self.ae_loss.load_state_dict(state_dict)
         self.ae_loss.eval()
+
+    @classmethod
+    def add_args(cls, parser: ArgumentParser):
+        parser.add_argument("--mnist_base_digits", type=int, nargs="+", default=[3, 5])
 
     @property
     def base_model(self) -> BaseModel[FlowTensor]:

@@ -8,7 +8,8 @@ from flowgym.images import SD15BaseModel
 from vendi_score import vendi
 from PIL import Image
 from matplotlib.figure import Figure
-import os
+from argparse import ArgumentParser
+from pathlib import Path
 
 from active_pretraining.problem_setup import ProblemSetup, SampleFile
 from active_pretraining.utils import add_valid_border, CLIP, Batch
@@ -33,6 +34,12 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
         self._base_model.eval()
 
         self.clip = CLIP(device)
+
+    @classmethod
+    def add_args(cls, parser: ArgumentParser):
+        parser.add_argument("--sd_prompts", type=str, nargs="+", default=None)
+        parser.add_argument("--sd_cfg_scale", type=float, default=0.0)
+        parser.add_argument("--sd_score_threshold", type=float, default=20.0)
 
     @property
     def base_model(self) -> BaseModel[FlowTensor]:
@@ -74,7 +81,7 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
 
         return fig
 
-    def save_sample(self, sample: FlowTensor, kwargs: dict, filename: os.PathLike | str):
+    def save_sample(self, sample: FlowTensor, kwargs: dict, filename: Path):
         x = sample.data.cpu()
         save_image(x, f"{filename}.png")
 

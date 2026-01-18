@@ -15,6 +15,7 @@ from vendi_score import molecule_utils
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from pathlib import Path
+from argparse import ArgumentParser
 import json
 from json import JSONDecodeError
 import re
@@ -41,6 +42,10 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
             self.div_valid = 4
         else:
             raise ValueError(f"Unknown dataset: {dataset}")
+
+    @classmethod
+    def add_args(cls, parser: ArgumentParser):
+        parser.add_argument("--mol_geometry_opt", type=str, choices=["none", "mmff", "uff", "gfn2"], default="mmff")
 
     @property
     def base_model(self) -> BaseModel[FlowGraph]:

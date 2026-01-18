@@ -6,6 +6,7 @@ import torch
 from flowgym import D, BaseModel, Environment
 from matplotlib.figure import Figure
 from pathlib import Path
+from argparse import ArgumentParser
 
 from .utils import Batch
 
@@ -24,6 +25,17 @@ class ProblemSetup(ABC, Generic[D]):
         ----------
         args : dict[str, Any]
             A dictionary of arguments to configure the problem setup.
+        """
+        pass
+
+    @classmethod
+    def add_args(cls, parser: ArgumentParser):
+        """Add problem setup specific arguments to the parser.
+
+        Parameters
+        ----------
+        parser : ArgumentParser
+            The argument parser to which to add arguments.
         """
         pass
 
