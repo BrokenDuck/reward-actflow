@@ -1,19 +1,17 @@
 from typing import Any, Optional
 
 import torch
-import torch.nn.functional as F
 from torchvision.transforms.functional import to_pil_image
 from torchvision.utils import save_image, make_grid
 from flowgym import BaseModel, Environment, FlowTensor, ConstantNoiseSchedule
 from flowgym.images import SD15BaseModel
 from vendi_score import vendi
-import open_clip
 from PIL import Image
 from matplotlib.figure import Figure
 import os
 
 from active_pretraining.problem_setup import ProblemSetup, SampleFile
-from active_pretraining.utils import add_valid_border
+from active_pretraining.utils import add_valid_border, CLIP
 
 
 class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
@@ -46,6 +44,7 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
             img_list.append(to_pil_image(x.data[i].to(dtype=torch.float)))
         return img_list
 
+    @torch.no_grad()
     def validity(self, x: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
         text_list = kwargs["prompt"]
         img_list = self._to_pil_images(x)
@@ -102,36 +101,3 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
         # todo: aesthetic score?
         return dict()
 
-
-class CLIP:
-    def __init__(self, device: torch.device):
-        self.device = device
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            "ViT-B-32",
-            pretrained="laion2b_s34b_b79k",
-            device=device,
-        )
-        self.model.eval()  # type: ignore
-        self.tokenizer = open_clip.get_tokenizer("ViT-B-32")
-
-    @torch.no_grad()
-    def embed_images(self, images: list[Image.Image]) -> torch.Tensor:
-        images = [self.preprocess(img).unsqueeze(0) for img in images]  # type: ignore
-        feats = torch.cat([self.model.encode_image(img.to(self.device)) for img in images])  # type: ignore
-        return feats / feats.norm(dim=-1, keepdim=True)
-
-
-    @torch.no_grad()
-    def embed_texts(self, texts: list[str]) -> torch.Tensor:
-        tokenized_texts = self.tokenizer(texts).to(self.device)
-        feats = self.model.encode_text(tokenized_texts)  # type: ignore
-        return feats / feats.norm(dim=-1, keepdim=True)
-
-    @torch.no_grad()
-    def score(self, images: list[Image.Image], texts: list[str]) -> torch.Tensor:
-        assert len(images) == len(texts)
-
-        img_feats = self.embed_images(images)
-        txt_feats = self.embed_texts(texts)
-
-        return 100 * F.cosine_similarity(img_feats, txt_feats, dim=-1).clamp(min=0)
