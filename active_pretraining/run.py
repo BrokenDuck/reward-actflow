@@ -28,7 +28,7 @@ def main(args):
     logger = setup_logger(config, args.verbose)
 
     apt = ActivePretraining(problem_setup=problem_setup, config=config, logger=logger)
-    apt.explore_loop(args.num_iters, args.samples_per_iter)
+    apt.explore_loop(config.num_iters, config.samples_per_iter)
 
 
 def setup_logger(config, verbose: bool) -> logging.Logger:
@@ -84,8 +84,12 @@ def add_global_args(parser):
     # Baselines
     parser.add_argument("--no_uncertainty", action="store_true")
     parser.add_argument("--no_verifier", action="store_true")
+
+    # Exploration sampling
     parser.add_argument("--num_iters", type=int, default=1000)
     parser.add_argument("--samples_per_iter", type=int, default=64)
+    parser.add_argument("--sample_batch_size", type=int, default=64)
+    parser.add_argument("--num_steps", type=int, default=100)
 
     # Uncertainty estimator
     parser.add_argument("--gp_kernel", type=str, choices=["rbf", "linear"], default="rbf")
@@ -103,7 +107,6 @@ def add_global_args(parser):
     parser.add_argument("--ft_weight_decay", type=float, default=0.0)
 
     # Sampling
-    parser.add_argument("--num_steps", type=int, default=100)
     parser.add_argument("--eval_samples", type=int, default=0)
     parser.add_argument("--eval_batch_size", type=int, default=64)
     parser.add_argument("--eval_every", type=int, default=10)

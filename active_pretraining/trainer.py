@@ -161,6 +161,45 @@ class ActivePretraining(Generic[D]):
         batch.latents = self.problem.postprocess_latents(batch)
         return batch
 
+    def get_many_batches(
+        self,
+        n: int,
+        batch_size: int,
+        kwargs: Optional[dict] = None,
+        guided: bool = True,
+    ) -> list[Batch[D]]:
+        """Obtain multiple batches of samples.
+
+        Parameters
+        ----------
+        n : int
+            Total number of samples to obtain.
+
+        batch_size : int
+            Number of samples per batch.
+
+        kwargs : Optional[dict], default=None
+            Keyword arguments for sampling.
+
+        guided : bool, default=True
+            Whether to use uncertainty guidance when obtaining samples.
+
+        Returns
+        -------
+        batches : list[Batch[D]]
+            Obtained batches of samples.
+        """
+        batches: list[Batch[D]] = []
+        for i in range(0, n, batch_size):
+            bsz = min(batch_size, n - i)
+            batch_kwargs = {}
+            if kwargs is not None:
+                batch_kwargs = index_dict(kwargs, i, i + bsz)
+            batch = self.get_samples(bsz, batch_kwargs, guided=guided)
+            batches.append(batch)
+
+        return batches
+
     def _write_video(self) -> None:
         frame_paths = sorted(self.config.folder.glob("frames/*.png"))
         if len(frame_paths) == 0:
@@ -193,15 +232,7 @@ class ActivePretraining(Generic[D]):
         if n <= 0:
             return dict()
 
-        batches: list[Batch[D]] = []
-
-        # Obtain samples in batches
-        eval_kwargs = self.problem.eval_sampling_kwargs(n)
-        for i in range(0, n, bs):
-            bsz = min(bs, n - i)
-            batch_kwargs = index_dict(eval_kwargs, i, i + bsz)
-            batch = self.get_samples(bsz,  batch_kwargs, guided=False)
-            batches.append(batch)
+        batches = self.get_many_batches(n, bs, guided=False)
 
         # Save samples
         directory = self.config.folder / "eval" / f"{iteration:04d}"
@@ -249,7 +280,8 @@ class ActivePretraining(Generic[D]):
             use_guidance = has_enough_data and not self.config.no_uncertainty
 
             # Collect new samples
-            batch = self.get_samples(samples_per_iter, guided=use_guidance)
+            new_batches = self.get_many_batches(samples_per_iter, self.config.sample_batch_size, guided=use_guidance)
+            batch = Batch.concat(new_batches)
             total_valid_samples += batch.valids.int().sum().item()
 
             # Store data

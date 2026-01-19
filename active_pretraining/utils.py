@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from torch.utils.data._utils.collate import default_collate
 from flowgym import D
 from PIL import Image
 import open_clip
@@ -31,6 +32,27 @@ class Batch(Generic[D]):
             latents=self.latents[idx],
             valids=self.valids[idx:idx+1],
             kwargs=index_dict(self.kwargs, idx),
+        )
+
+    @staticmethod
+    def concat(batches: list["Batch[D]"]) -> "Batch[D]":
+        batch_type = type(batches[0].samples)
+
+        batch_samples = batch_type.collate([b.samples for b in batches])
+        batch_latents = batch_type.collate([b.latents for b in batches])
+        batch_valids = torch.cat([b.valids for b in batches], dim=0)
+        all_kwargs = []
+        for batch in batches:
+            for i in range(len(batch)):
+                all_kwargs.append(index_dict(batch.kwargs, i))
+
+        batch_kwargs = default_collate(all_kwargs)  # type: ignore
+
+        return Batch(
+            samples=batch_samples,
+            latents=batch_latents,
+            valids=batch_valids,
+            kwargs=batch_kwargs,  # type: ignore
         )
 
 

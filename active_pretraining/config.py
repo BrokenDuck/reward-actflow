@@ -9,6 +9,12 @@ class ActivePretrainingConfig:
     # Experiment directory
     folder: Path
 
+    # Exploration sampling
+    num_iters: int = 1000
+    samples_per_iter: int = 64
+    sample_batch_size: int = 64
+    num_steps: int = 100
+
     # Feature extraction and Gaussian Process
     feat_timestep: float = 0.9
     gp_kernel: str = "rbf"
@@ -27,7 +33,6 @@ class ActivePretrainingConfig:
     ft_weight_decay: float = 0.0
 
     # Sampling and evaluation
-    num_steps: int = 100
     eval_samples: int = 0
     eval_batch_size: int = 64
     eval_every: int = 10
