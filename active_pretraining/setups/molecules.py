@@ -272,12 +272,12 @@ def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff"
         # Sometimes it crashes in the middle of a run, so we guard with try-except
         try:
             AllChem.MMFFOptimizeMolecule(mol)  # type: ignore
-        except RuntimeError:
+        except:
             pass
     elif alg == "uff":
         try:
             AllChem.UFFOptimizeMolecule(mol)  # type: ignore
-        except RuntimeError:
+        except:
             pass
     elif alg == "gfn2":
         mol = xtb_relax_geometry(mol)
@@ -391,13 +391,13 @@ class XTBResult:
 
         # Load Log data (assumes .out file exists next to .json)
         # The parallel_xtb function saves JSON as *.xtbout.json and log as *.out
-        log_filename = filename.with_suffix(".out").with_suffix(".out")
+        log_filename = filename.parent / (filename.stem.split(".")[0] + ".out")
         
         if log_filename.exists():
             with open(log_filename, "r") as f:
                 self.log_content = f.read()
         else:
-            self.log_content = ""
+            raise FileNotFoundError(f"Log file {log_filename} not found.")
 
     @property
     def energy(self) -> float:

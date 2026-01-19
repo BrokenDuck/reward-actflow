@@ -22,7 +22,7 @@ def main(args):
 
     # Save arguments
     with open(config.folder / "args.yaml", "w") as f:
-        yaml.dump(vars(args), f)
+        yaml.safe_dump(serialize_args(args), f)
 
     # Set up logging
     logger = setup_logger(config, args.verbose)
@@ -52,6 +52,16 @@ def setup_logger(config, verbose: bool) -> logging.Logger:
     logger.addHandler(fh)
 
     return logger
+
+
+def serialize_args(args: argparse.Namespace) -> dict:
+    out = {}
+    for k, v in vars(args).items():
+        if isinstance(v, Path):
+            out[k] = str(v)
+        else:
+            out[k] = v
+    return out
 
 
 def build_parser():

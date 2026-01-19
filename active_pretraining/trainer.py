@@ -162,8 +162,7 @@ class ActivePretraining(Generic[D]):
         return batch
 
     def _write_video(self) -> None:
-        frames_path = self.config.folder / "frames"
-        frame_paths = sorted(frames_path.glob("*.png"))
+        frame_paths = sorted(self.config.folder.glob("frames/*.png"))
         if len(frame_paths) == 0:
             self.logger.warning("No frames found; skipping video creation.")
             return
