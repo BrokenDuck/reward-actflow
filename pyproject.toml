@@ -42,6 +42,7 @@ black = ">=25.12.0,<26"
 ipykernel = ">=7.1.0,<8"
 
 [tool.ruff.lint]
+
 select = [
     "B",  # bugbear
     "D",  # pydocstyle
@@ -81,5 +82,5 @@ ignore = [
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
 
-[tool.ruff.lint]
+[tool.ruff]
 line-length = 120
