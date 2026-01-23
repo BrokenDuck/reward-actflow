@@ -1,20 +1,16 @@
 from abc import abstractmethod
-from typing import Any, Optional, Union, Sequence, Tuple
-from typing_extensions import Self
 from dataclasses import dataclass
+from typing import Any, Optional, Sequence, Tuple, Union
 
 import torch
-from flowgym import (
-    BaseModel,
-    FlowMixin,
-    MemorylessNoiseSchedule,
-    NoiseSchedule,
-    Scheduler
-)
-
-from flowgym.types import UnaryOp, BinaryOp
-
-from torch_geometric.data import HeteroData, Batch
+from diffdock.utils.inference_utils import InferenceDataset
+from diffdock.utils.sampling import modify_conformer_batch
+from flowgym import BaseModel, FlowMixin, MemorylessNoiseSchedule, NoiseSchedule, Scheduler
+from flowgym.types import BinaryOp, UnaryOp
+from torch_geometric.data.batch import Batch
+from torch_geometric.data.hetero_data import HeteroData
+from torch_geometric.data.storage import NodeStorage
+from typing_extensions import Self
 
 
 @dataclass(frozen=True)
@@ -27,23 +23,35 @@ class DockPose(object):
 class DockResult(FlowMixin):
     def __init__(
         self,
-        complex_graph: HeteroData,
-        pose: DockPose
+        complex_graph: HeteroData | Batch
     ):
+        if 'ligand_pose' not in complex_graph:
+            if isinstance(complex_graph, Batch):
+                data_list = complex_graph.to_data_list()
+                for graph in data_list:
+                    graph['ligand_pose'].rot = torch.zeros((1, 3))
+                    graph['ligand_pose'].tr = torch.zeros((1, 3))
+                    graph['ligand_pose'].tor = torch.zeros((1, 3))
+                complex_graph = Batch.from_data_list(data_list)
+
+            else:
+                complex_graph['ligand_pose'].rot = torch.zeros((1, 3))
+                complex_graph['ligand_pose'].tr = torch.zeros((1, 3))
+                complex_graph['ligand_pose'].tor = torch.zeros((1, 3))
+
         self.graph = complex_graph
-        self.pose = pose
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
     def __repr__(self) -> str:
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def __getattr__(self, name: str) -> Any:
-        raise NotImplementedError()
+        raise NotImplementedError
         return getattr(self.graph, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        raise NotImplementedError()
+        raise NotImplementedError
         if name == "graph":
             object.__setattr__(self, name, value)
         else:
@@ -64,12 +72,10 @@ class DockResult(FlowMixin):
 
             if idx < 0 or idx >= len(self):
                 raise IndexError(f"Index {idx} out of range for batch size {len(self)}")
-            return type(self)(self.graph.get_example(idx)) # TODO select pose as well
+            return type(self)(self.graph.get_example(idx))
 
-        if isinstance(idx, slice):
-            return type(self)(Batch.from_data_list(self.graph.index_select(idx))) # TODO select pose as well
+        return type(self)(Batch.from_data_list(self.graph.index_select(idx)))
 
-        raise TypeError(f"Invalid index type: {type(idx)}")
 
     @classmethod
     def collate(cls, items: Sequence[Self]) -> Self:
@@ -77,9 +83,10 @@ class DockResult(FlowMixin):
             raise ValueError("Cannot collate an empty sequence")
 
         return cls(Batch.from_data_list([item.graph for item in items]))
-    
+
 
     def apply(self, op: UnaryOp) -> Self:
+        raise NotImplementedError
         res = self.graph.clone()
 
         for key, sub in self.graph.node_items():
@@ -93,13 +100,30 @@ class DockResult(FlowMixin):
                     res[key][ekey] = op(edata)
 
         return type(self)(res)
-    
+
+
+    def apply_pose(self, pose: NodeStorage, mask_rotate: torch.Tensor) -> torch.Tensor:
+        tr_perturb = pose.tr
+        rot_perturb = pose.rot
+        tor_perturb = pose.tor
+
+        return modify_conformer_batch(self.graph['ligand'].pos, self.graph,
+                                                   tr_perturb, rot_perturb, tor_perturb, mask_rotate)
+
 
     def combine(self, other: Union[Self, float, torch.Tensor], op: BinaryOp) -> Self:
-        if isinstance(other, DockPose):
-            raise NotImplementedError()
+        res = self.graph.clone()
+        if isinstance(other, Self):
+            pose = other['ligand_pose']
+            rot, tr, tor = pose.rot, pose.tr, pose.tor
+            res.pose.rot = op(self.graph.pose.rot, rot)
+            res.pose.tr = op(self.graph.pose.tr, tr)
+            res.pose.tor = op(self.graph.pose.tor, tor)
 
-        """
+            self.apply_pose(res.pose, )
+
+
+        raise NotImplementedError
         if isinstance(other, HeteroData):
             res = self.graph.clone()
             for key, val in self.graph.node_items():
@@ -125,10 +149,6 @@ class DockResult(FlowMixin):
             for key, val in self.graph.edge_items():
                     for ekey, edata in val.items():
                         res[key][ekey] = op(edata, other)  # type: ignore
-        
-        """
-
-        raise NotImplementedError()
 
 
 class DiffDockBaseModel(BaseModel[DockResult]):
