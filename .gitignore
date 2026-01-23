@@ -224,3 +224,4 @@ experiments/
 slurm-*
 jobs/
 *.ipynb
+notes.md
