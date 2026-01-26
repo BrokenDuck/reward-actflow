@@ -6,11 +6,14 @@ import torch
 from diffdock.utils.inference_utils import InferenceDataset
 from diffdock.utils.sampling import modify_conformer_batch
 from flowgym import BaseModel, FlowMixin, MemorylessNoiseSchedule, NoiseSchedule, Scheduler
-from flowgym.types import BinaryOp, UnaryOp
+from flowgym.types import BinaryOp, UnaryOp, FlowTensor
+from flowgym.utils import append_dims
+
 from torch_geometric.data.batch import Batch
 from torch_geometric.data.hetero_data import HeteroData
 from torch_geometric.data.storage import NodeStorage
 from typing_extensions import Self
+from argparse import Namespace
 
 
 @dataclass(frozen=True)
@@ -20,7 +23,7 @@ class DockPose(object):
     tor_pose: torch.Tensor
 
 
-class DockResult(FlowMixin):
+class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
     def __init__(
         self,
         complex_graph: HeteroData | Batch
@@ -40,7 +43,6 @@ class DockResult(FlowMixin):
                 complex_graph['ligand_pose'].tor = torch.zeros((1, 3))
 
         self.graph = complex_graph
-        raise NotImplementedError
 
 
     def __repr__(self) -> str:
@@ -85,6 +87,16 @@ class DockResult(FlowMixin):
         return cls(Batch.from_data_list([item.graph for item in items]))
 
 
+    @classmethod
+    def from_pose(cls, pose: DockPose) -> "DockResult":
+        graph = HeteroData()
+        graph['ligand_pose'].tor = pose.tor_pose
+        graph['ligand_pose'].rot = pose.rot_pose
+        graph['ligand_pose'].tr = pose.tr_pose
+
+        return cls(graph)
+
+
     def apply(self, op: UnaryOp) -> Self:
         raise NotImplementedError
         res = self.graph.clone()
@@ -102,13 +114,12 @@ class DockResult(FlowMixin):
         return type(self)(res)
 
 
-    def apply_pose(self, pose: NodeStorage, mask_rotate: torch.Tensor) -> torch.Tensor:
-        tr_perturb = pose.tr
-        rot_perturb = pose.rot
-        tor_perturb = pose.tor
+    def apply_pose(self, pose: DockPose) -> torch.Tensor:
+        tr_perturb, rot_perturb, tor_perturb = pose.tr_pose, pose.rot_pose, pose.tor_pose
+        mask_rotate = torch.from_numpy(self.graph['ligand'].mask_rotate[0]).to(self.device)
 
         return modify_conformer_batch(self.graph['ligand'].pos, self.graph,
-                                                   tr_perturb, rot_perturb, tor_perturb, mask_rotate)
+                                      tr_perturb, rot_perturb, tor_perturb, mask_rotate)
 
 
     def combine(self, other: Union[Self, float, torch.Tensor], op: BinaryOp) -> Self:
@@ -120,47 +131,27 @@ class DockResult(FlowMixin):
             res.pose.tr = op(self.graph.pose.tr, tr)
             res.pose.tor = op(self.graph.pose.tor, tor)
 
-            self.apply_pose(res.pose, None) # TODO fetch mask somehow... build into DockResult?
-
-
-        raise NotImplementedError
-        if isinstance(other, HeteroData):
-            res = self.graph.clone()
-            for key, val in self.graph.node_items():
-                if key in other.node_types:
-                    for nkey, ndata in val.items():
-                        if nkey in other[key]:
-                            res[key][nkey] = op(ndata, other.graph[key][nkey])  # type: ignore
-                else:
-                    res[key] = val
-
-            for key, val in self.graph.edge_items():
-                if key in other.graph.edge_types:
-                    for ekey, edata in val.items():
-                        if ekey in other[key]:
-                            res[key][ekey] = op(edata, other.graph[key][ekey])  # type: ignore
-                else:
-                    res[key] = val
         else:
-            for key, val in self.graph.node_items():
-                    for nkey, ndata in val.items():
-                        res[key][nkey] = op(ndata, other)  # type: ignore
+            res.pose.rot = op(self.graph.pose.rot, other)
+            res.pose.tr = op(self.graph.pose.tr, other)
+            res.pose.tor = op(self.graph.pose.tor, other)
 
-            for key, val in self.graph.edge_items():
-                    for ekey, edata in val.items():
-                        res[key][ekey] = op(edata, other)  # type: ignore
+        pose = DockPose(res.pose.tr, res.pose.rot, res.pose.tor)
+        res['ligand'].pos = self.apply_pose(pose)
+        return type(self)(res)
 
 
 class DiffDockBaseModel(BaseModel[DockResult]):
     def __init__(self, scheduler_params):
         self._scheduler = None
-        
-        raise NotImplementedError()
-    
+        # TODO diffdock has drift = sigma_t^2 score, which corresponds to memoryless
+        # i.e.: need eta_t = 0.5 sigma_t^2 (except where does the a * x come in?)
+        raise NotImplementedError
+
     @property
     def scheduler(self) -> "DiffDockScheduler":
         """Base model-dependent scheduler used for sampling."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @abstractmethod
     def sample_p0(self, n: int, **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
@@ -238,14 +229,34 @@ class DiffDockBaseModel(BaseModel[DockResult]):
         return x
 
 
+@dataclass(frozen=True)
+class LogLinearScheduler(Scheduler[FlowTensor]):
+    sigma_max: torch.Tensor
+    sigma_min: torch.Tensor
+
+
+    def alpha(self, x: FlowTensor, t: torch.Tensor) -> FlowTensor:
+        t = t.double()
+        logr = torch.tensor(2 * torch.log(self.sigma_max / self.sigma_min))
+        diff = (self.sigma_min / self.sigma_max)** (2 * t) - (self.sigma_min / self.sigma_max) **2
+        result = torch.exp(-logr * self.sigma_max**2 / (4 * torch.log(self.sigma_max / self.sigma_min)) * diff)
+        return FlowTensor(append_dims(result, x.data.ndim))
+
+
+    def alpha_dot(self, x: FlowTensor, t: torch.Tensor) -> FlowTensor:
+        t = t.double()
+        logr = torch.tensor(2 * torch.log(self.sigma_max / self.sigma_min))
+        result = 0.5 * logr * self.sigma_max**2 * (self.sigma_min / self.sigma_max)**(2 * t) * self.alpha(x, t)
+        return FlowTensor(append_dims(result, x.data.ndim))
+
 
 class DiffDockScheduler(Scheduler[DockResult]):
-    r"""Abstract base class for schedulers of flow matching models.
-
-    Generally :math:`\beta_t = 1-\alpha_t`, but this can be re-defined. Furthermore, generally we
-    are interested in a memoryless noise schedule, which is the default of `noise_schedule` (i.e.,
-    :math:`\sigma`), however this can also be re-defined.
-    """
+    def __init__(self, params: Namespace):
+        self.schedulers = {
+            'tr': LogLinearScheduler(params.rot_sigma_max, params.rot_sigma_min),
+            'rot': LogLinearScheduler(params.rot_sigma_max, params.rot_sigma_min),
+            'tor': LogLinearScheduler(params.tor_sigma_max, params.tor_sigma_min)
+        }
 
     @property
     def noise_schedule(self) -> NoiseSchedule[DockResult]:
@@ -256,12 +267,12 @@ class DiffDockScheduler(Scheduler[DockResult]):
         return self._noise_schedule
 
     @noise_schedule.setter
-    def noise_schedule(self, schedule: NoiseSchedule[D]) -> None:
+    def noise_schedule(self, schedule: NoiseSchedule[DockResult]) -> None:
         """Set the noise schedule. Defaults to the memoryless noise schedule."""
         self._noise_schedule = schedule
 
     @abstractmethod
-    def alpha(self, x: D, t: torch.Tensor) -> D:
+    def alpha(self, x: DockResult, t: torch.Tensor) -> DockResult:
         r""":math:`\alpha_t`.
 
         Can be overwritten if :math:`\alpha_t` is data-dependent.
