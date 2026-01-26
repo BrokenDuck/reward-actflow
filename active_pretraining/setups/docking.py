@@ -120,7 +120,7 @@ class DockResult(FlowMixin):
             res.pose.tr = op(self.graph.pose.tr, tr)
             res.pose.tor = op(self.graph.pose.tor, tor)
 
-            self.apply_pose(res.pose, )
+            self.apply_pose(res.pose, None) # TODO fetch mask somehow... build into DockResult?
 
 
         raise NotImplementedError
