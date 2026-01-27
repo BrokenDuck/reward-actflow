@@ -1,25 +1,34 @@
+import os
 from abc import abstractmethod
+from argparse import Namespace
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Tuple, Union
+from functools import partial
+from typing import Any, Optional, Sequence, Union
 
+import pandas as pd
 import torch
-from diffdock.utils.inference_utils import InferenceDataset
+import yaml
+from diffdock.utils.diffusion_utils import t_to_sigma as t_to_sigma_compl
+from diffdock.utils.download import download_and_extract
+from diffdock.utils.inference_utils import InferenceDataset, set_nones
 from diffdock.utils.sampling import modify_conformer_batch
+from diffdock.utils.utils import get_model
 from flowgym import BaseModel, FlowMixin, MemorylessNoiseSchedule, NoiseSchedule, Scheduler
-from flowgym.types import BinaryOp, UnaryOp, FlowTensor
+from flowgym.types import BinaryOp, FlowTensor, UnaryOp
 from flowgym.utils import append_dims
-from active_pretraining.problem_setup import ProblemSetup
-
+from matplotlib.pyplot import Figure
+from torch_geometric.data import DataLoader
 from torch_geometric.data.batch import Batch
 from torch_geometric.data.hetero_data import HeteroData
-from torch_geometric.data.storage import NodeStorage
 from typing_extensions import Self
-from argparse import Namespace
 
-from matplotlib.pyplot import Figure
-
+from active_pretraining.problem_setup import ProblemSetup
 
 pose_els = {'tr', 'rot', 'tor'}
+
+# TODO: check logic of DockResult data flow
+# TODO: check feature_postprocess latent_postprocess
+# TODO: check if we have right version of active exp (run.py line 237+)
 
 
 @dataclass(frozen=True)
@@ -40,7 +49,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
     ):
         device = complex_graph['ligand'].pos.device
         complex_graph = complex_graph.clone().to(device)
-    
+
         if 'ligand_pose' not in complex_graph:
             if isinstance(complex_graph, Batch):
                 data_list = complex_graph.to_data_list()
@@ -56,7 +65,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
                 complex_graph['ligand_pose'].tor = torch.zeros((1, 3)).to(device)
 
         self.graph = complex_graph
-    
+
 
     def to(self, device: torch.device) -> "DockResult":
         return DockResult(self.graph.to(device))
@@ -66,10 +75,10 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
         if isinstance(self.graph, Batch):
             data_list = [g.clone() for g in self.graph.to_data_list()]
             return DockResult(Batch.from_data_list(data_list))
-        
+
         return DockResult(self.graph.clone())
 
-    
+
     @property
     def pose(self) -> "DockPose":
         lig_pose = self.graph['ligand_pose']
@@ -151,8 +160,8 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
 
 
     def combine(self, other: Union[Self, float, torch.Tensor], op: BinaryOp) -> Self:
-        # TODO new idea: core of problem is that rotations are relative to a reference pose, so instead always "undo" current rotation and apply new one
-        # problem: double computational costs...
+        # TODO new idea: core of problem is that rotations are relative to a reference pose, 
+        # so instead always "undo" current rotation and apply new one. problem: double computational costs...
         res = self.clone()
         if isinstance(other, DockResult):
             pose = other.pose
@@ -174,8 +183,8 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
 class DiffDockBaseModel(BaseModel[DockResult]):
     def __init__(self, scheduler_params):
         self._scheduler = DiffDockScheduler(scheduler_params)
-        raise NotImplementedError()
-    
+        raise NotImplementedError
+
 
     @property
     def scheduler(self) -> "DiffDockScheduler":
@@ -206,7 +215,7 @@ class DiffDockBaseModel(BaseModel[DockResult]):
     @abstractmethod
     def forward(self, x: DockResult, t: torch.Tensor, **kwargs: Any) -> DockResult:
         raise NotImplementedError
-    
+
 
     def preprocess(self, x: DockResult, **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
         """Preprocess data and keyword arguments for the base model.
@@ -262,7 +271,8 @@ class LogLinearScheduler(Scheduler[FlowTensor]):
     def alpha_dot(self, x: FlowTensor, t: torch.Tensor) -> FlowTensor:
         t = t.double().to(x.device)
         logr = 2 * torch.log(self.sigma_max / self.sigma_min).to(x.device)
-        result = 0.5 * logr * self.sigma_max.to(x.device)**2 * (self.sigma_min / self.sigma_max).to(x.device)**(2 * t) * self.alpha(x, t)
+        mul = 0.5 * logr * self.sigma_max.to(x.device)**2 * (self.sigma_min / self.sigma_max).to(x.device)**(2 * t)
+        result = self.alpha(x, t) * mul
         return result.to(x.device)
 
 
@@ -292,9 +302,9 @@ class DiffDockScheduler(Scheduler[DockResult]):
     def alpha(self, x: DockResult, t: torch.Tensor) -> DockResult:
         res = x.clone()
         pose = res.pose
-        a_tr = self.schedulers['tr'].alpha(pose.tr, t)
-        a_rot = self.schedulers['rot'].alpha(pose.rot, t)
-        a_tor = self.schedulers['tor'].alpha(pose.tor, t)
+        a_tr = self.schedulers['tr'].alpha(FlowTensor(pose.tr), t)
+        a_rot = self.schedulers['rot'].alpha(FlowTensor(pose.rot), t)
+        a_tor = self.schedulers['tor'].alpha(FlowTensor(pose.tor), t)
         res.pose = DockPose(a_tr.data, a_rot.data, a_tor.data)
         # TODO apply pose?? see if right to left or left to right, might not matter anyway
 
@@ -304,9 +314,9 @@ class DiffDockScheduler(Scheduler[DockResult]):
     def alpha_dot(self, x: DockResult, t: torch.Tensor) -> DockResult:
         res = x.clone()
         pose = res.pose
-        a_tr = self.schedulers['tr'].alpha_dot(pose.tr, t)
-        a_rot = self.schedulers['rot'].alpha_dot(pose.rot, t)
-        a_tor = self.schedulers['tor'].alpha_dot(pose.tor, t)
+        a_tr = self.schedulers['tr'].alpha_dot(FlowTensor(pose.tr), t)
+        a_rot = self.schedulers['rot'].alpha_dot(FlowTensor(pose.rot), t)
+        a_tor = self.schedulers['tor'].alpha_dot(FlowTensor(pose.tor), t)
         res.pose = DockPose(a_tr.data, a_rot.data, a_tor.data)
         # TODO apply pose?? see if right to left or left to right, might not matter anyway
 
@@ -326,12 +336,12 @@ REMOTE_URLS = [f"{REPOSITORY_URL}/releases/latest/download/diffdock_models.zip",
 
 class DockingProblemSetup(ProblemSetup[DockResult]):
     def __init__(self, dataset: str, args: dict, device: Optional[torch.device] = None):
-        args = Namespace(**args)
+        args_ns = Namespace(**args)
         # TODO for now dataset is a single complex
         self.dataset = dataset
-        if args.config:
-            config_dict = yaml.load(args.config, Loader=yaml.FullLoader)
-            arg_dict = args.__dict__
+        if args_ns.config:
+            config_dict = yaml.load(args_ns.config, Loader=yaml.FullLoader)
+            arg_dict = args_ns.__dict__
             for key, value in config_dict.items():
                 if isinstance(value, list):
                     for v in value:
@@ -340,18 +350,14 @@ class DockingProblemSetup(ProblemSetup[DockResult]):
                     arg_dict[key] = value
 
         # Download models if they don't exist locally
-        if not os.path.exists(args.model_dir):
-            logger.info(f"Models not found. Downloading")
+        if not os.path.exists(args_ns.model_dir):
             remote_urls = REMOTE_URLS
             downloaded_successfully = False
             for remote_url in remote_urls:
                 try:
-                    logger.info(f"Attempting download from {remote_url}")
-                    files_downloaded = download_and_extract(remote_url, os.path.dirname(args.model_dir))
+                    files_downloaded = download_and_extract(remote_url, os.path.dirname(args_ns.model_dir))
                     if not files_downloaded:
-                        logger.info(f"Download from {remote_url} failed.")
                         continue
-                    logger.info(f"Downloaded and extracted {len(files_downloaded)} files from {remote_url}")
                     downloaded_successfully = True
                     # Once we have downloaded the models, we can break the loop
                     break
@@ -361,35 +367,34 @@ class DockingProblemSetup(ProblemSetup[DockResult]):
             if not downloaded_successfully:
                 raise Exception(f"Models not found locally and failed to download them from {remote_urls}")
 
-        os.makedirs(args.out_dir, exist_ok=True)
-        with open(f'{args.model_dir}/model_parameters.yml') as f:
+        os.makedirs(args_ns.out_dir, exist_ok=True)
+        with open(f'{args_ns.model_dir}/model_parameters.yml') as f:
             score_model_args = Namespace(**yaml.full_load(f))
-        if args.confidence_model_dir is not None:
-            with open(f'{args.confidence_model_dir}/model_parameters.yml') as f:
+        if args_ns.confidence_model_dir is not None:
+            with open(f'{args_ns.confidence_model_dir}/model_parameters.yml') as f:
                 confidence_args = Namespace(**yaml.full_load(f))
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"DiffDock will run on {device}")
+        device = torch.device('cuda' if torch.cuda.is_available() and device is None else 'cpu')
 
-        if args.protein_ligand_csv is not None:
-            df = pd.read_csv(args.protein_ligand_csv)
+        if args_ns.protein_ligand_csv is not None:
+            df = pd.read_csv(args_ns.protein_ligand_csv)
             complex_name_list = set_nones(df['complex_name'].tolist())
             protein_path_list = set_nones(df['protein_path'].tolist())
             protein_sequence_list = set_nones(df['protein_sequence'].tolist())
             ligand_description_list = set_nones(df['ligand_description'].tolist())
         else:
-            complex_name_list = [args.complex_name if args.complex_name else f"complex_0"]
-            protein_path_list = [args.protein_path]
-            protein_sequence_list = [args.protein_sequence]
-            ligand_description_list = [args.ligand_description]
+            complex_name_list = [args_ns.complex_name if args_ns.complex_name else f"complex_0"]
+            protein_path_list = [args_ns.protein_path]
+            protein_sequence_list = [args_ns.protein_sequence]
+            ligand_description_list = [args_ns.ligand_description]
 
         complex_name_list = [name if name is not None else f"complex_{i}" for i, name in enumerate(complex_name_list)]
         for name in complex_name_list:
-            write_dir = f'{args.out_dir}/{name}'
+            write_dir = f'{args_ns.out_dir}/{name}'
             os.makedirs(write_dir, exist_ok=True)
 
         # preprocessing of complexes into geometric graphs
-        test_dataset = InferenceDataset(out_dir=args.out_dir, complex_names=complex_name_list, protein_files=protein_path_list,
+        test_dataset = InferenceDataset(out_dir=args_ns.out_dir, complex_names=complex_name_list, protein_files=protein_path_list,
                                         ligand_descriptions=ligand_description_list, protein_sequences=protein_sequence_list,
                                         lm_embeddings=True,
                                         receptor_radius=score_model_args.receptor_radius, remove_hs=score_model_args.remove_hs,
@@ -399,7 +404,43 @@ class DockingProblemSetup(ProblemSetup[DockResult]):
                                         knn_only_graph=False if not hasattr(score_model_args, 'not_knn_only_graph') else not score_model_args.not_knn_only_graph)
         test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False)
 
-    
+        if args_ns.confidence_model_dir is not None and not confidence_args.use_original_model_cache:
+            knn = False if not hasattr(score_model_args, 'not_knn_only_graph') else not score_model_args.not_knn_only_graph
+            confidence_test_dataset = \
+                InferenceDataset(out_dir=args_ns.out_dir, complex_names=complex_name_list, protein_files=protein_path_list,
+                                ligand_descriptions=ligand_description_list, protein_sequences=protein_sequence_list,
+                                lm_embeddings=True,
+                                receptor_radius=confidence_args.receptor_radius, remove_hs=confidence_args.remove_hs,
+                                c_alpha_max_neighbors=confidence_args.c_alpha_max_neighbors,
+                                all_atoms=confidence_args.all_atoms, atom_radius=confidence_args.atom_radius,
+                                atom_max_neighbors=confidence_args.atom_max_neighbors,
+                                precomputed_lm_embeddings=test_dataset.lm_embeddings,
+                             knn_only_graph=knn)
+        else:
+            confidence_test_dataset = None
+
+        t_to_sigma = partial(t_to_sigma_compl, args=score_model_args)
+
+        model = get_model(score_model_args, device, t_to_sigma=t_to_sigma, no_parallel=True, old=args_ns.old_score_model)
+        state_dict = torch.load(f'{args_ns.model_dir}/{args_ns.ckpt}', map_location=torch.device('cpu'))
+        model.load_state_dict(state_dict, strict=True)
+        model = model.to(device)
+
+        if args_ns.confidence_model_dir is not None:
+            confidence_model = get_model(confidence_args, device, t_to_sigma=t_to_sigma, no_parallel=True,
+                                        confidence_mode=True, old=args_ns.old_confidence_model)
+            state_dict = torch.load(f'{args_ns.confidence_model_dir}/{args_ns.confidence_ckpt}',
+                                    map_location=torch.device('cpu'))
+            confidence_model.load_state_dict(state_dict, strict=True)
+            confidence_model = confidence_model.to(device)
+            confidence_model.eval()
+        else:
+            confidence_model = None
+            confidence_args = None
+
+        self.test_loader = test_loader
+        self._base_model = model
+
     @property
     def base_model(self) -> BaseModel[DockResult]:
         raise NotImplementedError
