@@ -15,9 +15,8 @@ from torch_geometric.data.hetero_data import HeteroData
 from torch_geometric.data.storage import NodeStorage
 from typing_extensions import Self
 from argparse import Namespace
-
 from matplotlib.pyplot import Figure
-
+import os
 
 pose_els = {'tr', 'rot', 'tor'}
 
@@ -292,9 +291,9 @@ class DiffDockScheduler(Scheduler[DockResult]):
     def alpha(self, x: DockResult, t: torch.Tensor) -> DockResult:
         res = x.clone()
         pose = res.pose
-        a_tr = self.schedulers['tr'].alpha(pose.tr, t)
-        a_rot = self.schedulers['rot'].alpha(pose.rot, t)
-        a_tor = self.schedulers['tor'].alpha(pose.tor, t)
+        a_tr = self.schedulers['tr'].alpha(FlowTensor(pose.tr), t)
+        a_rot = self.schedulers['rot'].alpha(FlowTensor(pose.rot), t)
+        a_tor = self.schedulers['tor'].alpha(FlowTensor(pose.tor), t)
         res.pose = DockPose(a_tr.data, a_rot.data, a_tor.data)
         # TODO apply pose?? see if right to left or left to right, might not matter anyway
 
@@ -304,9 +303,9 @@ class DiffDockScheduler(Scheduler[DockResult]):
     def alpha_dot(self, x: DockResult, t: torch.Tensor) -> DockResult:
         res = x.clone()
         pose = res.pose
-        a_tr = self.schedulers['tr'].alpha_dot(pose.tr, t)
-        a_rot = self.schedulers['rot'].alpha_dot(pose.rot, t)
-        a_tor = self.schedulers['tor'].alpha_dot(pose.tor, t)
+        a_tr = self.schedulers['tr'].alpha_dot(FlowTensor(pose.tr), t)
+        a_rot = self.schedulers['rot'].alpha_dot(FlowTensor(pose.rot), t)
+        a_tor = self.schedulers['tor'].alpha_dot(FlowTensor(pose.tor), t)
         res.pose = DockPose(a_tr.data, a_rot.data, a_tor.data)
         # TODO apply pose?? see if right to left or left to right, might not matter anyway
 
