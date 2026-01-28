@@ -74,7 +74,7 @@ class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality 
         return self.tr.shape[0]
 
 
-    def __getitem__(self, idx: int | slice[Any, Any, Any]) -> "DockPose":
+    def __getitem__(self, idx: Union[int, slice]) -> "DockPose":
         return DockPose(self.tr[idx], self.rot[idx], self.tor[idx])
 
 
