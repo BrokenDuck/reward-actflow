@@ -15,7 +15,7 @@ from diffdock.utils.download import download_and_extract
 from diffdock.utils.geometry import matrix_to_axis_angle
 from diffdock.utils.inference_utils import InferenceDataset, set_nones
 from diffdock.utils.sampling import modify_conformer_batch
-from diffdock.utils.torsion import modify_conformer_torsion_angles_batch
+from diffdock.utils.torsion import modify_conformer_torsion_angles
 from diffdock.utils.utils import get_model
 from flowgym import BaseModel, Environment, FlowMixin, MemorylessNoiseSchedule, NoiseSchedule, Scheduler
 from flowgym.types import BinaryOp, FlowTensor, UnaryOp
@@ -50,7 +50,7 @@ class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality 
 
     @property
     def base(self) -> bool:
-        zero = torch.tensor(0.)
+        zero = torch.tensor(0., dtype=self.tr.dtype)
         return torch.allclose(self.tr, zero) and torch.allclose(self.rot, zero) and torch.allclose(self.tor, zero)
 
 
@@ -80,6 +80,8 @@ class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality 
 
     @classmethod
     def collate(cls: type[Self], items: Sequence[Self]) -> "DockPose":
+        if not items:
+            raise ValueError("Cannot collate an empty sequence")
         tr = torch.vstack([i.tr for i in items])
         rot = torch.vstack([i.rot for i in items])
         tor = torch.vstack([i.tor for i in items])
@@ -165,6 +167,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
 
 
     def __getitem__(self, idx: Union[int, slice]) -> Self:
+        # TODO mixing batch and single element here... maybe make everything batch
         if not isinstance(self.graph, Batch):
             raise ValueError("Trying to get an item of something that is not batched")
 
@@ -187,7 +190,8 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
 
         graph_batch = Batch.from_data_list([item.graph for item in items])
         result = cls(graph_batch)
-        result.pose = DockPose.collate(item.pose for item in items)
+
+        result.pose = DockPose.collate([item.pose for item in items])
         return result
 
 
@@ -223,11 +227,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
     def combine(self, other: Union[Self, float, torch.Tensor], op: BinaryOp) -> "DockResult":
         res = self.clone()
         if isinstance(other, DockResult):
-            pose = other.pose
-            tr = op(res.pose.tr, pose.tr)
-            rot = op(res.pose.rot, pose.rot)
-            tor = op(res.pose.tor, pose.tor)
-            res.pose = DockPose(tr, rot, tor)
+            res.pose = self.pose.combine(other.pose, op)
 
             if self.pose.base and not other.pose.base: # other is transformation
                 res.pos = self.apply_pose(res.pose)
@@ -236,10 +236,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
                 res.pos = other.apply_pose(res.pose)
 
         else:
-            tr = op(res.pose.tr, other)
-            rot = op(res.pose.rot, other)
-            tor = op(res.pose.tor, other)
-            res.pose = DockPose(tr, rot, tor)
+            res.pose = self.pose.combine(other, op)
 
         return res
 
@@ -252,7 +249,6 @@ class DiffDockBaseModel(BaseModel[DockResult]):
     def __init__(self, scheduler_params: Namespace):
         self._scheduler = DiffDockScheduler(scheduler_params)
         # TODO fetch underlying model etc either AAModel or CGModel or old variations
-        raise NotImplementedError
 
 
     @property
@@ -260,18 +256,12 @@ class DiffDockBaseModel(BaseModel[DockResult]):
         return self._scheduler
 
 
-    def sample_p0(self, n: int, **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
-        # TODO make batch of n copies
+    def sample_p0(self, n: int, pocket_cutoff=7., no_random=False, pocket_knowledge=False, choose_residue=False, initial_noise_std_proportion=-1., **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
         results: Sequence[DockResult] = []
         for _ in range(n):
             complex_graph = kwargs['data']
             center_pocket = complex_graph['receptor'].pos.mean(dim=0)
-            pocket_knowledge = kwargs['pocket_knowledge'] if 'pocket_knowledge' in kwargs else False
-            pocket_cutoff = kwargs['pocket_cutoff']
             no_torsion = kwargs['no_torsion']
-            no_random = kwargs['no_random']
-            choose_residue = kwargs['choose_residue']
-            initial_noise_std_proportion = kwargs['initial_noise_std_proportion']
             tr_sigma_max = kwargs['tr_sigma_max']
             if pocket_knowledge:
                 d = torch.cdist(complex_graph['receptor'].pos, torch.from_numpy(complex_graph['ligand'].orig_pos[0]).float() - complex_graph.original_center)
@@ -287,7 +277,7 @@ class DiffDockBaseModel(BaseModel[DockResult]):
                 # randomize torsion angles
                 torsion_updates = np.random.uniform(low=-np.pi, high=np.pi, size=complex_graph['ligand'].edge_mask.sum())
                 complex_graph['ligand'].pos = \
-                    modify_conformer_torsion_angles_batch(complex_graph['ligand'].pos,
+                    modify_conformer_torsion_angles(complex_graph['ligand'].pos,
                                                     complex_graph['ligand', 'ligand'].edge_index.T[
                                                         complex_graph['ligand'].edge_mask],
                                                     complex_graph['ligand'].mask_rotate[0], torsion_updates)
@@ -319,7 +309,6 @@ class DiffDockBaseModel(BaseModel[DockResult]):
         return DockResult.collate(results), kwargs
 
 
-    @abstractmethod
     def forward(self, x: DockResult, t: torch.Tensor, **kwargs: Any) -> DockResult:
         raise NotImplementedError
 
@@ -351,7 +340,8 @@ class LogLinearScheduler(Scheduler[FlowTensor]):
         t = t.double().to(x.device)
         logr = 2 * torch.log(self.sigma_max / self.sigma_min).to(x.device)
         mul = 0.5 * logr * self.sigma_max.to(x.device)**2 * (self.sigma_min / self.sigma_max).to(x.device)**(2 * t)
-        result = self.alpha(x, t) * mul
+        alpha = self.alpha(x, t)
+        result = alpha * mul.reshape(alpha.data.shape)
         return result.to(x.device)
 
 
