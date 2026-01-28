@@ -1,22 +1,27 @@
 import os
+import random
 from abc import abstractmethod
 from argparse import Namespace
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, Sequence, Union
 
+import numpy as np
 import pandas as pd
 import torch
 import yaml
 from diffdock.utils.diffusion_utils import t_to_sigma as t_to_sigma_compl
 from diffdock.utils.download import download_and_extract
+from diffdock.utils.geometry import matrix_to_axis_angle
 from diffdock.utils.inference_utils import InferenceDataset, set_nones
 from diffdock.utils.sampling import modify_conformer_batch
+from diffdock.utils.torsion import modify_conformer_torsion_angles_batch
 from diffdock.utils.utils import get_model
 from flowgym import BaseModel, Environment, FlowMixin, MemorylessNoiseSchedule, NoiseSchedule, Scheduler
 from flowgym.types import BinaryOp, FlowTensor, UnaryOp
 from flowgym.utils import append_dims
 from matplotlib.pyplot import Figure
+from scipy.spatial.transform import Rotation as R
 from torch_geometric.data import DataLoader
 from torch_geometric.data.batch import Batch
 from torch_geometric.data.hetero_data import HeteroData
@@ -29,17 +34,61 @@ pose_els = {'tr', 'rot', 'tor'}
 # TODO: check logic of DockResult data flow
 # TODO: check feature_postprocess latent_postprocess
 # TODO: check if we have right version of active exp (run.py line 237+)
+# TODO: ideal data type is only pose and we run rotation at the end of every loop iter of sampling (change flowgym)
 
 
 @dataclass(frozen=True)
-class DockPose(object): # TODO maybe just use dict-nodestorage functionality somehow
+class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality somehow
     tr: torch.Tensor
     rot: torch.Tensor
     tor: torch.Tensor
 
 
-    def to(self, device: torch.device) -> "DockPose":
+    def to(self, device: torch.device | str) -> "DockPose":
         return DockPose(self.tr.to(device), self.rot.to(device), self.tor.to(device))
+
+
+    @property
+    def base(self) -> bool:
+        zero = torch.tensor(0.)
+        return torch.allclose(self.tr, zero) and torch.allclose(self.rot, zero) and torch.allclose(self.tor, zero)
+
+
+    def combine(self, other: Self, op: BinaryOp) -> "DockPose":
+        tr = op(self.tr, other.tr)
+        rot = op(self.rot, other.rot)
+        tor = op(self.tor, other.tor)
+
+        return DockPose(tr, rot, tor)
+
+
+    def apply(self, op: UnaryOp) -> "DockPose":
+        tr = op(self.tr)
+        rot = op(self.rot)
+        tor = op(self.tor)
+
+        return DockPose(tr, rot, tor)
+
+
+    def __len__(self) -> int:
+        return self.tr.shape[0]
+
+
+    def __getitem__(self, idx: Union[int, slice]) -> "DockPose":
+        return DockPose(self.tr[idx], self.rot[idx], self.tor[idx])
+
+
+    @classmethod
+    def collate(cls: type[Self], items: Sequence[Self]) -> "DockPose":
+        tr = torch.vstack([i.tr for i in items])
+        rot = torch.vstack([i.rot for i in items])
+        tor = torch.vstack([i.tor for i in items])
+
+        return DockPose(tr, rot, tor)
+
+
+    def aggregate(self) -> torch.Tensor:
+        raise NotImplementedError
 
 
 class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
@@ -67,7 +116,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
         self.graph = complex_graph
 
 
-    def to(self, device: torch.device) -> "DockResult":
+    def to(self, device: torch.device | str) -> "DockResult":
         return DockResult(self.graph.to(device))
 
 
@@ -82,6 +131,11 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
     @property
     def pos(self) -> torch.Tensor:
         return self.graph['ligand'].pos
+
+
+    @pos.setter
+    def pos(self, val: torch.Tensor):
+        self.graph['ligand'].pos = val
 
 
     @property
@@ -131,7 +185,10 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
         if not items:
             raise ValueError("Cannot collate an empty sequence")
 
-        return cls(Batch.from_data_list([item.graph for item in items]))
+        graph_batch = Batch.from_data_list([item.graph for item in items])
+        result = cls(graph_batch)
+        result.pose = DockPose.collate(item.pose for item in items)
+        return result
 
 
     @classmethod
@@ -144,14 +201,13 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
         return cls(graph)
 
 
-    def apply(self, op: UnaryOp) -> Self:
+    def apply(self, op: UnaryOp) -> "DockResult":
         res = self.clone()
 
         tr = op(res.pose.tr)
         rot = op(res.pose.rot)
         tor = op(res.pose.tor)
         res.pose = DockPose(tr, rot, tor)
-        # TODO apply pose?
 
         return res
 
@@ -164,7 +220,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
                                       tr_perturb, rot_perturb, tor_perturb, mask_rotate)
 
 
-    def combine(self, other: Union[Self, float, torch.Tensor], op: BinaryOp) -> Self:
+    def combine(self, other: Union[Self, float, torch.Tensor], op: BinaryOp) -> "DockResult":
         res = self.clone()
         if isinstance(other, DockResult):
             pose = other.pose
@@ -173,19 +229,29 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
             tor = op(res.pose.tor, pose.tor)
             res.pose = DockPose(tr, rot, tor)
 
+            if self.pose.base and not other.pose.base: # other is transformation
+                res.pos = self.apply_pose(res.pose)
+
+            elif not self.pose.base and other.pose.base: # self is transformation
+                res.pos = other.apply_pose(res.pose)
+
         else:
             tr = op(res.pose.tr, other)
             rot = op(res.pose.rot, other)
             tor = op(res.pose.tor, other)
             res.pose = DockPose(tr, rot, tor)
 
-        res.graph['ligand'].pos = self.apply_pose(res.pose)
         return res
 
 
+    def aggregate(self) -> torch.Tensor:
+        raise NotImplementedError
+
+
 class DiffDockBaseModel(BaseModel[DockResult]):
-    def __init__(self, scheduler_params):
+    def __init__(self, scheduler_params: Namespace):
         self._scheduler = DiffDockScheduler(scheduler_params)
+        # TODO fetch underlying model etc either AAModel or CGModel or old variations
         raise NotImplementedError
 
 
@@ -194,26 +260,64 @@ class DiffDockBaseModel(BaseModel[DockResult]):
         return self._scheduler
 
 
-    @abstractmethod
     def sample_p0(self, n: int, **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
-        """Sample n data points from the base distribution p0.
+        # TODO make batch of n copies
+        results: Sequence[DockResult] = []
+        for _ in range(n):
+            complex_graph = kwargs['data']
+            center_pocket = complex_graph['receptor'].pos.mean(dim=0)
+            pocket_knowledge = kwargs['pocket_knowledge'] if 'pocket_knowledge' in kwargs else False
+            pocket_cutoff = kwargs['pocket_cutoff']
+            no_torsion = kwargs['no_torsion']
+            no_random = kwargs['no_random']
+            choose_residue = kwargs['choose_residue']
+            initial_noise_std_proportion = kwargs['initial_noise_std_proportion']
+            tr_sigma_max = kwargs['tr_sigma_max']
+            if pocket_knowledge:
+                d = torch.cdist(complex_graph['receptor'].pos, torch.from_numpy(complex_graph['ligand'].orig_pos[0]).float() - complex_graph.original_center)
+                label = torch.any(d < pocket_cutoff, dim=1)
 
-        Parameters
-        ----------
-        n : int
-            Number of samples to draw.
+                if torch.any(label):
+                    center_pocket = complex_graph['receptor'].pos[label].mean(dim=0)
+                else:
+                    print("No pocket residue below minimum distance ", pocket_cutoff, "taking closest at", torch.min(d))
+                    center_pocket = complex_graph['receptor'].pos[torch.argmin(torch.min(d, dim=1)[0])]
 
-        **kwargs : dict
-            Additional keyword arguments.
+            if not no_torsion:
+                # randomize torsion angles
+                torsion_updates = np.random.uniform(low=-np.pi, high=np.pi, size=complex_graph['ligand'].edge_mask.sum())
+                complex_graph['ligand'].pos = \
+                    modify_conformer_torsion_angles_batch(complex_graph['ligand'].pos,
+                                                    complex_graph['ligand', 'ligand'].edge_index.T[
+                                                        complex_graph['ligand'].edge_mask],
+                                                    complex_graph['ligand'].mask_rotate[0], torsion_updates)
 
-        Returns
-        -------
-        samples : D
-            Samples from the base distribution p0.
+            # randomize position
+            molecule_center = torch.mean(complex_graph['ligand'].pos, dim=0, keepdim=True)
+            random_rotation = torch.from_numpy(R.random().as_matrix()).float()
+            complex_graph['ligand'].pos = (complex_graph['ligand'].pos - molecule_center) @ random_rotation.T + center_pocket
 
-        kwargs : dict
-            Additional keyword arguments.
-        """
+            if not no_random:  # note for now the torsion angles are still randomised
+                if choose_residue:
+                    idx = random.randint(0, len(complex_graph['receptor'].pos)-1)
+                    tr_update = torch.normal(mean=complex_graph['receptor'].pos[idx:idx+1], std=0.01)
+                elif initial_noise_std_proportion >= 0.0:
+                    std_rec = torch.sqrt(torch.mean(torch.sum(complex_graph['receptor'].pos ** 2, dim=1)))
+                    tr_update = torch.normal(mean=0, std=std_rec * initial_noise_std_proportion / 1.73, size=(1, 3))
+                else:
+                    # if initial_noise_std_proportion < 0.0, we use the tr_sigma_max multiplied by -initial_noise_std_proportion
+                    tr_update = torch.normal(mean=0, std=-initial_noise_std_proportion * tr_sigma_max, size=(1, 3))
+                complex_graph['ligand'].pos += tr_update
+
+            res = DockResult(complex_graph)
+            if not no_torsion and not no_random:
+                rot_updates = matrix_to_axis_angle(random_rotation)
+                res.pose = DockPose(tr_update, rot_updates, torsion_updates)
+
+            results.append(res)
+
+        return DockResult.collate(results), kwargs
+
 
     @abstractmethod
     def forward(self, x: DockResult, t: torch.Tensor, **kwargs: Any) -> DockResult:
@@ -221,40 +325,10 @@ class DiffDockBaseModel(BaseModel[DockResult]):
 
 
     def preprocess(self, x: DockResult, **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
-        """Preprocess data and keyword arguments for the base model.
-
-        Parameters
-        ----------
-        x : D
-            Input data to preprocess.
-
-        **kwargs : dict
-            Additional keyword arguments to preprocess.
-
-        Returns
-        -------
-        output : D
-            Preprocessed data.
-
-        kwargs : dict
-            Preprocessed keyword arguments.
-        """
-        return x, kwargs
+        raise NotImplementedError
 
     def postprocess(self, x: DockResult) -> DockResult:
-        """Postprocess samples x_1 (e.g., decode with VAE).
-
-        Parameters
-        ----------
-        x : D
-            Input data to postprocess.
-
-        Returns
-        -------
-        output : D
-            Postprocessed output.
-        """
-        return x
+        raise NotImplementedError
 
 
 class LogLinearScheduler(Scheduler[FlowTensor]):
@@ -265,8 +339,10 @@ class LogLinearScheduler(Scheduler[FlowTensor]):
 
     def alpha(self, x: FlowTensor, t: torch.Tensor) -> FlowTensor:
         t = t.double().to(x.device)
-        logr = 2 * torch.log(self.sigma_max / self.sigma_min).to(x.device)
-        diff = (self.sigma_min / self.sigma_max).to(x.device)** (2 * t) - (self.sigma_min / self.sigma_max).to(x.device) **2
+        max_over_min = self.sigma_max / self.sigma_min
+        min_over_max = self.sigma_min / self.sigma_max
+        logr = 2 * torch.log(max_over_min).to(x.device)
+        diff = (min_over_max).to(x.device)** (2 * t) - (min_over_max).to(x.device) **2
         result = torch.exp(-logr * self.sigma_max.to(x.device)**2 / (2 * logr) * diff)
         return FlowTensor(append_dims(result, x.data.ndim)).to(x.device)
 
