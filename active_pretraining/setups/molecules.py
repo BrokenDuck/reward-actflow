@@ -10,8 +10,7 @@ from flowmol.analysis.molecule_builder import SampledMolecule
 from flowgym import  BaseModel, Environment
 from flowgym.molecules import FlowGraph, QM9BaseModel, GEOMBaseModel
 from flowgym.utils import temporary_workdir
-from vendi_score import vendi
-from vendi_score import molecule_utils
+from vendi_score import vendi, molecule_utils
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from pathlib import Path
@@ -482,7 +481,7 @@ def parallel_xtb(mols: list[Chem.Mol]):
         # Compute properties using GFN2-xTB
         # Added --ohess to calculate Hessian (needed for Heat Capacity)
         os.system(
-            f"parallel -j {ncpus} "
+            f"parallel --bar -j {ncpus} "
             f"'xtb {{}} --ohess --parallel 1 --namespace {{/.}} --json > {{/.}}.out 2>&1' "
             "::: *.xyz"
         )

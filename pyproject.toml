@@ -1,6 +1,11 @@
 [project]
 authors = [{name = "Cristian Perez Jensen", email = "cristianpjensen@gmail.com"}]
-dependencies = ["imageio[ffmpeg]>=2.37.2,<3", "vendi-score[images,molecules]>=0.0.3,<0.0.4"]
+dependencies = [
+    "imageio[ffmpeg]>=2.37.2,<3",
+    "vendi-score[images,molecules]>=0.0.3,<0.0.4",
+    "peft>=0.8.2",
+    "transformers>=4.45.0"
+]
 name = "active_pretraining"
 requires-python = ">=3.8,<3.12"
 version = "0.1.0"
@@ -29,7 +34,7 @@ torch_scatter = "==2.1.2"
 torch_cluster = "==1.6.3"
 flowmol = { git = "https://github.com/cristianpjensen/FlowMol.git", rev = "8f4c98cbe68111e4e63480b250d925b6d960d3bc" }
 clip = { git = "https://github.com/openai/CLIP.git" }
-flowgym = "==1.11"
+flowgym = "==1.12"
 
 [tool.pixi.activation]
 env = { DGLBACKEND = "pytorch" }

@@ -10,6 +10,7 @@ from PIL import Image
 from matplotlib.figure import Figure
 from argparse import ArgumentParser
 from pathlib import Path
+from peft import LoraConfig
 
 from active_pretraining.problem_setup import ProblemSetup, SampleFile
 from active_pretraining.utils import add_valid_border, CLIP, Batch
@@ -30,6 +31,19 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
             prompts=prompts,
             device=device,
         )
+
+        text_encoder = self._base_model.pipe.text_encoder
+        text_encoder.requires_grad_(False)
+        text_encoder.eval()
+
+        # Add LoRA
+        peft_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        )
+        self._base_model.unet.add_adapter(peft_config)
+
         self._base_model.scheduler.noise_schedule = ConstantNoiseSchedule(0)
         self._base_model.eval()
 
@@ -97,4 +111,3 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
     def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
         # todo: aesthetic score?
         return dict()
-

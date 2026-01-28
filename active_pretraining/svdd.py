@@ -11,7 +11,7 @@ def sample_svdd_pm(
     env: Environment[D],
     n: int,
     m: int = 20,
-    alpha: float = 0.0,
+    temperature: float = 0.0,
     pbar: bool = True,
     **kwargs: Any,
 ):
@@ -33,42 +33,41 @@ def sample_svdd_pm(
         diffusion = env.diffusion(x, t_curr)
 
         # Sample m seeds which represent the noise, then we pick the best noise later
-        seeds = torch.randint(0, 2**32 - 1, (m,), device=env.device)
-        values = torch.zeros(n, m)
+        epsilons = [x.randn_like() for _ in range(m)]
+        values = torch.empty(n, m, device=env.device)
 
-        for j, seed in enumerate(seeds):
-            torch.manual_seed(seed)
-            epsilon = x.randn_like()
-
+        for j, epsilon in enumerate(epsilons):
             x_next = x + dt * drift + torch.sqrt(dt) * diffusion * epsilon
 
             x_final = env.pred_final(x_next, t_curr + dt, **kwargs)
             if not env.reward.latent_space:
                 x_final = env.base_model.postprocess(x_final)
 
-            values[:, j] = env.reward(x_final, **kwargs)[0].cpu()
-            trajectories.append(x.to("cpu"))
+            reward, valids = env.reward(x_final, **kwargs)
+            reward[~valids] = -torch.inf
+            values[:, j] = reward
 
-        if alpha > 0:
-            weights = torch.softmax(values / alpha, dim=1)
+        if temperature > 0:
+            weights = torch.softmax(values / temperature, dim=1)
             indices = torch.multinomial(weights, num_samples=1).squeeze(1)
         else:
             indices = torch.argmax(values, dim=1)
 
-        seeds = seeds[indices]
-        epsilons = []
-        for i in range(n):
-            torch.manual_seed(seeds[i])
-            epsilon = x.randn_like()
-            epsilons.append(epsilon[i])
-
-        epsilon = type(x).collate(epsilons)
+        selected_epsilons = [epsilons[j][i] for i, j in enumerate(indices)]
+        epsilon = type(x).collate(selected_epsilons)
         x += dt * drift + torch.sqrt(dt) * diffusion * epsilon
 
-        if isinstance(iterator, tqdm):
-            iterator.set_postfix({ "reward": values[indices].mean().item() })
+        trajectories.append(x.to("cpu"))
 
-    rewards, valids = env.reward(x, **kwargs)
+        if isinstance(iterator, tqdm):
+            chosen = values[torch.arange(n), indices]
+            finite_mask = torch.isfinite(chosen)
+
+            mean_reward = torch.nan
+            if finite_mask.any():
+                mean_reward = chosen[finite_mask].mean().item()
+
+            iterator.set_postfix({ "reward": mean_reward })
 
     sample = env.base_model.postprocess(x)
 

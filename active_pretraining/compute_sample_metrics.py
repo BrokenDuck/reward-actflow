@@ -22,7 +22,7 @@ def main(args):
 
     problem_setup = problem_setups[exp_args["problem_setup"]](exp_args, device=device)
 
-    for eval_dir in tqdm(sorted(exp_dir.glob("eval/*"))):
+    for eval_dir in tqdm(sorted(exp_dir.glob("eval/*"), reverse=True)):
         if not eval_dir.is_dir():
             continue
 

@@ -1,4 +1,5 @@
 from typing import Generic, Optional
+from contextlib import contextmanager
 
 import torch
 from flowgym import construct_env, D
@@ -8,7 +9,8 @@ import imageio.v2 as imageio
 import logging
 import yaml
 import shutil
-import os
+import time
+import csv
 
 from .gp import GPUncertaintyReward, FlowFeatureExtractor
 from .dps import RewardGradient
@@ -65,13 +67,39 @@ class ActivePretraining(Generic[D]):
         self.reward = reward
         self.env = env
 
-    def finetune_base_model(self, batches: list[Batch[D]]):
+        self._timings = {}
+
+        # Create file and write headers
+        self.timing_heads = ["iteration", "eval", "sampling", "visualize", "finetune", "uncertainty_update", "checkpoint"]
+        self.timing_path = self.config.folder / "timings.csv"
+        with open(self.timing_path, "w", newline="") as f:
+            csv.writer(f).writerow(self.timing_heads)
+
+    @contextmanager
+    def _timer(self, name: str):
+        """Context manager to measure execution time of a block."""
+        t0 = time.perf_counter()
+        yield
+        self._timings[name] = time.perf_counter() - t0
+
+    def _flush_timings(self, iteration: int):
+        """Writes the stored timings to the CSV file."""
+        row = [iteration] + [self._timings.get(head, 0.0) for head in self.timing_heads[1:]]
+        with open(self.timing_path, "a", newline="") as f:
+            csv.writer(f).writerow(row)
+
+        self._timings = {}
+
+    def finetune_base_model(self, batches: list[Batch[D]], pbar: bool = False):
         """Fine-tune the base model with obtained valid samples.
 
         Parameters
         ----------
         batches : list[Batch[D]]
             Data batches obtained so far, where one batch comes from one iteration in the order.
+
+        pbar : bool, default: False
+            Progress bar or not.
         """
         # Extract valid samples
         valid_latents = []
@@ -87,7 +115,7 @@ class ActivePretraining(Generic[D]):
             return
 
         # Fine-tune base model
-        opt = torch.optim.Adam(
+        opt = torch.optim.AdamW(
             self.base_model.parameters(),
             lr=self.config.ft_lr,
             weight_decay=self.config.ft_weight_decay,
@@ -100,7 +128,7 @@ class ActivePretraining(Generic[D]):
             steps=self.config.ft_steps,
             batch_size=self.config.ft_batch_size,
             accumulate_steps=self.config.ft_accumulate_steps,
-            pbar=False,
+            pbar=pbar,
         )
 
     def update_uncertainty_estimator(self, batches: list[Batch[D]]):
@@ -167,6 +195,7 @@ class ActivePretraining(Generic[D]):
         batch_size: int,
         kwargs: Optional[dict] = None,
         guided: bool = True,
+        pbar: bool = False,
     ) -> list[Batch[D]]:
         """Obtain multiple batches of samples.
 
@@ -183,6 +212,9 @@ class ActivePretraining(Generic[D]):
 
         guided : bool, default=True
             Whether to use uncertainty guidance when obtaining samples.
+
+        pbar : bool, default=True
+            Progress bar or not.
 
         Returns
         -------
@@ -237,7 +269,7 @@ class ActivePretraining(Generic[D]):
         # Save samples
         directory = self.config.folder / "eval" / f"{iteration:04d}"
         samples_dir = directory / "samples"
-        os.makedirs(samples_dir, exist_ok=True)
+        samples_dir.mkdir(parents=True, exist_ok=True)
 
         count = 0
         for i, batch in enumerate(batches):
@@ -271,36 +303,45 @@ class ActivePretraining(Generic[D]):
 
         for i in range(num_iterations):
             # Evaluate current model state
-            metrics = {}
-            if i % self.config.eval_every == 0:
-                metrics = self.eval_model(i)
+            with self._timer("eval"):
+                metrics = {}
+                if i % self.config.eval_every == 0:
+                    metrics = self.eval_model(i)
 
             # Determine if we should use uncertainty guidance
             has_enough_data = total_valid_samples > self.config.ft_min_dataset_size
             use_guidance = has_enough_data and not self.config.no_uncertainty
 
             # Collect new samples
-            new_batches = self.get_many_batches(samples_per_iter, self.config.sample_batch_size, guided=use_guidance)
-            batch = Batch.concat(new_batches)
-            total_valid_samples += batch.valids.int().sum().item()
+            with self._timer("sampling"):
+                new_batches = self.get_many_batches(samples_per_iter, self.config.sample_batch_size, guided=use_guidance)
+                batch = Batch.concat(new_batches)
+                total_valid_samples += batch.valids.int().sum().item()
 
             # Store data
             batches.append(batch)
 
             # Logging and visualization
-            self.visualize_iter(batch, i)
-            metrics["biased_valid"] = batch.valids.float().mean().item()
-            metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
-            self.logger.info(f"(iter={i:05d}) {f', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+            with self._timer("visualize"):
+                self.visualize_iter(batch, i)
+                metrics["biased_valid"] = batch.valids.float().mean().item()
+                metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
+                self.logger.info(f"(iter={i:05d}) {f', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
 
             # Update models with full buffer
-            if has_enough_data:
-                self.finetune_base_model(batches)
+            with self._timer("finetune"):
+                if has_enough_data:
+                    self.finetune_base_model(batches, pbar=False)
 
-            if not self.config.no_uncertainty:
-                self.update_uncertainty_estimator(batches)
+            with self._timer("uncertainty_update"):
+                if not self.config.no_uncertainty:
+                    self.update_uncertainty_estimator(batches)
 
             # Save checkpoint
-            torch.save(self.base_model.state_dict(), self.config.folder / "base_model.pt")
+            with self._timer("checkpoint"):
+                torch.save(self.base_model.state_dict(), self.config.folder / "base_model.pt")
+
+            # Write timings to CSV
+            self._flush_timings(i)
 
         self._write_video()
