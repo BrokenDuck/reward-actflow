@@ -13,7 +13,7 @@ from diffdock.utils.download import download_and_extract
 from diffdock.utils.inference_utils import InferenceDataset, set_nones
 from diffdock.utils.sampling import modify_conformer_batch
 from diffdock.utils.utils import get_model
-from flowgym import BaseModel, FlowMixin, MemorylessNoiseSchedule, NoiseSchedule, Scheduler
+from flowgym import BaseModel, Environment, FlowMixin, MemorylessNoiseSchedule, NoiseSchedule, Scheduler
 from flowgym.types import BinaryOp, FlowTensor, UnaryOp
 from flowgym.utils import append_dims
 from matplotlib.pyplot import Figure
@@ -50,7 +50,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
         device = complex_graph['ligand'].pos.device
         complex_graph = complex_graph.clone().to(device)
 
-        if 'ligand_pose' not in complex_graph:
+        if 'ligand_pose' not in complex_graph.node_types:
             if isinstance(complex_graph, Batch):
                 data_list = complex_graph.to_data_list()
                 for graph in data_list:
@@ -77,6 +77,11 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
             return DockResult(Batch.from_data_list(data_list))
 
         return DockResult(self.graph.clone())
+
+
+    @property
+    def pos(self) -> torch.Tensor:
+        return self.graph['ligand'].pos
 
 
     @property
@@ -160,8 +165,6 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
 
 
     def combine(self, other: Union[Self, float, torch.Tensor], op: BinaryOp) -> Self:
-        # TODO new idea: core of problem is that rotations are relative to a reference pose, 
-        # so instead always "undo" current rotation and apply new one. problem: double computational costs...
         res = self.clone()
         if isinstance(other, DockResult):
             pose = other.pose
@@ -472,175 +475,3 @@ class DockingProblemSetup(ProblemSetup[DockResult]):
     def feature_layer(self) -> str:
         raise NotImplementedError
         return "model.vector_field.node_output_head.0"
-
-    def feature_postprocess(self, x: DockResult, feats: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
-        # `feats` is a tensor of shape (num_nodes, feature_dim), which we want to take the mean over
-        # for each graph in the batch. We have the indices that each node belongs to which graph in x.n_idx.
-        device = x.device
-        num_nodes, feature_dim = feats.shape
-        num_graphs = int(x.n_idx.max().item()) + 1
-
-        # Sum features per graph
-        graph_sums = torch.zeros(num_graphs, feature_dim, device=device)
-        graph_sums.index_add_(0, x.n_idx, feats)
-
-        # Count nodes per graph
-        graph_counts = torch.zeros(num_graphs, device=device)
-        graph_counts.index_add_(0, x.n_idx, torch.ones(num_nodes, device=device))
-
-        # Mean pooling
-        return graph_sums / graph_counts.unsqueeze(1)
-
-    def latent_postprocess(self, latents: DockResult, valids: torch.Tensor, kwargs: dict) -> DockResult:
-        raise NotImplementedError
-
-        graph = latents.graph.clone()
-
-        def _discretize(x):
-            # argmax finds the class index, one_hot creates the vector
-            # type_as ensures we match the original float precision and device
-            return F.one_hot(x.argmax(dim=-1), num_classes=x.shape[-1]).type_as(x)
-
-        # Set categorical features to be one-hot vectors over dim -1
-        graph.ndata["a_t"] = _discretize(graph.ndata["a_t"])
-        graph.ndata["c_t"] = _discretize(graph.ndata["c_t"])
-        graph.edata["e_t"] = _discretize(graph.edata["e_t"])
-
-        # Relax the geometry, otherwise the structures will become increasingly distorted
-        graph.edata["ue_mask"] = latents.ue_mask
-        if self.geometry_opt != "none":
-            graphs = []
-            for i, g in enumerate(dgl.unbatch(graph)):
-                if valids[i]:
-                    g = relax_positions(g, self.base_model.model.atom_type_map, self.geometry_opt)
-
-                graphs.append(g)
-
-            graph = dgl.batch(graphs)
-
-        # Remove center of mass
-        init_coms = dgl.readout_nodes(graph, feat="x_t", op="mean")
-        graph.ndata["x_t"] = graph.ndata["x_t"] - init_coms[latents.n_idx]
-
-        return FlowGraph(graph, latents.ue_mask, latents.n_idx, latents.e_idx)
-
-
-    @torch.no_grad()
-    def visualize_sample(
-        self,
-        env: Environment[DockResult],
-        samples: list[DockResult],
-        valids: list[torch.Tensor],
-    ) -> Figure:
-        raise NotImplementedError
-        mols = self._to_mols(samples[-1])
-
-        fig = plt.figure(figsize=(12, 8))
-        cols = 8
-        rows = (len(mols) + cols - 1) // cols
-        for i, mol in enumerate(mols):
-            ax = fig.add_subplot(rows, cols, i + 1)
-            if valids[-1][i]:
-                ax.set_title("Valid", color="green", fontsize=8)
-            else:
-                ax.set_title("Invalid", color="red", fontsize=8)
-
-            ax.axis("off")
-            img = Draw.MolToImage(mol, size=(150, 150))
-            ax.imshow(img)
-
-        return fig
-
-    def eval_sampling_kwargs(self, n: int) -> dict:
-        raise NotImplementedError
-        probs = self.base_model.model.n_atoms_dist.probs
-
-        expected = n * probs
-        counts = expected.round().long()
-
-        # Correct for rounding errors
-        remainder = n - counts.sum()
-        if remainder > 0:
-            fractional = expected - counts
-            extra = torch.topk(fractional, remainder).indices
-            counts[extra] += 1
-
-        indices = torch.arange(len(counts), device=counts.device)
-        result = torch.repeat_interleave(indices, counts)
-
-        # Randomly order result
-        perm = torch.randperm(result.numel(), device=result.device)
-        result = result[perm]
-
-        return {"n_atoms": result}
-
-    def save_sample(self, sample: DockResult, kwargs: dict, filename: os.PathLike | str):
-        raise NotImplementedError
-        if len(sample) != 1:
-            raise ValueError("Can only save a single sample at a time.")
-
-        mol = SampledMolecule(sample.graph.cpu(), self.base_model.model.atom_type_map).rdkit_mol
-        mol = validate_mol(mol)
-
-        if mol is None:
-            return
-
-        Chem.MolToMolFile(mol, f"{filename}.mol")
-
-    def compute_metrics(
-        self,
-        samples: list[DockResult],
-        valids: list[torch.Tensor],
-        kwargs: list[dict],
-    ) -> dict[str, float]:
-        raise NotImplementedError
-        n_samples = 0
-        mols = []
-        for d, v in zip(samples, valids):
-            for j in range(len(d)):
-                n_samples += 1
-
-                if not v[j]:
-                    continue
-
-                mol = SampledMolecule(d[j].graph.cpu(), self.base_model.model.atom_type_map).rdkit_mol
-                mol = validate_mol(mol)
-
-                if mol is not None:
-                    mols.append(mol)
-
-        # We want to make sure the number of samples we compute the diversity on is constant between iterations
-        mols = mols[:n_samples // self.div_valid]
-        K = molecule_utils.get_tanimoto_K(mols)
-        vendi_score = vendi.score_K(K)
-
-        return { "vendi": float(vendi_score) }
-
-    def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
-        raise NotImplementedError
-        # Load molecule samples
-        valid_mols = []
-        valid_files = []
-        for sample_file in sample_files:
-            if sample_file.is_valid:
-                mol = Chem.MolFromMolFile(sample_file.file, sanitize=False, removeHs=False, strictParsing=False)
-                if mol is not None:
-                    valid_files.append(sample_file.file)
-                    valid_mols.append(mol)
-
-        # Compute quantum chemistry properties
-        res = parallel_xtb(valid_mols)
-
-        # Return in nice format
-        metric_names = ["energy", "homo", "lumo", "homo_lumo_gap", "dipole_moment", "polarizability", "heat_capacity"]
-        out = dict()
-        for fn, xtb_res in zip(valid_files, res):
-            if xtb_res is None:
-                continue
-
-            sample_name = os.path.basename(fn).replace(".mol", "")
-            metrics = { name: getattr(xtb_res, name) for name in metric_names }
-            out[sample_name] = metrics
-
-        return out
