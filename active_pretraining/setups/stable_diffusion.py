@@ -8,10 +8,12 @@ from flowgym.images import SD15BaseModel
 from vendi_score import vendi
 from PIL import Image
 from matplotlib.figure import Figure
-import os
+from argparse import ArgumentParser
+from pathlib import Path
+from peft import LoraConfig
 
 from active_pretraining.problem_setup import ProblemSetup, SampleFile
-from active_pretraining.utils import add_valid_border, CLIP
+from active_pretraining.utils import add_valid_border, CLIP, Batch
 
 
 class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
@@ -29,10 +31,29 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
             prompts=prompts,
             device=device,
         )
+
+        text_encoder = self._base_model.pipe.text_encoder
+        text_encoder.requires_grad_(False)
+        text_encoder.eval()
+
+        # Add LoRA
+        peft_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        )
+        self._base_model.unet.add_adapter(peft_config)
+
         self._base_model.scheduler.noise_schedule = ConstantNoiseSchedule(0)
         self._base_model.eval()
 
         self.clip = CLIP(device)
+
+    @classmethod
+    def add_args(cls, parser: ArgumentParser):
+        parser.add_argument("--sd_prompts", type=str, nargs="+", default=None)
+        parser.add_argument("--sd_cfg_scale", type=float, default=0.0)
+        parser.add_argument("--sd_score_threshold", type=float, default=20.0)
 
     @property
     def base_model(self) -> BaseModel[FlowTensor]:
@@ -45,9 +66,9 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
         return img_list
 
     @torch.no_grad()
-    def validity(self, x: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
+    def validity(self, samples: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
         text_list = kwargs["prompt"]
-        img_list = self._to_pil_images(x)
+        img_list = self._to_pil_images(samples)
         scores = self.clip.score(img_list, text_list)
         return scores > self.score_threshold
 
@@ -55,21 +76,16 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
     def feature_layer(self) -> str:
         return "unet.mid_block"
 
-    def feature_postprocess(self, x: FlowTensor, feats: torch.Tensor) -> torch.Tensor:
+    def postprocess_features(self, latents: FlowTensor, feats: torch.Tensor) -> torch.Tensor:
         # If CFG, only use conditional features
-        if feats.shape[0] == 2 * len(x):
+        if feats.shape[0] == 2 * len(latents):
             feats, _ = feats.chunk(2)
 
         return feats.mean(dim=[-2, -1])
 
-    def visualize_sample(
-        self,
-        env: Environment[FlowTensor],
-        samples: list[FlowTensor],
-        valids: list[torch.Tensor],
-    ) -> Figure:
-        x = samples[-1].data.cpu()
-        v = valids[-1].cpu()
+    def visualize_batch(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
+        x = batch.samples.data.cpu()
+        v = batch.valids.cpu()
         grid = make_grid(add_valid_border(x, v, thickness=16), nrow=8)
 
         fig = Figure(figsize=(8, 8))
@@ -79,7 +95,7 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
 
         return fig
 
-    def save_sample(self, sample: FlowTensor, kwargs: dict, filename: os.PathLike | str):
+    def save_sample(self, sample: FlowTensor, kwargs: dict, filename: Path):
         x = sample.data.cpu()
         save_image(x, f"{filename}.png")
 
@@ -87,17 +103,11 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
         with open(f"{filename}_prompt.txt", "w") as f:
             f.write(kwargs.get("prompt", "prompt not found"))
 
-    def compute_metrics(
-        self,
-        samples: list[FlowTensor],
-        valids: list[torch.Tensor],
-        kwargs: list[dict],
-    ) -> dict[str, float]:
-        img_list = self._to_pil_images(FlowTensor.collate(samples))
+    def compute_metrics(self, batches: list[Batch[FlowTensor]]) -> dict[str, float]:
+        img_list = self._to_pil_images(FlowTensor.collate([b.samples for b in batches]))
         feats = self.clip.embed_images(img_list)
         return { "vendi": vendi.score_X(feats) }
 
     def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
         # todo: aesthetic score?
         return dict()
-

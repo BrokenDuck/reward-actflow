@@ -5,6 +5,8 @@ import torch.nn as nn
 import gpytorch
 from flowgym import D, BaseModel, Reward
 
+from .utils import Batch
+
 
 class FlowFeatureExtractor(nn.Module, Generic[D]):
     """Makes it possible to extract features from a specific layer of a flow model.
@@ -22,9 +24,8 @@ class FlowFeatureExtractor(nn.Module, Generic[D]):
         The timestep at which to extract features during the diffusion process. Earlier timesteps
         will give more semantic features, whereas later ones will give more low-level features.
 
-    postprocess : Optional[Callable[[Any], torch.Tensor]]
-        An optional post-processing function to apply to the extracted features, defaults to
-        identity.
+    postprocess : Callable[[D, Any], torch.Tensor]
+        An optional post-processing function to apply to the extracted features.
     """
 
     def __init__(
@@ -32,17 +33,13 @@ class FlowFeatureExtractor(nn.Module, Generic[D]):
         base_model: BaseModel[D],
         layer: str,
         timestep: float,
-        postprocess: Optional[Callable[[D, Any], torch.Tensor]] = None,
+        postprocess: Callable[[D, Any], torch.Tensor],
     ):
         super().__init__()
         self.base_model = base_model
         self.layer = layer
         self.timestep = timestep
         self._features = None
-
-        if postprocess is None:
-            postprocess = lambda x, feat: feat
-
         self.postprocess = postprocess
 
         if layer != "input":
@@ -135,24 +132,23 @@ class GPUncertaintyReward(Reward[D]):
         model.eval()
         likelihood.eval()
 
-        self.feats = feats
         self.feat_extractor = feat_extractor
         self.likelihood = likelihood
         self.model = model
         self.device = device
 
-    def set_data(self, data: list[D], valids: list[torch.Tensor], kwargs: list[dict]):
+    @torch.no_grad()
+    def set_data(self, batches: list[Batch[D]]):
         """Set data by computing features and storing."""
-        feats = []
-        with torch.no_grad():
-            for x, k in zip(data, kwargs):
-                feat = self.feat_extractor(x.to(self.device), **k).detach()
-                feats.append(feat)
+        feats_list = []
+        for batch in batches:
+            feat = self.feat_extractor(batch.latents.to(self.device), **batch.kwargs).detach()
+            feats_list.append(feat)
 
-        self.feats = torch.cat(feats, dim=0)
+        feats = torch.cat(feats_list, dim=0)
 
-        labels = torch.zeros(self.feats.shape[0], device=self.device)
-        self.model.set_train_data(self.feats, labels, strict=False)
+        labels = torch.zeros(feats.shape[0], device=self.device)
+        self.model.set_train_data(feats, labels, strict=False)
 
     def __call__(self, x: D, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         x = x.to(self.device)

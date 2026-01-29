@@ -10,16 +10,18 @@ from flowmol.analysis.molecule_builder import SampledMolecule
 from flowgym import  BaseModel, Environment
 from flowgym.molecules import FlowGraph, QM9BaseModel, GEOMBaseModel
 from flowgym.utils import temporary_workdir
-from vendi_score import vendi
-from vendi_score import molecule_utils
+from vendi_score import vendi, molecule_utils
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+from pathlib import Path
+from argparse import ArgumentParser
 import json
 from json import JSONDecodeError
 import re
 import os
 
 from active_pretraining.problem_setup import ProblemSetup, SampleFile
+from active_pretraining.utils import Batch
 
 
 class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
@@ -40,15 +42,19 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
         else:
             raise ValueError(f"Unknown dataset: {dataset}")
 
+    @classmethod
+    def add_args(cls, parser: ArgumentParser):
+        parser.add_argument("--mol_geometry_opt", type=str, choices=["none", "mmff", "uff", "gfn2"], default="mmff")
+
     @property
     def base_model(self) -> BaseModel[FlowGraph]:
         return self._base_model
 
-    def validity(self, x: FlowGraph, kwargs: dict) -> torch.Tensor:
-        valids = torch.ones(len(x), dtype=torch.bool)
+    def validity(self, samples: FlowGraph, kwargs: dict) -> torch.Tensor:
+        valids = torch.ones(len(samples), dtype=torch.bool)
 
-        x.graph.edata["ue_mask"] = x.ue_mask
-        batched_graph = x.graph.cpu()
+        samples.graph.edata["ue_mask"] = samples.ue_mask
+        batched_graph = samples.graph.cpu()
 
         for i, g in enumerate(dgl.unbatch(batched_graph)):
             # Check if it passes rdkit validity rules
@@ -69,25 +75,25 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
     def feature_layer(self) -> str:
         return "model.vector_field.node_output_head.0"
 
-    def feature_postprocess(self, x: FlowGraph, feats: torch.Tensor) -> torch.Tensor:
+    def postprocess_features(self, latents: FlowGraph, feats: torch.Tensor) -> torch.Tensor:
         # `feats` is a tensor of shape (num_nodes, feature_dim), which we want to take the mean over
         # for each graph in the batch. We have the indices that each node belongs to which graph in x.n_idx.
-        device = x.device
+        device = latents.device
         num_nodes, feature_dim = feats.shape
-        num_graphs = int(x.n_idx.max().item()) + 1
+        num_graphs = int(latents.n_idx.max().item()) + 1
 
         # Sum features per graph
         graph_sums = torch.zeros(num_graphs, feature_dim, device=device)
-        graph_sums.index_add_(0, x.n_idx, feats)
-
+        graph_sums.index_add_(0, latents.n_idx, feats)
         # Count nodes per graph
         graph_counts = torch.zeros(num_graphs, device=device)
-        graph_counts.index_add_(0, x.n_idx, torch.ones(num_nodes, device=device))
+        graph_counts.index_add_(0, latents.n_idx, torch.ones(num_nodes, device=device))
 
         # Mean pooling
         return graph_sums / graph_counts.unsqueeze(1)
 
-    def latent_postprocess(self, latents: FlowGraph, valids: torch.Tensor, kwargs: dict) -> FlowGraph:
+    def postprocess_latents(self, batch: Batch[FlowGraph]) -> FlowGraph:
+        latents = batch.latents
         graph = latents.graph.clone()
 
         def _discretize(x):
@@ -105,7 +111,7 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
         if self.geometry_opt != "none":
             graphs = []
             for i, g in enumerate(dgl.unbatch(graph)):
-                if valids[i]:
+                if batch.valids[i]:
                     g = relax_positions(g, self.base_model.model.atom_type_map, self.geometry_opt)
 
                 graphs.append(g)
@@ -127,20 +133,15 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
         return mols
 
     @torch.no_grad()
-    def visualize_sample(
-        self,
-        env: Environment[FlowGraph],
-        samples: list[FlowGraph],
-        valids: list[torch.Tensor],
-    ) -> Figure:
-        mols = self._to_mols(samples[-1])
+    def visualize_batch(self, env: Environment[FlowGraph], batch: Batch[FlowGraph]) -> Figure:
+        mols = self._to_mols(batch.samples)
 
         fig = plt.figure(figsize=(12, 8))
         cols = 8
         rows = (len(mols) + cols - 1) // cols
-        for i, mol in enumerate(mols):
+        for i, (mol, is_valid) in enumerate(zip(mols, batch.valids)):
             ax = fig.add_subplot(rows, cols, i + 1)
-            if valids[-1][i]:
+            if is_valid:
                 ax.set_title("Valid", color="green", fontsize=8)
             else:
                 ax.set_title("Invalid", color="red", fontsize=8)
@@ -152,6 +153,7 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
         return fig
 
     def eval_sampling_kwargs(self, n: int) -> dict:
+        # Fix the atom sizes seen during evaluation
         probs = self.base_model.model.n_atoms_dist.probs
 
         expected = n * probs
@@ -173,7 +175,7 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
 
         return {"n_atoms": result}
 
-    def save_sample(self, sample: FlowGraph, kwargs: dict, filename: os.PathLike | str):
+    def save_sample(self, sample: FlowGraph, kwargs: dict, filename: Path):
         if len(sample) != 1:
             raise ValueError("Can only save a single sample at a time.")
 
@@ -187,20 +189,18 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
 
     def compute_metrics(
         self,
-        samples: list[FlowGraph],
-        valids: list[torch.Tensor],
-        kwargs: list[dict],
+        batches: list[Batch[FlowGraph]],
     ) -> dict[str, float]:
         n_samples = 0
         mols = []
-        for d, v in zip(samples, valids):
-            for j in range(len(d)):
+        for batch in batches:
+            for j in range(len(batch)):
                 n_samples += 1
 
-                if not v[j]:
+                if not batch.valids[j]:
                     continue
 
-                mol = SampledMolecule(d[j].graph.cpu(), self.base_model.model.atom_type_map).rdkit_mol
+                mol = SampledMolecule(batch.samples[j].graph.cpu(), self.base_model.model.atom_type_map).rdkit_mol
                 mol = validate_mol(mol)
 
                 if mol is not None:
@@ -215,11 +215,11 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
 
     def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
         # Load molecule samples
-        valid_mols = []
-        valid_files = []
+        valid_mols: list[Chem.Mol] = []
+        valid_files: list[Path] = []
         for sample_file in sample_files:
             if sample_file.is_valid:
-                mol = Chem.MolFromMolFile(sample_file.file, sanitize=False, removeHs=False, strictParsing=False)
+                mol = Chem.MolFromMolFile(str(sample_file.file), sanitize=False, removeHs=False, strictParsing=False)
                 if mol is not None:
                     valid_files.append(sample_file.file)
                     valid_mols.append(mol)
@@ -230,11 +230,11 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
         # Return in nice format
         metric_names = ["energy", "homo", "lumo", "homo_lumo_gap", "dipole_moment", "polarizability", "heat_capacity"]
         out = dict()
-        for fn, xtb_res in zip(valid_files, res):
+        for file_path, xtb_res in zip(valid_files, res):
             if xtb_res is None:
                 continue
 
-            sample_name = os.path.basename(fn).replace(".mol", "")
+            sample_name = file_path.name.replace(".mol", "")
             metrics = { name: getattr(xtb_res, name) for name in metric_names }
             out[sample_name] = metrics
 
@@ -271,12 +271,12 @@ def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff"
         # Sometimes it crashes in the middle of a run, so we guard with try-except
         try:
             AllChem.MMFFOptimizeMolecule(mol)  # type: ignore
-        except RuntimeError:
+        except:
             pass
     elif alg == "uff":
         try:
             AllChem.UFFOptimizeMolecule(mol)  # type: ignore
-        except RuntimeError:
+        except:
             pass
     elif alg == "gfn2":
         mol = xtb_relax_geometry(mol)
@@ -307,20 +307,20 @@ def xtb_relax_geometry(mol: Chem.Mol) -> Chem.Mol | None:
     """
     with temporary_workdir():
         # Write molecule to XYZ file
-        xyz_file = "input.xyz"
-        output_file = "xtbopt.xyz"
+        xyz_file = Path("input.xyz")
+        output_file = Path("xtbopt.xyz")
 
         # Convert RDKit mol to XYZ format
-        Chem.MolToXYZFile(mol, xyz_file)
+        Chem.MolToXYZFile(mol, str(xyz_file))
 
         # Optimize geometry
         os.system(f"xtb {xyz_file} --opt --gfn 2 > /dev/null 2>&1")
 
-        if not os.path.exists(output_file):
+        if not output_file.exists():
             return None
 
         # Load optimized structure back into RDKit
-        opt_mol = Chem.MolFromXYZFile(output_file)  # type: ignore
+        opt_mol = Chem.MolFromXYZFile(str(output_file))  # type: ignore
         if opt_mol is None:
             return None
 
@@ -381,8 +381,8 @@ def validate_mol(mol: Chem.Mol) -> Optional[Chem.Mol]:
 class XTBResult:
     """Class to parse the output of GFN2-xTB."""
 
-    def __init__(self, filename: str):
-        assert filename.endswith(".json"), f"Filename ({filename}) must end with .json"
+    def __init__(self, filename: Path):
+        assert filename.suffix == ".json", f"Filename ({filename}) must end with .json"
         
         # Load JSON data
         with open(filename, "r") as f:
@@ -390,13 +390,13 @@ class XTBResult:
 
         # Load Log data (assumes .out file exists next to .json)
         # The parallel_xtb function saves JSON as *.xtbout.json and log as *.out
-        log_filename = filename.replace(".xtbout.json", ".out").replace(".json", ".out")
+        log_filename = filename.parent / (filename.stem.split(".")[0] + ".out")
         
-        if os.path.exists(log_filename):
+        if log_filename.exists():
             with open(log_filename, "r") as f:
                 self.log_content = f.read()
         else:
-            self.log_content = ""
+            raise FileNotFoundError(f"Log file {log_filename} not found.")
 
     @property
     def energy(self) -> float:
@@ -481,17 +481,17 @@ def parallel_xtb(mols: list[Chem.Mol]):
         # Compute properties using GFN2-xTB
         # Added --ohess to calculate Hessian (needed for Heat Capacity)
         os.system(
-            f"parallel -j {ncpus} "
+            f"parallel --bar -j {ncpus} "
             f"'xtb {{}} --ohess --parallel 1 --namespace {{/.}} --json > {{/.}}.out 2>&1' "
             "::: *.xyz"
         )
 
         # Read results
         for i in range(1, len(mols) + 1):
-            path = f"{i}.xtbout.json"
+            path = Path(f"{i}.xtbout.json")
 
             try:
-                res = XTBResult(path) if os.path.exists(path) else None
+                res = XTBResult(path) if path.exists() else None
             except JSONDecodeError:
                 res = None
 

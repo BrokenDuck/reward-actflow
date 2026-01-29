@@ -5,13 +5,16 @@ from dataclasses import dataclass
 import torch
 from flowgym import D, BaseModel, Environment
 from matplotlib.figure import Figure
-import os
+from pathlib import Path
+from argparse import ArgumentParser
+
+from .utils import Batch
 
 
 @dataclass
 class SampleFile:
     is_valid: bool
-    file: str
+    file: Path
 
 
 class ProblemSetup(ABC, Generic[D]):
@@ -25,6 +28,17 @@ class ProblemSetup(ABC, Generic[D]):
         """
         pass
 
+    @classmethod
+    def add_args(cls, parser: ArgumentParser):
+        """Add problem setup specific arguments to the parser.
+
+        Parameters
+        ----------
+        parser : ArgumentParser
+            The argument parser to which to add arguments.
+        """
+        pass
+
     @property
     @abstractmethod
     def base_model(self) -> BaseModel[D]:
@@ -32,16 +46,16 @@ class ProblemSetup(ABC, Generic[D]):
         raise NotImplementedError
 
     @abstractmethod
-    def validity(self, x: D, kwargs: dict) -> torch.Tensor:
+    def validity(self, samples: D, kwargs: dict[str, Any]) -> torch.Tensor:
         """Validity/verifier function that checks whether a sample is valid or not.
 
         Parameters
         ----------
-        x : D
-            The sample to check.
+        samples : D
+            The samples to check.
 
-        kwargs : Any
-            Additional keyword arguments that may be needed for validity checking.
+        kwargs : dict
+            The keyword arguments used to generate the samples.
 
         Returns
         -------
@@ -56,84 +70,72 @@ class ProblemSetup(ABC, Generic[D]):
         """The name of the layer from which to extract features for the GP."""
         raise NotImplementedError
 
-    def latent_postprocess(self, latents: D, valids: torch.Tensor, kwargs: dict) -> D:
+    def postprocess_latents(self, batch: Batch[D]) -> D:
         """Post-process latents generated from the base model.
 
         Parameters
         ----------
-        latents : D
-            The latents to post-process.
-
-        valids : torch.Tensor
-            A boolean tensor indicating whether each latent is valid.
-
-        kwargs : dict
-            Keyword arguments.
+        batch : Batch[D]
+            The batch containing latents, valids, and kwargs to post-process.
 
         Returns
         -------
-        D
-            The post-processed sample.
+        latents : D
+            The post-processed latents.
         """
-        return latents
+        return batch.latents
 
     @abstractmethod
-    def feature_postprocess(self, x: D, feats: Any) -> torch.Tensor:
+    def postprocess_features(self, latents: D, feats: Any) -> torch.Tensor:
         """Post-process features extracted from the base model.
 
         Parameters
         ----------
-        x : D
-            The input sample corresponding to the features.
+        batch : D
+            The batch.
 
         feats : Any
             The raw features extracted from the base model.
 
         Returns
         -------
-        torch.Tensor
+        features : torch.Tensor
             The post-processed features.
         """
         raise NotImplementedError
 
     @abstractmethod
-    def visualize_sample(
-        self, env: Environment[D], samples: list[D], valids: list[torch.Tensor]
-    ) -> Figure:
-        """Should output a matplotlib figure for visualizing the sample in the problem setup.
+    def visualize_batch(self, env: Environment[D], batch: Batch[D]) -> Figure:
+        """Produce a matplotlib figure for visualizing the sample in the problem setup.
 
         Parameters
         ----------
         env : Environment[D]
             The environment in which the samples were generated.
 
-        samples : list[D]
-            The samples to visualize, in order of obtaining them.
-
-        valids : list[torch.Tensor]
-            The validity tensors corresponding to the samples.
+        batch : Batch[D]
+            The batch containing samples and valids.
         """
         raise NotImplementedError
 
     @abstractmethod
-    def save_sample(self, sample: D, kwargs: dict, filename: os.PathLike | str):
-        """Save a sample to the disk.
+    def save_sample(self, sample: D, kwargs: dict[str, Any], filename: Path):
+        """Save a *single* sample to the disk.
         
         Parameters
         ----------
         sample : D
-            The sample to save.
+            The sample to save, batch-size 1.
 
         kwargs : dict
-            Additional keyword arguments that may be needed to save the sample.
+            The keyword arguments used to generate the sample.
 
-        filename : os.PathLike | str
-            The file path where to save the sample, without extension. The method will add the
-            appropriate extension.
+        filename : Path
+            The file path where to save the sample, without extension.
         """
         raise NotImplementedError
 
-    def eval_sampling_kwargs(self, n: int) -> dict:
+    def eval_sampling_kwargs(self, n: int) -> dict[str, Any]:
         """Provide keyword arguments for sampling during evaluation.
 
         Parameters
@@ -148,24 +150,13 @@ class ProblemSetup(ABC, Generic[D]):
         """
         return {}
 
-    def compute_metrics(
-        self,
-        samples: list[D],
-        valids: list[torch.Tensor],
-        kwargs: list[dict],
-    ) -> dict[str, float]:
+    def compute_metrics(self, batches: list[Batch[D]]) -> dict[str, float]:
         """Compute relevant (global) metrics for the problem setup.
         
         Parameters
         ----------
-        samples : list[D]
-            The samples for which to compute metrics.
-
-        valids : list[torch.Tensor]
-            The validity tensor corresponding to the samples.
-
-        kwargs : list[dict]
-            Keyword arguments corresponding to the samples.
+        batches : list[Batch[D]]
+            List of batches containing samples to compute metrics on.
 
         Returns
         -------
