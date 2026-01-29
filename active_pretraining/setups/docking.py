@@ -50,8 +50,9 @@ class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality 
 
     @property
     def base(self) -> bool:
-        zero = torch.tensor(0., dtype=self.tr.dtype)
-        return torch.allclose(self.tr, zero) and torch.allclose(self.rot, zero) and torch.allclose(self.tor, zero)
+        zero = torch.tensor(0.).double()
+        return torch.allclose(self.tr.double(), zero) \
+            and torch.allclose(self.rot.double(), zero) and torch.allclose(self.tor.double(), zero)
 
 
     def combine(self, other: Self, op: BinaryOp) -> "DockPose":
@@ -96,25 +97,19 @@ class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality 
 class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
     def __init__(
         self,
-        complex_graph: HeteroData | Batch,
+        complex_graph: Batch,
         pose: Optional[DockPose] = None
     ):
         device = complex_graph['ligand'].pos.device
         complex_graph = complex_graph.clone().to(device)
 
         if 'ligand_pose' not in complex_graph.node_types:
-            if isinstance(complex_graph, Batch):
-                data_list = complex_graph.to_data_list()
-                for graph in data_list:
-                    graph['ligand_pose'].rot = torch.zeros((1, 3)).to(device)
-                    graph['ligand_pose'].tr = torch.zeros((1, 3)).to(device)
-                    graph['ligand_pose'].tor = torch.zeros((1, 3)).to(device)
-                complex_graph = Batch.from_data_list(data_list)
-
-            else:
-                complex_graph['ligand_pose'].rot = torch.zeros((1, 3)).to(device)
-                complex_graph['ligand_pose'].tr = torch.zeros((1, 3)).to(device)
-                complex_graph['ligand_pose'].tor = torch.zeros((1, 3)).to(device)
+            data_list = complex_graph.to_data_list()
+            for graph in data_list:
+                graph['ligand_pose'].rot = torch.zeros((1, 3)).to(device)
+                graph['ligand_pose'].tr = torch.zeros((1, 3)).to(device)
+                graph['ligand_pose'].tor = torch.zeros((1, 3)).to(device)
+            complex_graph = Batch.from_data_list(data_list)
 
         self.graph = complex_graph
 
@@ -149,10 +144,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
 
     @pose.setter
     def pose(self, val: "DockPose"):
-        lig_pose = self.graph['ligand_pose']
-        lig_pose.tr = val.tr
-        lig_pose.rot = val.rot
-        lig_pose.tor = val.tor
+        self.graph.update(HeteroData(ligand_pose={'tr': val.tr, 'rot': val.rot, 'tor': val.tor}))
 
 
     def __repr__(self) -> str:
@@ -168,10 +160,6 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
 
 
     def __getitem__(self, idx: Union[int, slice]) -> Self:
-        # TODO mixing batch and single element here... maybe make everything batch
-        if not isinstance(self.graph, Batch):
-            raise ValueError("Trying to get an item of something that is not batched")
-
         if isinstance(idx, int):
             # Faster to use slice_batch if we only want one item
             if idx < 0:
@@ -179,7 +167,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
 
             if idx < 0 or idx >= len(self):
                 raise IndexError(f"Index {idx} out of range for batch size {len(self)}")
-            return type(self)(self.graph.get_example(idx))
+            return type(self)(Batch.from_data_list(self.graph.index_select(slice(idx, idx + 1))))
 
         return type(self)(Batch.from_data_list(self.graph.index_select(idx)))
 
@@ -189,10 +177,12 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
         if not items:
             raise ValueError("Cannot collate an empty sequence")
 
-        graph_batch = Batch.from_data_list([item.graph for item in items])
-        result = cls(graph_batch)
+        data_list = []
+        for item in items:
+            data_list = data_list + item.graph.to_data_list()
 
-        result.pose = DockPose.collate([item.pose for item in items])
+        graph_batch = Batch.from_data_list(data_list)
+        result = cls(graph_batch)
         return result
 
 
@@ -257,7 +247,9 @@ class DiffDockBaseModel(BaseModel[DockResult]):
         return self._scheduler
 
 
-    def sample_p0(self, n: int, pocket_cutoff=7., no_random=False, pocket_knowledge=False, choose_residue=False, initial_noise_std_proportion=-1., **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
+    def sample_p0(self, n: int, pocket_cutoff=7., no_random=False, pocket_knowledge=False, choose_residue=False, initial_noise_std_proportion=-1., add_pose=False,
+    debug=False,
+    **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
         results: Sequence[DockResult] = []
         for _ in range(n):
             complex_graph = kwargs['data']
@@ -301,14 +293,17 @@ class DiffDockBaseModel(BaseModel[DockResult]):
                 complex_graph['ligand'].pos += tr_update
 
             res = DockResult(complex_graph)
-            """
-            if not no_torsion and not no_random:
-                rot_update = matrix_to_axis_angle(random_rotation)
-                tor_update = torch.from_numpy(torsion_updates)
+
+            if not no_torsion and not no_random and add_pose:
+                rot_update = matrix_to_axis_angle(random_rotation).reshape((1, -1))
+                tor_update = torch.from_numpy(torsion_updates).reshape((1, -1))
                 res.pose = DockPose(tr_update, rot_update, tor_update)
-            """
+
+
             results.append(res)
 
+        if debug:
+            return results
 
         return DockResult.collate(results), kwargs
 
