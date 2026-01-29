@@ -96,7 +96,8 @@ class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality 
 class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
     def __init__(
         self,
-        complex_graph: HeteroData | Batch
+        complex_graph: HeteroData | Batch,
+        pose: Optional[DockPose] = None
     ):
         device = complex_graph['ligand'].pos.device
         complex_graph = complex_graph.clone().to(device)
@@ -280,7 +281,7 @@ class DiffDockBaseModel(BaseModel[DockResult]):
                     modify_conformer_torsion_angles(complex_graph['ligand'].pos,
                                                     complex_graph['ligand', 'ligand'].edge_index.T[
                                                         complex_graph['ligand'].edge_mask],
-                                                    complex_graph['ligand'].mask_rotate[0], torsion_updates)
+                                                    complex_graph['ligand'].mask_rotate, torsion_updates)
 
             # randomize position
             molecule_center = torch.mean(complex_graph['ligand'].pos, dim=0, keepdim=True)
@@ -300,11 +301,14 @@ class DiffDockBaseModel(BaseModel[DockResult]):
                 complex_graph['ligand'].pos += tr_update
 
             res = DockResult(complex_graph)
+            """
             if not no_torsion and not no_random:
-                rot_updates = matrix_to_axis_angle(random_rotation)
-                res.pose = DockPose(tr_update, rot_updates, torsion_updates)
-
+                rot_update = matrix_to_axis_angle(random_rotation)
+                tor_update = torch.from_numpy(torsion_updates)
+                res.pose = DockPose(tr_update, rot_update, tor_update)
+            """
             results.append(res)
+
 
         return DockResult.collate(results), kwargs
 
