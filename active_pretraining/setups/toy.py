@@ -43,7 +43,7 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
         return latents.data
 
     @torch.no_grad()
-    def visualize_batch(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
+    def visualize_sample(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
         xmin = -3.5
         xmax = 3.5
         delta = 0.05
@@ -52,7 +52,7 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
         y = torch.linspace(xmin, xmax, 100)
         X, Y = torch.meshgrid(x, y, indexing="ij")
         XY = torch.stack([X.flatten(), Y.flatten()], dim=-1)
-        Z, _ = env.reward(FlowTensor(XY), radius=math.sqrt(5)) 
+        Z, _ = env.reward(FlowTensor(XY), FlowTensor(XY), radius=math.sqrt(5)) 
         Z = Z.reshape(X.shape) 
 
         fig, axes = plt.subplots(1, 2, figsize=(6, 3), constrained_layout=True)
@@ -69,7 +69,7 @@ class ToyProblemSetup(ProblemSetup[FlowTensor]):
         axes[0].set_xlim(xmin, xmax)
         axes[0].set_ylim(xmin, xmax)
 
-        many_samples = env.sample(50_000, pbar=False)[0].data
+        many_samples = env.sample(50_000, pbar=False)[0].sample.data
         H, _, _ = np.histogram2d(
             many_samples[:, 0].cpu().numpy(),
             many_samples[:, 1].cpu().numpy(),

@@ -16,6 +16,7 @@ class RewardGradient(nn.Module, Generic[D]):
     def forward(self, xt: D, t: torch.Tensor, **kwargs: Any) -> D:
         xt = xt.requires_grad()
         x1 = self.env.pred_final(xt, t, **kwargs)
-        r, _ = self.env.reward(x1, **kwargs)
+        # For our purposes, we do not need a postprocessed sample
+        r, _ = self.env.reward(None, x1, **kwargs)  # type: ignore
         sigma = self.env.memoryless_schedule(xt, t)
         return sigma * self.env.reward_scale * xt.gradient(r)

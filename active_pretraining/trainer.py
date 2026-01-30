@@ -1,11 +1,10 @@
-from typing import Generic, Optional
+from typing import Generic
 from contextlib import contextmanager
 
 import torch
 from flowgym import construct_env, D
-from flowgym.utils import train_base_model
+from flowgym.utils import train_base_model, index_dict
 import matplotlib.pyplot as plt
-import imageio.v2 as imageio
 import logging
 import yaml
 import shutil
@@ -14,9 +13,8 @@ import csv
 
 from .gp import GPUncertaintyReward, FlowFeatureExtractor
 from .dps import RewardGradient
-from .svdd import sample_svdd_pm
 from .problem_setup import ProblemSetup
-from .utils import index_dict, Batch
+from .utils import write_video, filter_out_invalids, Batch
 from .config import ActivePretrainingConfig
 
 
@@ -52,6 +50,7 @@ class ActivePretraining(Generic[D]):
         reward = GPUncertaintyReward(
             feat_extractor=feat_extractor,
             feat_dim=feat.shape[1],
+            valid_fn=self.problem.validity,
             kernel=config.gp_kernel,
             lengthscale=config.gp_lengthscale,
             device=x.device,
@@ -96,21 +95,13 @@ class ActivePretraining(Generic[D]):
         Parameters
         ----------
         batches : list[Batch[D]]
-            Data batches obtained so far, where one batch comes from one iteration in the order.
+            Data batches obtained so far, where each entry is from a separate iteration.
 
         pbar : bool, default: False
             Progress bar or not.
         """
-        # Extract valid samples
-        valid_latents = []
-        valid_kwargs = []
-        for batch in batches:
-            for j in range(len(batch)):
-                if batch.valids[j] or self.config.no_verifier:
-                    valid_latents.append(batch.latents[j])
-                    valid_kwargs.append(index_dict(batch.kwargs, j))
-
-        if len(valid_latents) == 0:
+        valid_batch = filter_out_invalids(batches)
+        if len(valid_batch) == 0:
             self.logger.warning("No valid data to fine-tune")
             return
 
@@ -123,12 +114,12 @@ class ActivePretraining(Generic[D]):
         train_base_model(
             self.env.base_model,
             opt,
-            valid_latents,
-            valid_kwargs,
+            [valid_batch.latents.to(self.env.base_model.device)],
+            [valid_batch.kwargs],
             steps=self.config.ft_steps,
             batch_size=self.config.ft_batch_size,
             accumulate_steps=self.config.ft_accumulate_steps,
-            pbar=pbar,
+            pbar=True,
         )
 
     def update_uncertainty_estimator(self, batches: list[Batch[D]]):
@@ -136,118 +127,14 @@ class ActivePretraining(Generic[D]):
 
         Parameters
         ----------
-        batches : list[Batch[D]]
+        samples : list[Batch[D]]
             Data batches obtained so far, where one batch comes from one iteration in the order.
         """
-        self.reward.set_data(batches)
+        self.reward.set_data([b.latents for b in batches], [b.kwargs for b in batches])
 
-    @torch.no_grad()
-    def get_samples(self, n: int, kwargs: Optional[dict] = None, guided: bool = True) -> Batch[D]:
-        """Obtain samples from the environment, optionally using uncertainty guidance.
-
-        Parameters
-        ----------
-        n : int
-            Number of samples to obtain.
-
-        kwargs : Optional[dict], default=None
-            Keyword arguments for sampling.
-
-        guided : bool, default=True
-            Whether to use uncertainty guidance when obtaining samples.
-
-        Returns
-        -------
-        batch : Batch[D]
-            Obtained samples, latents, and kwargs.
-        """
-        if kwargs is None:
-            kwargs = {}
-
-        # Use uncertainty gradients to guide the base model
-        if guided:
-            if self.config.reward_opt_algo == "svdd":
-                output = sample_svdd_pm(self.env, n, m=4, alpha=1 / self.env.reward_scale, pbar=False, **kwargs)
-            elif self.config.reward_opt_algo == "dps":
-                self.env.control_policy = RewardGradient(self.env)
-                output = self.env.sample(n, pbar=False, **kwargs)
-                self.env.control_policy = None
-            else:
-                raise ValueError
-        else:
-            output = self.env.sample(n, pbar=False, **kwargs)
-
-        # Obtain the final samples (converted to data space) and latents (terminator of SDE). We use
-        # samples for validity and latents for updating the models.
-        samples = output[0]
-        latents = output[1][-1]
-        kwargs = output[-1]
-        valids = self.problem.validity(samples, kwargs).cpu()
-
-        # Postprocess latents
-        batch = Batch(samples, latents, valids, kwargs)
-        batch.latents = self.problem.postprocess_latents(batch)
-        return batch
-
-    def get_many_batches(
-        self,
-        n: int,
-        batch_size: int,
-        kwargs: Optional[dict] = None,
-        guided: bool = True,
-        pbar: bool = False,
-    ) -> list[Batch[D]]:
-        """Obtain multiple batches of samples.
-
-        Parameters
-        ----------
-        n : int
-            Total number of samples to obtain.
-
-        batch_size : int
-            Number of samples per batch.
-
-        kwargs : Optional[dict], default=None
-            Keyword arguments for sampling.
-
-        guided : bool, default=True
-            Whether to use uncertainty guidance when obtaining samples.
-
-        pbar : bool, default=True
-            Progress bar or not.
-
-        Returns
-        -------
-        batches : list[Batch[D]]
-            Obtained batches of samples.
-        """
-        batches: list[Batch[D]] = []
-        for i in range(0, n, batch_size):
-            bsz = min(batch_size, n - i)
-            batch_kwargs = {}
-            if kwargs is not None:
-                batch_kwargs = index_dict(kwargs, i, i + bsz)
-            batch = self.get_samples(bsz, batch_kwargs, guided=guided)
-            batches.append(batch)
-
-        return batches
-
-    def _write_video(self) -> None:
-        frame_paths = sorted(self.config.folder.glob("frames/*.png"))
-        if len(frame_paths) == 0:
-            self.logger.warning("No frames found; skipping video creation.")
-            return
-
-        video_path = self.config.folder / "video.mp4"
-        with imageio.get_writer(video_path, fps=self.config.video_fps, codec="libx264") as writer:
-            for frame_path in frame_paths:
-                writer.append_data(imageio.imread(frame_path))  # type: ignore
-
-        self.logger.info(f"Wrote video to {video_path}")
-
-    def visualize_iter(self, batch: Batch[D], iteration: int) -> None:
+    def visualize_iter(self, batch: Batch[D], iteration: int):
         # Visualizing an iteration is problem-dependent
-        fig = self.problem.visualize_batch(self.env, batch)
+        fig = self.problem.visualize_sample(self.env, batch)
 
         # Save frame
         directory = self.config.folder / "frames"
@@ -264,29 +151,27 @@ class ActivePretraining(Generic[D]):
         if n <= 0:
             return dict()
 
-        batches = self.get_many_batches(n, bs, guided=False)
+        eval_kwargs = self.problem.eval_sampling_kwargs(n)
+        sample = self.env.batch_sample(n, bs, **eval_kwargs)
+        batch = Batch.from_sample(sample)
 
         # Save samples
         directory = self.config.folder / "eval" / f"{iteration:04d}"
         samples_dir = directory / "samples"
         samples_dir.mkdir(parents=True, exist_ok=True)
 
-        count = 0
-        for i, batch in enumerate(batches):
-            for j in range(len(batch)):
-                self.problem.save_sample(
-                    batch.samples[j],
-                    index_dict(batch.kwargs, j),
-                    samples_dir / f"{count:04d}",
-                )
-                count += 1
+        for i in range(len(sample)):
+            self.problem.save_sample(
+                batch.samples[i],
+                index_dict(batch.kwargs, i),
+                samples_dir / f"{i:04d}",
+            )
 
-        all_valids = torch.cat([batch.valids for batch in batches], dim=0)
-        torch.save(all_valids, directory / "valids.pt")
+        torch.save(sample.valids, directory / "valids.pt")
 
         # Compute and save evaluation metrics
-        metrics = self.problem.compute_metrics(batches)
-        metrics["model_valid"] = all_valids.float().mean().item()
+        metrics = self.problem.compute_metrics(batch)
+        metrics["model_valid"] = batch.valids.float().mean().item()
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
 
@@ -314,9 +199,15 @@ class ActivePretraining(Generic[D]):
 
             # Collect new samples
             with self._timer("sampling"):
-                new_batches = self.get_many_batches(samples_per_iter, self.config.sample_batch_size, guided=use_guidance)
-                batch = Batch.concat(new_batches)
+                if use_guidance:
+                    self.env.control_policy = RewardGradient(self.env)
+
+                sample = self.env.batch_sample(samples_per_iter, self.config.sample_batch_size)
+                batch = Batch.from_sample(sample)
+                batch.latents = self.problem.postprocess_latents(batch)
                 total_valid_samples += batch.valids.int().sum().item()
+
+                self.env.control_policy = None
 
             # Store data
             batches.append(batch)
@@ -326,7 +217,7 @@ class ActivePretraining(Generic[D]):
                 self.visualize_iter(batch, i)
                 metrics["biased_valid"] = batch.valids.float().mean().item()
                 metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
-                self.logger.info(f"(iter={i:05d}) {f', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+                self.logger.info(f"(iter={i:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
 
             # Update models with full buffer
             with self._timer("finetune"):
@@ -343,5 +234,9 @@ class ActivePretraining(Generic[D]):
 
             # Write timings to CSV
             self._flush_timings(i)
-
-        self._write_video()
+        
+        write_video(
+            sorted(self.config.folder.glob("frames/*.png")),
+            self.config.folder / "video.mp4",
+            fps=self.config.video_fps,
+        )

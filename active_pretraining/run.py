@@ -96,7 +96,6 @@ def add_global_args(parser):
     parser.add_argument("--gp_lengthscale", type=float, default=0.1)
     parser.add_argument("--feat_timestep", type=float, default=0.9)
     parser.add_argument("--uncertainty_weight", type=float, default=100)
-    parser.add_argument("--reward_opt_algo", type=str, choices=["dps", "svdd"], default="dps")
 
     # Fine-tuning
     parser.add_argument("--ft_min_dataset_size", type=int, default=64)

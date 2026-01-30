@@ -1,96 +1,83 @@
-from typing import Any, TypeVar, Optional, Generic
+from typing import Generic, Any
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data._utils.collate import default_collate
-from flowgym import D
+from flowgym import D, Sample
+from flowgym.utils import index_dict
 from PIL import Image
+from pathlib import Path
+import imageio.v2 as imageio
 import open_clip
-
-
-T = TypeVar("T")
 
 
 @dataclass
 class Batch(Generic[D]):
     samples: D
     latents: D
+    rewards: torch.Tensor
     valids: torch.Tensor
     kwargs: dict[str, Any]
 
-    def __post_init__(self):
-        if len(self.samples) != len(self.latents) or len(self.samples) != len(self.valids):
-            raise ValueError(f"Length of samples, latents, and valids must be the same, got ({len(self.samples)}, {len(self.latents)}, {len(self.valids)})")
+    @classmethod
+    def from_sample(cls, sample: Sample[D]) -> "Batch[D]":
+        return cls(
+            samples=sample.sample,
+            latents=sample.latent,
+            rewards=sample.rewards,
+            valids=sample.valids,
+            kwargs=sample.kwargs,
+        )
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
-    
+
     def __getitem__(self, idx: int) -> "Batch[D]":
         return Batch(
             samples=self.samples[idx],
             latents=self.latents[idx],
+            rewards=self.rewards[idx:idx+1],
             valids=self.valids[idx:idx+1],
-            kwargs=index_dict(self.kwargs, idx),
+            kwargs=index_dict(self.kwargs, idx, idx + 1),
         )
 
     @staticmethod
     def concat(batches: list["Batch[D]"]) -> "Batch[D]":
-        batch_type = type(batches[0].samples)
+        data_type = type(batches[0].samples)
 
-        batch_samples = batch_type.collate([b.samples for b in batches])
-        batch_latents = batch_type.collate([b.latents for b in batches])
-        batch_valids = torch.cat([b.valids for b in batches], dim=0)
         all_kwargs = []
         for batch in batches:
             for i in range(len(batch)):
                 all_kwargs.append(index_dict(batch.kwargs, i))
 
-        batch_kwargs = default_collate(all_kwargs)  # type: ignore
-
         return Batch(
-            samples=batch_samples,
-            latents=batch_latents,
-            valids=batch_valids,
-            kwargs=batch_kwargs,  # type: ignore
+            samples=data_type.collate([b.samples for b in batches]),
+            latents=data_type.collate([b.latents for b in batches]),
+            rewards=torch.cat([b.rewards for b in batches], dim=0),
+            valids=torch.cat([b.valids for b in batches], dim=0),
+            kwargs=default_collate(all_kwargs),  # type: ignore
         )
 
 
-def index_dict(d: T, start: int, end: Optional[int] = None) -> T:
-    """Recursively index into the leaves of a nested dictionary.
+def filter_out_invalids(batches: list[Batch[D]]) -> Batch[D]:
+    valid_batches: list[Batch[D]] = []
 
-    Parameters
-    ----------
-    d : T
-        Any value, if a dictionary, will be processed recursively.
+    for batch in batches:
+        for i in range(len(batch)):
+            if batch.valids[i]:
+                valid_batches.append(batch[i])
 
-    start : int
-        The index to select from list/tensor leaves.
-    
-    end : Optional[int], optional
-        The end index to select from list/tensor leaves, by default None.
+    return Batch.concat(valid_batches)
 
-    Returns
-    -------
-    T
-        If d is a dictionary, returns a dictionary with the same keys and indexed leaves.
-    """
-    if end is None:
-        idx = start
-    else:
-        idx = slice(start, end)
 
-    if isinstance(d, dict):
-        return {k: index_dict(v, start, end) for k, v in d.items()}  # type: ignore
+def write_video(frame_paths: list[Path], video_path: Path, fps: int):
+    if len(frame_paths) == 0:
+        return
 
-    elif isinstance(d, (list, tuple, torch.Tensor)):
-        return d[idx]  # type: ignore
-
-    elif isinstance(d, (float, int, str)):
-        return d
-
-    else:
-        raise TypeError(f"Unsupported leaf type: {type(d)}")
+    with imageio.get_writer(video_path, fps=fps, codec="libx264") as writer:
+        for frame_path in frame_paths:
+            writer.append_data(imageio.imread(frame_path))  # type: ignore
 
 
 def add_valid_border(images: torch.Tensor, valids: torch.Tensor, thickness: int = 2) -> torch.Tensor:

@@ -22,7 +22,6 @@ class ActivePretrainingConfig:
 
     # Uncertainty reward and uncertainty sampling algorithm
     uncertainty_weight : float = 100.0
-    reward_opt_algo: str = "dps"
     
     # Fine-tuning
     ft_min_dataset_size: int = 64
@@ -55,10 +54,6 @@ class ActivePretrainingConfig:
 
         if self.gp_lengthscale < 0:
             raise ValueError(f"gp_lengthscale cannot be negative, got {self.gp_lengthscale}")
-
-        allowed_algos = { "dps", "svdd" }
-        if self.reward_opt_algo not in allowed_algos:
-            raise ValueError(f"reward_opt_algo must be one of {allowed_algos}")
 
         allowed_kernels = { "rbf", "linear" }
         if self.gp_kernel not in allowed_kernels:

@@ -83,7 +83,7 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
 
         return feats.mean(dim=[-2, -1])
 
-    def visualize_batch(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
+    def visualize_sample(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
         x = batch.samples.data.cpu()
         v = batch.valids.cpu()
         grid = make_grid(add_valid_border(x, v, thickness=16), nrow=8)
@@ -103,8 +103,8 @@ class StableDiffusionProblemSetup(ProblemSetup[FlowTensor]):
         with open(f"{filename}_prompt.txt", "w") as f:
             f.write(kwargs.get("prompt", "prompt not found"))
 
-    def compute_metrics(self, batches: list[Batch[FlowTensor]]) -> dict[str, float]:
-        img_list = self._to_pil_images(FlowTensor.collate([b.samples for b in batches]))
+    def compute_metrics(self, batch: Batch[FlowTensor]) -> dict[str, float]:
+        img_list = self._to_pil_images(batch.samples)
         feats = self.clip.embed_images(img_list)
         return { "vendi": vendi.score_X(feats) }
 

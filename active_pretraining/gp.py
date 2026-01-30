@@ -5,8 +5,6 @@ import torch.nn as nn
 import gpytorch
 from flowgym import D, BaseModel, Reward
 
-from .utils import Batch
-
 
 class FlowFeatureExtractor(nn.Module, Generic[D]):
     """Makes it possible to extract features from a specific layer of a flow model.
@@ -96,26 +94,21 @@ class GPUncertaintyReward(Reward[D]):
     feat_extractor : FlowFeatureExtractor[D]
         Feature extractor to obtain features from data points. The GP will operate in this feature
         space.
-
     feat_dim : int
         Dimensionality of the extracted features.
-
     kernel : "rbf" | "linear"
         Kernel type for the Gaussian process.
-
     lengthscale : float
         Lengthscale parameter for the RBF kernel of the GP.
-
     device : Optional[torch.device | str]
         Device on which to run the GP model.
     """
-
-    latent_space = True
 
     def __init__(
         self,
         feat_extractor: FlowFeatureExtractor[D],
         feat_dim: int,
+        valid_fn: Callable[[D, dict[str, Any]], torch.Tensor],
         kernel: str = "rbf",
         lengthscale: float = 0.1,
         device: Optional[torch.device | str] = None,
@@ -133,16 +126,17 @@ class GPUncertaintyReward(Reward[D]):
         likelihood.eval()
 
         self.feat_extractor = feat_extractor
+        self.valid_fn = valid_fn
         self.likelihood = likelihood
         self.model = model
         self.device = device
 
     @torch.no_grad()
-    def set_data(self, batches: list[Batch[D]]):
+    def set_data(self, latents: list[D], kwargs: list[dict[str, Any]]):
         """Set data by computing features and storing."""
         feats_list = []
-        for batch in batches:
-            feat = self.feat_extractor(batch.latents.to(self.device), **batch.kwargs).detach()
+        for latent, kwarg in zip(latents, kwargs):
+            feat = self.feat_extractor(latent.to(self.device), **kwarg).detach()
             feats_list.append(feat)
 
         feats = torch.cat(feats_list, dim=0)
@@ -150,15 +144,23 @@ class GPUncertaintyReward(Reward[D]):
         labels = torch.zeros(feats.shape[0], device=self.device)
         self.model.set_train_data(feats, labels, strict=False)
 
-    def __call__(self, x: D, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        x = x.to(self.device)
-        feats = self.feat_extractor(x, **kwargs)
+    def __call__(self, sample: D | None, latent: D, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        latent = latent.to(self.device)
+        feats = self.feat_extractor(latent, **kwargs)
 
-        with gpytorch.settings.fast_pred_var(), gpytorch.settings.max_root_decomposition_size(500):
+        with (
+            gpytorch.settings.fast_pred_var(),
+            gpytorch.settings.max_root_decomposition_size(500),
+        ):
             posterior = self.likelihood(self.model(feats))
 
-        uncertainty = posterior.variance
-        return uncertainty, torch.ones_like(uncertainty)
+        # If we are doing DPS, we set sample to None because we do not use the verifier
+        if sample is not None:
+            valids = self.valid_fn(sample, kwargs).cpu()
+        else:
+            valids = torch.ones(len(latent), dtype=torch.bool)
+
+        return posterior.variance, valids
 
 
 class GPModel(gpytorch.models.ExactGP):

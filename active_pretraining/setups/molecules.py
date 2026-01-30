@@ -21,7 +21,7 @@ import re
 import os
 
 from active_pretraining.problem_setup import ProblemSetup, SampleFile
-from active_pretraining.utils import Batch
+from active_pretraining.utils import filter_out_invalids, Batch
 
 
 class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
@@ -75,23 +75,6 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
     def feature_layer(self) -> str:
         return "model.vector_field.node_output_head.0"
 
-    def postprocess_features(self, latents: FlowGraph, feats: torch.Tensor) -> torch.Tensor:
-        # `feats` is a tensor of shape (num_nodes, feature_dim), which we want to take the mean over
-        # for each graph in the batch. We have the indices that each node belongs to which graph in x.n_idx.
-        device = latents.device
-        num_nodes, feature_dim = feats.shape
-        num_graphs = int(latents.n_idx.max().item()) + 1
-
-        # Sum features per graph
-        graph_sums = torch.zeros(num_graphs, feature_dim, device=device)
-        graph_sums.index_add_(0, latents.n_idx, feats)
-        # Count nodes per graph
-        graph_counts = torch.zeros(num_graphs, device=device)
-        graph_counts.index_add_(0, latents.n_idx, torch.ones(num_nodes, device=device))
-
-        # Mean pooling
-        return graph_sums / graph_counts.unsqueeze(1)
-
     def postprocess_latents(self, batch: Batch[FlowGraph]) -> FlowGraph:
         latents = batch.latents
         graph = latents.graph.clone()
@@ -124,6 +107,23 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
 
         return FlowGraph(graph, latents.ue_mask, latents.n_idx, latents.e_idx)
 
+    def postprocess_features(self, latents: FlowGraph, feats: torch.Tensor) -> torch.Tensor:
+        # `feats` is a tensor of shape (num_nodes, feature_dim), which we want to take the mean over
+        # for each graph in the batch. We have the indices that each node belongs to which graph in x.n_idx.
+        device = latents.device
+        num_nodes, feature_dim = feats.shape
+        num_graphs = int(latents.n_idx.max().item()) + 1
+
+        # Sum features per graph
+        graph_sums = torch.zeros(num_graphs, feature_dim, device=device)
+        graph_sums.index_add_(0, latents.n_idx, feats)
+        # Count nodes per graph
+        graph_counts = torch.zeros(num_graphs, device=device)
+        graph_counts.index_add_(0, latents.n_idx, torch.ones(num_nodes, device=device))
+
+        # Mean pooling
+        return graph_sums / graph_counts.unsqueeze(1)
+
     def _to_mols(self, samples: FlowGraph) -> list[Chem.Mol]:
         mols = []
         for sample in dgl.unbatch(samples.graph):
@@ -133,7 +133,7 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
         return mols
 
     @torch.no_grad()
-    def visualize_batch(self, env: Environment[FlowGraph], batch: Batch[FlowGraph]) -> Figure:
+    def visualize_sample(self, env: Environment[FlowGraph], batch: Batch[FlowGraph]) -> Figure:
         mols = self._to_mols(batch.samples)
 
         fig = plt.figure(figsize=(12, 8))
@@ -187,27 +187,19 @@ class MoleculeProblemSetup(ProblemSetup[FlowGraph]):
 
         Chem.MolToMolFile(mol, f"{filename}.mol")
 
-    def compute_metrics(
-        self,
-        batches: list[Batch[FlowGraph]],
-    ) -> dict[str, float]:
-        n_samples = 0
+    def compute_metrics(self, batch: Batch[FlowGraph]) -> dict[str, float]:
+        valid_batch = filter_out_invalids([batch])
+
         mols = []
-        for batch in batches:
-            for j in range(len(batch)):
-                n_samples += 1
+        for i in range(len(valid_batch)):
+            mol = SampledMolecule(batch.samples[i].graph.cpu(), self.base_model.model.atom_type_map).rdkit_mol
+            mol = validate_mol(mol)
 
-                if not batch.valids[j]:
-                    continue
-
-                mol = SampledMolecule(batch.samples[j].graph.cpu(), self.base_model.model.atom_type_map).rdkit_mol
-                mol = validate_mol(mol)
-
-                if mol is not None:
-                    mols.append(mol)
+            if mol is not None:
+                mols.append(mol)
 
         # We want to make sure the number of samples we compute the diversity on is constant between iterations
-        mols = mols[:n_samples // self.div_valid]
+        mols = mols[:len(batch) // self.div_valid]
         K = molecule_utils.get_tanimoto_K(mols)
         vendi_score = vendi.score_K(K)
 

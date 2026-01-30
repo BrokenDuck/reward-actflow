@@ -31,7 +31,7 @@ def main(args):
     if args.use_last_ckpt:
         ckpt_path = exp_dir / "base_model.pt"
         state_dict = torch.load(ckpt_path, map_location=device)
-        problem_setup.base_model.load_state_dict(state_dict)
+        env.base_model.load_state_dict(state_dict)
 
     eval_kwargs = problem_setup.eval_sampling_kwargs(args.n_samples)
     consecutive_all_invalid = 0

@@ -110,7 +110,7 @@ class MNISTProblemSetup(ProblemSetup[FlowTensor]):
     def postprocess_features(self, latents: FlowTensor, feats: torch.Tensor) -> torch.Tensor:
         return feats.mean(dim=[-2, -1])
 
-    def visualize_batch(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
+    def visualize_sample(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
         x = batch.samples.data.cpu()
         v = batch.valids.cpu()
         grid = make_grid(add_valid_border(x, v, thickness=1), nrow=8)

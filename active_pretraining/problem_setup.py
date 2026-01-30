@@ -53,7 +53,6 @@ class ProblemSetup(ABC, Generic[D]):
         ----------
         samples : D
             The samples to check.
-
         kwargs : dict
             The keyword arguments used to generate the samples.
 
@@ -76,11 +75,11 @@ class ProblemSetup(ABC, Generic[D]):
         Parameters
         ----------
         batch : Batch[D]
-            The batch containing latents, valids, and kwargs to post-process.
+            The sample.
 
         Returns
         -------
-        latents : D
+        latent : D
             The post-processed latents.
         """
         return batch.latents
@@ -91,9 +90,8 @@ class ProblemSetup(ABC, Generic[D]):
 
         Parameters
         ----------
-        batch : D
+        latents : D
             The batch.
-
         feats : Any
             The raw features extracted from the base model.
 
@@ -105,16 +103,15 @@ class ProblemSetup(ABC, Generic[D]):
         raise NotImplementedError
 
     @abstractmethod
-    def visualize_batch(self, env: Environment[D], batch: Batch[D]) -> Figure:
+    def visualize_sample(self, env: Environment[D], batch: Batch[D]) -> Figure:
         """Produce a matplotlib figure for visualizing the sample in the problem setup.
 
         Parameters
         ----------
         env : Environment[D]
             The environment in which the samples were generated.
-
         batch : Batch[D]
-            The batch containing samples and valids.
+            The batch.
         """
         raise NotImplementedError
 
@@ -126,10 +123,8 @@ class ProblemSetup(ABC, Generic[D]):
         ----------
         sample : D
             The sample to save, batch-size 1.
-
         kwargs : dict
             The keyword arguments used to generate the sample.
-
         filename : Path
             The file path where to save the sample, without extension.
         """
@@ -150,13 +145,13 @@ class ProblemSetup(ABC, Generic[D]):
         """
         return {}
 
-    def compute_metrics(self, batches: list[Batch[D]]) -> dict[str, float]:
+    def compute_metrics(self, batch: Batch[D]) -> dict[str, float]:
         """Compute relevant (global) metrics for the problem setup.
         
         Parameters
         ----------
-        batches : list[Batch[D]]
-            List of batches containing samples to compute metrics on.
+        batch : Batch[D]
+            The batch.
 
         Returns
         -------
