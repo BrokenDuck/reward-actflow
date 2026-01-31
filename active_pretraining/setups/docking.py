@@ -37,6 +37,63 @@ pose_els = {'tr', 'rot', 'tor'}
 # TODO: ideal data type is only pose and we run rotation at the end of every loop iter of sampling (change flowgym)
 
 
+def init_graph(data: HeteroData,
+               no_torsion=False,
+               tr_sigma_max=1.,
+               pocket_knowledge=False,
+               pocket_cutoff=1.,
+               no_random=False,
+               choose_residue=False,
+               initial_noise_std_proportion=-1.):
+    """Initialize graph for DiffDock functionality."""
+    complex_graph = data
+    center_pocket = complex_graph['receptor'].pos.mean(dim=0)
+    if pocket_knowledge:
+        orig_pos = torch.from_numpy(complex_graph['ligand'].orig_pos[0]).float()
+        d = torch.cdist(complex_graph['receptor'].pos, orig_pos - complex_graph.original_center)
+        label = torch.any(d < pocket_cutoff, dim=1)
+
+        if torch.any(label):
+            center_pocket = complex_graph['receptor'].pos[label].mean(dim=0)
+        else:
+            print("No pocket residue below minimum distance ", pocket_cutoff, "taking closest at", torch.min(d))
+            center_pocket = complex_graph['receptor'].pos[torch.argmin(torch.min(d, dim=1)[0])]
+
+    if not no_torsion:
+        # randomize torsion angles
+        torsion_updates = np.random.uniform(low=-np.pi, high=np.pi, size=complex_graph['ligand'].edge_mask.sum())
+        complex_graph['ligand'].pos = \
+            modify_conformer_torsion_angles(complex_graph['ligand'].pos,
+                                            complex_graph['ligand', 'ligand'].edge_index.T[
+                                                complex_graph['ligand'].edge_mask],
+                                            complex_graph['ligand'].mask_rotate, torsion_updates)
+    else:
+        torsion_updates = np.zeros((complex_graph['ligand'].edge_mask.sum(),))
+
+    # randomize position
+    pos: torch.Tensor = complex_graph['ligand'].pos
+    molecule_center = torch.mean(pos, dim=0, keepdim=True)
+    random_rotation = torch.from_numpy(R.random().as_matrix()).float()
+    complex_graph['ligand'].pos = (complex_graph['ligand'].pos - molecule_center) @ random_rotation.T + center_pocket
+
+    if not no_random:  # note for now the torsion angles are still randomised
+        if choose_residue:
+            idx = random.randint(0, len(complex_graph['receptor'].pos)-1)
+            tr_update = torch.normal(mean=complex_graph['receptor'].pos[idx:idx+1], std=0.01)
+        elif initial_noise_std_proportion >= 0.0:
+            std_rec = torch.sqrt(torch.mean(torch.sum(complex_graph['receptor'].pos ** 2, dim=1)))
+            tr_update = torch.normal(mean=0, std=std_rec * initial_noise_std_proportion / 1.73, size=(1, 3))
+        else:
+            # if initial_noise_std_proportion < 0.0, we use the tr_sigma_max multiplied by -initial_noise_std_proportion
+            tr_update = torch.normal(mean=0, std=-initial_noise_std_proportion * tr_sigma_max, size=(1, 3))
+        complex_graph['ligand'].pos += tr_update
+
+    else:
+        tr_update = torch.zeros_like(complex_graph['receptor'].pos[0:1])
+
+    return complex_graph, tr_update, random_rotation, torsion_updates
+
+
 @dataclass(frozen=True)
 class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality somehow
     tr: torch.Tensor
@@ -55,10 +112,15 @@ class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality 
             and torch.allclose(self.rot.double(), zero) and torch.allclose(self.tor.double(), zero)
 
 
-    def combine(self, other: Self, op: BinaryOp) -> "DockPose":
-        tr = op(self.tr, other.tr)
-        rot = op(self.rot, other.rot)
-        tor = op(self.tor, other.tor)
+    def combine(self, other: Self | float | torch.Tensor, op: BinaryOp) -> "DockPose":
+        if isinstance(other, DockPose):
+            tr = op(self.tr, other.tr)
+            rot = op(self.rot, other.rot)
+            tor = op(self.tor, other.tor)
+        else:
+            tr = op(self.tr, other)
+            rot = op(self.rot, other)
+            tor = op(self.tor, other)
 
         return DockPose(tr, rot, tor)
 
@@ -90,15 +152,14 @@ class DockPose(FlowMixin): # TODO maybe just use dict-nodestorage functionality 
         return DockPose(tr, rot, tor)
 
 
-    def aggregate(self) -> torch.Tensor:
+    def aggregate(self, reduction: str = "mean") -> torch.Tensor:
         raise NotImplementedError
 
 
 class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
     def __init__(
         self,
-        complex_graph: Batch,
-        pose: Optional[DockPose] = None
+        complex_graph: Batch
     ):
         device = complex_graph['ligand'].pos.device
         complex_graph = complex_graph.clone().to(device)
@@ -144,7 +205,8 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
 
     @pose.setter
     def pose(self, val: "DockPose"):
-        self.graph.update(HeteroData(ligand_pose={'tr': val.tr, 'rot': val.rot, 'tor': val.tor}))
+        pose_graph = Batch.from_data_list([HeteroData(ligand_pose={'tr': val.tr, 'rot': val.rot, 'tor': val.tor})])
+        self.graph.update(pose_graph)
 
 
     def __repr__(self) -> str:
@@ -186,16 +248,6 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
         return result
 
 
-    @classmethod
-    def from_pose(cls, pose: DockPose) -> "DockResult":
-        graph = HeteroData()
-        graph['ligand_pose'].tor = pose.tor
-        graph['ligand_pose'].rot = pose.rot
-        graph['ligand_pose'].tr = pose.tr
-
-        return cls(graph)
-
-
     def apply(self, op: UnaryOp) -> "DockResult":
         res = self.clone()
 
@@ -232,7 +284,7 @@ class DockResult(FlowMixin): # TODO maybe change to subclass HeteroData???
         return res
 
 
-    def aggregate(self) -> torch.Tensor:
+    def aggregate(self, reduction: str = "mean") -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -247,52 +299,13 @@ class DiffDockBaseModel(BaseModel[DockResult]):
         return self._scheduler
 
 
-    def sample_p0(self, n: int, pocket_cutoff=7., no_random=False, pocket_knowledge=False, choose_residue=False, initial_noise_std_proportion=-1., add_pose=False,
-    debug=False,
-    **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
+    def sample_p0(self, n: int, **kwargs: Any) -> tuple[DockResult, dict[str, Any]]:
+
         results: Sequence[DockResult] = []
         for _ in range(n):
-            complex_graph = kwargs['data']
-            center_pocket = complex_graph['receptor'].pos.mean(dim=0)
-            no_torsion = kwargs['no_torsion']
-            tr_sigma_max = kwargs['tr_sigma_max']
-            if pocket_knowledge:
-                d = torch.cdist(complex_graph['receptor'].pos, torch.from_numpy(complex_graph['ligand'].orig_pos[0]).float() - complex_graph.original_center)
-                label = torch.any(d < pocket_cutoff, dim=1)
-
-                if torch.any(label):
-                    center_pocket = complex_graph['receptor'].pos[label].mean(dim=0)
-                else:
-                    print("No pocket residue below minimum distance ", pocket_cutoff, "taking closest at", torch.min(d))
-                    center_pocket = complex_graph['receptor'].pos[torch.argmin(torch.min(d, dim=1)[0])]
-
-            if not no_torsion:
-                # randomize torsion angles
-                torsion_updates = np.random.uniform(low=-np.pi, high=np.pi, size=complex_graph['ligand'].edge_mask.sum())
-                complex_graph['ligand'].pos = \
-                    modify_conformer_torsion_angles(complex_graph['ligand'].pos,
-                                                    complex_graph['ligand', 'ligand'].edge_index.T[
-                                                        complex_graph['ligand'].edge_mask],
-                                                    complex_graph['ligand'].mask_rotate, torsion_updates)
-
-            # randomize position
-            molecule_center = torch.mean(complex_graph['ligand'].pos, dim=0, keepdim=True)
-            random_rotation = torch.from_numpy(R.random().as_matrix()).float()
-            complex_graph['ligand'].pos = (complex_graph['ligand'].pos - molecule_center) @ random_rotation.T + center_pocket
-
-            if not no_random:  # note for now the torsion angles are still randomised
-                if choose_residue:
-                    idx = random.randint(0, len(complex_graph['receptor'].pos)-1)
-                    tr_update = torch.normal(mean=complex_graph['receptor'].pos[idx:idx+1], std=0.01)
-                elif initial_noise_std_proportion >= 0.0:
-                    std_rec = torch.sqrt(torch.mean(torch.sum(complex_graph['receptor'].pos ** 2, dim=1)))
-                    tr_update = torch.normal(mean=0, std=std_rec * initial_noise_std_proportion / 1.73, size=(1, 3))
-                else:
-                    # if initial_noise_std_proportion < 0.0, we use the tr_sigma_max multiplied by -initial_noise_std_proportion
-                    tr_update = torch.normal(mean=0, std=-initial_noise_std_proportion * tr_sigma_max, size=(1, 3))
-                complex_graph['ligand'].pos += tr_update
-
-            res = DockResult(complex_graph)
+            complex_graph, tr_update, random_rotation, torsion_updates = init_graph(**kwargs)
+            res = DockResult(Batch.from_data_list([complex_graph]))
+            no_torsion, no_random, add_pose = kwargs['no_torsion'], kwargs['no_random'], kwargs['add_pose']
 
             if not no_torsion and not no_random and add_pose:
                 rot_update = matrix_to_axis_angle(random_rotation).reshape((1, -1))
@@ -301,9 +314,6 @@ class DiffDockBaseModel(BaseModel[DockResult]):
 
 
             results.append(res)
-
-        if debug:
-            return results
 
         return DockResult.collate(results), kwargs
 
