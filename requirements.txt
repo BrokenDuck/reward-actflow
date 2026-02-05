@@ -1,0 +1,15 @@
+# install torch==2.3.1 first
+importlib_resources
+lightning
+transformers==4.48.1
+wandb
+ipykernel
+biopython
+botorch
+seaborn
+flowgym
+timm
+hydra-core
+# then install evodiff (pip install evodiff)
+# then install flash attention (pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/flash_attn-2.7.3+cu12torch2.3cxx11abiFALSE-cp310-cp310-linux_x86_64.whl)
+# pip install -e . (from the sgpo repo)
