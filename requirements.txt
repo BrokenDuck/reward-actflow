@@ -1,15 +1,34 @@
-# install torch==2.3.1 first
-importlib_resources
-lightning
-transformers==4.48.1
-wandb
-ipykernel
+https://download.pytorch.org/whl/cu121/torch-2.3.1%2Bcu121-cp310-cp310-linux_x86_64.whl#sha256=f0deb5d2f932a68ed54625ba140eddbf2af22be978ee19b9b63c986add6425b2
+torchvision
+aria2
+awscli
 biopython
 botorch
-seaborn
+deepspeed==0.14.5
+dm-tree==0.1.6
 flowgym
-timm
+hmmer
 hydra-core
-# then install evodiff (pip install evodiff)
-# then install flash attention (pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/flash_attn-2.7.3+cu12torch2.3cxx11abiFALSE-cp310-cp310-linux_x86_64.whl)
-# pip install -e . (from the sgpo repo)
+ipykernel
+lightning
+mkl
+ml-collections
+modelcif==0.7
+openmm
+pdbfixer
+pytorch-lightning
+pyyaml
+requests
+scipy
+seaborn
+setuptools
+sgpo @ git+https://github.com/Komod0D/SGPO.git
+timm
+tqdm
+transformers==4.48.1
+typing-extensions
+wandb
+kalign[biopython] @ git+https://github.com/TimoLassmann/kalign.git
+dllogger @ git+https://github.com/NVIDIA/dllogger.git
+evodiff
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.3cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
