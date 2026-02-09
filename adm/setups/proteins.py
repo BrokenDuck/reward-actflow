@@ -191,11 +191,11 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
 
 
     def validity(self, samples: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
-        # TODO pass samples.data or self.network_forward(samples.data, t=0.0005)? 
+        # TODO pass samples.data or self.network_forward(samples.data, t=0.0005)?
         logits = self.base_model.sgpo_model.model.network.cls(samples.data) # TODO hardcoded for GaussianDiffusionTransformer
-        probas = F.softmax(logits)
+        probas = F.softmax(logits, dim=-1)
         tokens = probas.argmax(dim=-1)
-        strings = [self.base_model.tokenizer.untokenize(s) for s in tokens]
+        strings = [self.base_model.sgpo_model.tokenizer.untokenize(s) for s in tokens]
         
         results = []
         with torch.no_grad():
