@@ -1,21 +1,68 @@
-from typing import Any
+from typing import Any, Sequence
 from argparse import ArgumentParser
 from importlib_resources import files
 from pathlib import Path
 from hydra.utils import instantiate
 from torch import Tensor, device
+import torch.nn.functional as F
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
+import esm
+import numpy as np
 
+from matplotlib.figure import Figure
 
 from sgpo.models.continuous import ContinuousModel
+from sgpo.models.pretraining.model.continuous_diffusion import GaussianDiffusionTransformer
 from flowgym.types import FlowTensor
 from flowgym.base_models import BaseModel
 from flowgym.schedulers import Scheduler, NoiseSchedule
+from flowgym.environments import Environment
 from flowgym.utils import append_dims
 
 from active_pretraining.problem_setup import ProblemSetup, SampleFile, Batch
 import sgpo
+
+
+def shim():
+    import importlib
+    try:
+        import deepspeed
+    except Exception:
+        # deepspeed not installed yet; nothing to do
+        deepspeed = None
+
+    if deepspeed is not None:
+        # if utils.is_initialized already exists, do nothing
+        try:
+            if not (hasattr(deepspeed, "utils") and hasattr(deepspeed.utils, "is_initialized")):
+                # prefer comm.is_initialized if available
+                comm = None
+                try:
+                    # new DeepSpeed exposes the helper under deepspeed.comm (or deepspeed.comm.comm)
+                    from deepspeed import comm as _ds_comm  # most common
+                    comm = _ds_comm
+                except Exception:
+                    # fallback: try the nested comm module path sometimes used
+                    try:
+                        from deepspeed.comm import comm as _ds_comm2
+                        comm = _ds_comm2
+                    except Exception:
+                        comm = None
+
+                import types
+                if not hasattr(deepspeed, "utils"):
+                    deepspeed.utils = types.SimpleNamespace()
+
+                if comm is not None and hasattr(comm, "is_initialized"):
+                    deepspeed.utils.is_initialized = comm.is_initialized
+                else:
+                    deepspeed.utils.is_initialized = lambda: False
+        except Exception:
+            pass
+
+
+shim()
 
 
 class DDPMNoiseSchedule(NoiseSchedule[FlowTensor]):
@@ -74,40 +121,52 @@ class ProteinModel(BaseModel[FlowTensor]):
 
     def preprocess(self, x: FlowTensor, **kwargs: Any) -> tuple[FlowTensor, dict[str, Any]]:
         # TODO maybe map to and from ESM embeddings???
-        raise NotImplementedError
+        return x, kwargs
     
 
     def postprocess(self, x: FlowTensor) -> FlowTensor:
         # TODO maybe map to and from ESM embeddings???
-        raise NotImplementedError
+        return x
     
 
     def sample_p0(self, n: int, **kwargs: Any) -> tuple[FlowTensor, dict[str, Any]]:
-        return super().sample_p0(n, **kwargs)
+        return FlowTensor(self.sgpo_model.get_start(n)), kwargs
     
 
-    def forward(self, x: FlowTensor, t: Tensor, **kwargs: Any) -> FlowTensor:
-        seq_len: int= self.sgpo_model.seq_len
-        infill_mask = (torch.ones(seq_len) != self.sgpo_model.tokenizer.pad_id-100).to(self.device) 
-        attn_mask = torch.ones((x.data.shape[0], seq_len),dtype=torch.bool, device=self.device)
+    def forward(self, x: FlowTensor, t: Tensor, **kwargs: Any) -> FlowTensor: 
+        return FlowTensor(self.network_forward(x.data, t)['xstart'])
 
-        with torch.no_grad():
-            sigma = self.scheduler.sigma(x, t).data # TODO or just use idxs and bypass everything? test both
-            n = len(self.sgpo_model.noise_schedule.sigmas)
-            idxs = (t * n).round().clamp_max(n - 1).int()
-            f_out = self.sgpo_model.model.network.forward(x/(sigma**2 + 1).sqrt(), idxs, attn_mask=attn_mask)
-            out = self.sgpo_model.model.network.pred_xstart(
-                x,
-                t,
-                attn_mask=attn_mask,
-                sequence_output=f_out['sequence_output'],
-                infill_mask=infill_mask
-            )
-            x1 = out['xstart']
-        
-    
-        return FlowTensor(x1)
 
+    def embed_to_sequence(self, embeds: FlowTensor) -> Sequence[str]:
+        epsilon = 1e-4 # TODO change magic number
+        t = (1. - epsilon) * torch.ones((embeds.data.shape[0],)).to(self.device)
+        out = self.network_forward(embeds.data, t)
+
+        tokens = out['probs'].argmax(dim=-1)
+        strings = [self.sgpo_model.tokenizer.untokenize(s) for s in tokens]
+        return strings
+
+
+    def network_forward(self, x: torch.Tensor, t: torch.Tensor) -> dict[str, torch.Tensor]:
+        t = 1. - t
+        net = self.sgpo_model
+        infill_mask = (torch.ones(net.seq_len) != net.tokenizer.pad_id-100).to(net.device) # TODO change magic number
+        attn_mask = torch.ones((x.shape[0], x.shape[1]), dtype=torch.bool, device=net.device)
+                               
+        idx = (t * len(net.noise_schedule.sigmas)).round().clamp(0, len(net.noise_schedule.sigmas) - 1).long()
+        sigma = net.noise_schedule.sigmas.to(net.device)[idx].reshape((x.shape[0], 1, 1))
+        f_out = net.model.network(x/(sigma**2 + 1).sqrt(), idx, attn_mask=attn_mask)
+
+        out = net.model.network.pred_xstart(
+            x,
+            t,
+            attn_mask=attn_mask,
+            sequence_output=f_out['sequence_output'],
+            infill_mask=infill_mask
+        )
+
+        out['sequence_output'] = f_out['sequence_output']
+        return out
 
 
 class ProteinProblemSetup(ProblemSetup[FlowTensor]):
@@ -117,12 +176,13 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         config = OmegaConf.load(cfg_path)
 
         self._base_model = ProteinModel(config, device=device)
+        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device)
 
 
     @classmethod
     def add_args(cls, parser: ArgumentParser): # TODO interface with hydra somehow to get hierarchical configs... for now use static one from existing run
         default_path = files(sgpo) / Path('configs/sample_config.yaml')
-        parser.add_argument('--cfg_path', type='str', default=default_path)
+        parser.add_argument('--cfg_path', type=str, default=default_path, help='Path for diffusion model config file')
 
 
     @property
@@ -131,52 +191,37 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
 
 
     def validity(self, samples: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
-        tokens = self.base_model.tokenizer
+        # TODO pass samples.data or self.network_forward(samples.data, t=0.0005)? 
+        logits = self.base_model.sgpo_model.model.network.cls(samples.data) # TODO hardcoded for GaussianDiffusionTransformer
+        probas = F.softmax(logits)
+        tokens = probas.argmax(dim=-1)
+        strings = [self.base_model.tokenizer.untokenize(s) for s in tokens]
+        
+        results = []
+        with torch.no_grad():
+            for s in strings:
+                results.append(self.esmfold.infer(s))        
+            
+        threshold = kwargs['threshold']
+        plddt = torch.vstack([r['mean_plddt'] for r in results])
+        return torch.where(plddt > threshold, 1., 0.)
 
 
     @property
-    @abstractmethod
-    def feature_layer(self) -> str:
+    def feature_layer(self) -> str: # TODO maybe this is good? it's already supposed to be an ESM embedding...
         """The name of the layer from which to extract features for the GP."""
-        raise NotImplementedError
+        return 'input'
 
 
     def postprocess_latents(self, batch: Batch[FlowTensor]) -> FlowTensor:
-        """Post-process latents generated from the base model.
-
-        Parameters
-        ----------
-        batch : Batch[D]
-            The sample.
-
-        Returns
-        -------
-        latent : D
-            The post-processed latents.
-        """
         return batch.latents
 
 
-    @abstractmethod
     def postprocess_features(self, latents: FlowTensor, feats: Any) -> torch.Tensor:
-        """Post-process features extracted from the base model.
+        data: torch.Tensor = feats.data
+        return data.mean(dim=-1)
 
-        Parameters
-        ----------
-        latents : D
-            The batch.
-        feats : Any
-            The raw features extracted from the base model.
 
-        Returns
-        -------
-        features : torch.Tensor
-            The post-processed features.
-        """
-        raise NotImplementedError
-    
-
-    @abstractmethod
     def visualize_sample(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
         """Produce a matplotlib figure for visualizing the sample in the problem setup.
 
@@ -190,8 +235,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         raise NotImplementedError
     
 
-    @abstractmethod
-    def save_sample(self, sample: D, kwargs: dict[str, Any], filename: Path):
+    def save_sample(self, sample: FlowTensor, kwargs: dict[str, Any], filename: Path):
         """Save a *single* sample to the disk.
         
         Parameters
@@ -223,7 +267,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         return {}
     
 
-    def compute_metrics(self, batch: Batch[D]) -> dict[str, float]:
+    def compute_metrics(self, batch: Batch[FlowTensor]) -> dict[str, float]:
         """Compute relevant (global) metrics for the problem setup.
         
         Parameters

@@ -1,0 +1,25 @@
+data:
+  name: CreiLOV
+  data_path: data/CreiLOV/fitness.csv
+  pretrain_data_prefix: data/CreiLOV/
+  full_seq: MAGLRHTFVVADATLPDCPLVYASEGFYAMTGYGPDEVLGHNARFLQGEGTDPKEVQKIRDAIKKGEACSVRLLNYRKDGTPFWNLLTVTPIKTPDGRVSKFVGVQVDVTSKTEGKALA
+  seq_len: 119
+  residues: null
+  seed: 42
+  alphabet: ACDEFGHIKLMNPQRSTVWYBZXJOU-*#@!
+  alphabet_size: 31
+  oracle_model_path: oracle/checkpoints/CreiLOV
+model:
+  name: continuous
+  model:
+    _target_: sgpo.models.continuous.ContinuousModel
+exp_name: uncond
+measurement: false
+num_samples: 1000
+batch_size: 200
+num_samples_per_round: 100
+n_repeats: 5
+n_rounds: 8
+seed: 42
+wandb: false
+pretrained_ckpt: continuous_ESM/CreiLOV

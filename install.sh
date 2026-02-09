@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 if command -v module >/dev/null 2>&1
 then
-    module load stack/2024-06 cuda/12.1.1
+    module load stack/2024-06 gcc/12.2.0 cuda/11.8.0
 fi
 
 ENV_DIR=$(pwd)
@@ -51,10 +51,11 @@ then
 fi
 
 
+
 cd $MAIN_DIR
 if [ ! -d "openfold" ]
 then
-    git clone https://github.com/aqlaboratory/openfold.git
+    git clone https://github.com/Komod0D/openfold.git@4b41059694619831a7db195b7e0988fc4ff3a307
     cd openfold
     cat scripts/install_third_party_dependencies.sh | head -n 17 > scripts/our_install.sh
     chmod +x scripts/our_install.sh
@@ -64,3 +65,6 @@ then
     echo "export LIBRARY_PATH=$ENV_DIR/.venv/lib:\$LIBRARY_PATH" >> ~/.bashrc
     echo "export LD_LIBRARY_PATH=$ENV_DIR/.venv/lib:\$LD_LIBRARY_PATH" >> ~/.bashrc
 fi
+
+
+# TODO then need to run SGPO once and change the downloaded checkpoint with the script in the repo

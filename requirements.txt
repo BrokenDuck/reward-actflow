@@ -1,12 +1,12 @@
-https://download.pytorch.org/whl/cu121/torch-2.3.1%2Bcu121-cp310-cp310-linux_x86_64.whl#sha256=f0deb5d2f932a68ed54625ba140eddbf2af22be978ee19b9b63c986add6425b2
+torch @ https://download.pytorch.org/whl/cu113/torch-1.12.0%2Bcu113-cp310-cp310-linux_x86_64.whl
 torchvision
 aria2
 awscli
 biopython
 botorch
-deepspeed==0.14.5
+deepspeed==0.6.5
 dm-tree==0.1.6
-flowgym
+flowgym @ git+https://github.com/Komod0D/flowgym.git
 hmmer
 hydra-core
 ipykernel
@@ -14,21 +14,22 @@ lightning
 mkl
 ml-collections
 modelcif==0.7
+numpy==1.*
 openmm
 pdbfixer
-pytorch-lightning
+pytorch-lightning==1.8.4
 pyyaml
 requests
 scipy
 seaborn
-setuptools
+setuptools==69.0.3
 sgpo @ git+https://github.com/Komod0D/SGPO.git
 timm
 tqdm
-transformers==4.48.1
+transformers==4.38.2
 typing-extensions
 wandb
 kalign[biopython] @ git+https://github.com/TimoLassmann/kalign.git
 dllogger @ git+https://github.com/NVIDIA/dllogger.git
 evodiff
-flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.3cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v0.2.1/flash_attn-0.2.1+cu116torch1.12.0-cp310-cp310-linux_x86_64.whl
