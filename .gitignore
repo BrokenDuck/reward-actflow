@@ -232,3 +232,4 @@ runs
 *.pt
 run
 temp
+sweep*

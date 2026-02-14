@@ -11,6 +11,8 @@ from active_pretraining.trainer import ActivePretrainingConfig, ActivePretrainin
 from active_pretraining.run import build_parser, setup_logger
 from flowgym import FlowTensor
 
+from matplotlib import pyplot as plt
+
 def shim():
     # compatibility shim - put this before any imports that might call deepspeed.utils.is_initialized
     import importlib
@@ -70,30 +72,87 @@ esmfold = setup.esmfold
 net = setup.base_model.sgpo_model
 net : ContinuousModel
 
+
+
+print('============= CHECKING SCHEDULER FUNCS =============')
+N = 200
+x0, _ = setup.base_model.sample_p0(N)
+t = torch.arange(N) / N
+sched = setup.base_model.scheduler
+
+alpha = sched.alpha(x0, t).data[:, 0, 0]
+beta = sched.beta(x0, t).data[:, 0, 0]
+alpha_dot = sched.alpha_dot(x0, t).data[:, 0, 0]
+beta_dot = sched.beta_dot(x0, t).data[:, 0, 0]
+
+plt.plot(alpha, label='alpha')
+plt.plot(beta, label='beta')
+plt.plot(alpha_dot, label='alpha_dot')
+plt.plot(beta_dot, label='beta_dot')
+plt.legend()
+
+plt.savefig('schedulers.png')
+
 print('============= SAMPLING FROM ENVIRONMENT =============')
-init = net.get_start(32)
-samples = env.sample(32, x0=FlowTensor(init))
-strings = setup.base_model.embed_to_sequence(samples)
+N = 32
+init = net.get_start(N)
+x = FlowTensor(init)
+t = torch.ones((init.shape[0], )).to(net.device)* 0.5
 
-strings_net = net.sample(num_samples=32)
+
+samples = env.sample(N, x0=FlowTensor(init), threshold=50, debug=False, valid_pbar=True)
+samples_rand = env.sample(N, x0=FlowTensor(init), threshold=50, debug=True, valid_pbar=True)
+
+strings = setup.base_model.embed_to_sequence(samples.sample)
+strings_rand = setup.base_model.embed_to_sequence(samples_rand.sample)
+
+print(f'Validity: {samples.valids.mean()}')
+
+conf = OmegaConf.load(args.cfg_path)
+seq_len = conf.data.seq_len
+infill_seed = torch.randint(0, net.model.network.vocab_size, (seq_len,)).to(
+            torch.device('cuda'))  # random seed of token ids for now
+# 1 if != pad, else 0
+infill_mask = (torch.ones(seq_len) != net.tokenizer.pad_id-100).to(
+    torch.device('cuda'))  # switch 30 for net.tokenizer.pad_id
 
 
+# corrupt_mask: 1 for real tokens, 0 for pad (Equivalent to "fully corrupt all real tokens")
+corrupt_mask = infill_mask.clone().to(torch.device('cuda')) 
+
+tokens_net = net.sample(num_samples=N, infill_seed=infill_seed, infill_mask=infill_mask, corrupt_mask=corrupt_mask)
+strings_net = [net.tokenizer.untokenize(t) for t in tokens_net]
+
+random_tokens = torch.randint(0, net.model.network.vocab_size - 1, (N, seq_len))
+random_strings = [net.tokenizer.untokenize(t) for t in random_tokens]
 
 results = []
+results_rand = []
 results_net = []
+results_fullrand = []
 with torch.no_grad():
     for i in tqdm(range(len(strings))):
         s = strings[i]
         sn = strings_net[i]
+        snr = strings_rand[i]
+        snfr = random_strings[i]
         results.append(esmfold.infer(s))
         results_net.append(esmfold.infer(sn))
+        results_rand.append(esmfold.infer(snr))
+        results_fullrand.append(esmfold.infer(snfr))
+        
 
 plddts = torch.vstack([r['mean_plddt'] for r in results])
 plddts_net = torch.vstack([r['mean_plddt'] for r in results_net])
+plddts_rand = torch.vstack([r['mean_plddt'] for r in results_rand])
+plddts_fullrand = torch.vstack([r['mean_plddt'] for r in results_fullrand])
 
 
-print(plddts)
-print(plddts_net)
+
+print(f'APT mean pLDDT: {plddts.mean()}')
+print(f'SGPO means pLDDT: {plddts_net.mean()}')
+print(f'random score : {plddts_rand.mean()}')
+print(f'random tokens : {plddts_fullrand.mean()}')
 
 
 print('=========== CHECKING SGPO BASE FUNCTIONS ============')
@@ -139,4 +198,4 @@ with torch.no_grad():
         results.append(esmfold.infer(s))
 
 plddts = torch.vstack([r['mean_plddt'] for r in results])
-torch.save(plddts, 'plddts.pt')
+# torch.save(plddts, 'plddts.pt')
