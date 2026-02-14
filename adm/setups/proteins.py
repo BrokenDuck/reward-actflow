@@ -9,8 +9,12 @@ import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
 import esm
 import numpy as np
+from tqdm import tqdm
+from vendi_score import vendi
+import gpytorch
 
 from matplotlib.figure import Figure
+from matplotlib import pyplot as plt
 
 from sgpo.models.continuous import ContinuousModel
 from sgpo.models.pretraining.model.continuous_diffusion import GaussianDiffusionTransformer
@@ -78,6 +82,8 @@ class DDPMNoiseSchedule(NoiseSchedule[FlowTensor]):
 class CosineSchedule(Scheduler[FlowTensor]):
     def __init__(self) -> None:
         super().__init__()
+        # self._noise_schedule = DDPMNoiseSchedule(self)
+
 
     def alpha(self, x: FlowTensor, t: Tensor) -> FlowTensor:
         sqrt_alpha_bar = torch.cos((1. - t) * torch.pi / 2.)
@@ -97,7 +103,7 @@ class CosineSchedule(Scheduler[FlowTensor]):
 
     def beta_dot(self, x: FlowTensor, t: Tensor) -> FlowTensor:
         alpha_bar_dot = 2. * torch.cos((1. - t) * torch.pi / 2.) * torch.pi / 2. * torch.sin((1. - t) * torch.pi / 2.)
-        return -FlowTensor(alpha_bar_dot) / (2. * self.beta(x, t))
+        return -FlowTensor(append_dims(alpha_bar_dot, x.data.ndim)) / (2. * self.beta(x, t))
 
 
 class ProteinModel(BaseModel[FlowTensor]):
@@ -111,6 +117,7 @@ class ProteinModel(BaseModel[FlowTensor]):
         seq_len = config.data.seq_len
 
         self.sgpo_model: ContinuousModel = instantiate(model, model_name=model_name, seq_len=seq_len, device=device, _recursive_=True)
+        self.network = self.sgpo_model.model.network
         self._scheduler = CosineSchedule()
     
     
@@ -134,6 +141,8 @@ class ProteinModel(BaseModel[FlowTensor]):
     
 
     def forward(self, x: FlowTensor, t: Tensor, **kwargs: Any) -> FlowTensor: 
+        if 'debug' in kwargs and kwargs['debug']:
+            return FlowTensor(torch.randn_like(x.data).to(x.device))
         return FlowTensor(self.network_forward(x.data, t)['xstart'])
 
 
@@ -148,18 +157,19 @@ class ProteinModel(BaseModel[FlowTensor]):
 
 
     def network_forward(self, x: torch.Tensor, t: torch.Tensor) -> dict[str, torch.Tensor]:
-        t = 1. - t
+        t = 1. - t.to(self.device)
+        x = x.to(self.device)
         net = self.sgpo_model
         infill_mask = (torch.ones(net.seq_len) != net.tokenizer.pad_id-100).to(net.device) # TODO change magic number
         attn_mask = torch.ones((x.shape[0], x.shape[1]), dtype=torch.bool, device=net.device)
                                
         idx = (t * len(net.noise_schedule.sigmas)).round().clamp(0, len(net.noise_schedule.sigmas) - 1).long()
-        sigma = net.noise_schedule.sigmas.to(net.device)[idx].reshape((x.shape[0], 1, 1))
-        f_out = net.model.network(x/(sigma**2 + 1).sqrt(), idx, attn_mask=attn_mask)
+        sigma = net.noise_schedule.sigmas.to(net.device)[idx].reshape((x.shape[0], 1, 1)).float()
+        f_out = net.model.network(x.float()/(sigma**2 + 1).sqrt(), idx, attn_mask=attn_mask)
 
         out = net.model.network.pred_xstart(
-            x,
-            t,
+            x.float(),
+            idx,
             attn_mask=attn_mask,
             sequence_output=f_out['sequence_output'],
             infill_mask=infill_mask
@@ -173,6 +183,8 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
     def __init__(self, args: dict[str, Any], device: device | None):
         super().__init__(args)
         cfg_path: str = args['cfg_path']
+        self.threshold = args['threshold']
+        self.lengthscale = args['lengthscale_vendi'] if 'lengthscale_vendi' in args else None
         config = OmegaConf.load(cfg_path)
 
         self._base_model = ProteinModel(config, device=device)
@@ -183,27 +195,35 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
     def add_args(cls, parser: ArgumentParser): # TODO interface with hydra somehow to get hierarchical configs... for now use static one from existing run
         default_path = files(sgpo) / Path('configs/sample_config.yaml')
         parser.add_argument('--cfg_path', type=str, default=default_path, help='Path for diffusion model config file')
+        parser.add_argument('--threshold', type=float, default=65., help='Validity threshold for pLDDT')
+        parser.add_argument('--lengthscale_vendi', type=float)
 
 
     @property
     def base_model(self) -> ProteinModel:
         return self._base_model
+    
+    
+    @property
+    def device(self) -> torch.device:
+        return self._base_model.device
 
 
     def validity(self, samples: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
-        # TODO pass samples.data or self.network_forward(samples.data, t=0.0005)?
-        logits = self.base_model.sgpo_model.model.network.cls(samples.data) # TODO hardcoded for GaussianDiffusionTransformer
-        probas = F.softmax(logits, dim=-1)
-        tokens = probas.argmax(dim=-1)
-        strings = [self.base_model.sgpo_model.tokenizer.untokenize(s) for s in tokens]
+        strings = self.base_model.embed_to_sequence(samples)
         
         results = []
         with torch.no_grad():
-            for s in strings:
+            if 'valid_pbar' in kwargs and kwargs['valid_pbar']:
+                it = tqdm(strings)
+            else:
+                it = strings
+            for s in it:
                 results.append(self.esmfold.infer(s))        
-            
-        threshold = kwargs['threshold']
+        
         plddt = torch.vstack([r['mean_plddt'] for r in results])
+
+        threshold = kwargs['threshold'] if 'threshold' in kwargs else self.threshold
         return torch.where(plddt > threshold, 1., 0.)
 
 
@@ -232,7 +252,10 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         batch : Batch[D]
             The batch.
         """
-        raise NotImplementedError
+
+        fig, _ = plt.subplots()
+
+        return fig
     
 
     def save_sample(self, sample: FlowTensor, kwargs: dict[str, Any], filename: Path):
@@ -247,7 +270,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         filename : Path
             The file path where to save the sample, without extension.
         """
-        raise NotImplementedError
+        torch.save(sample.data, f'{filename}.pt')
     
 
     def eval_sampling_kwargs(self, n: int) -> dict[str, Any]:
@@ -263,13 +286,12 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         dict
             A dictionary of keyword arguments for sampling.
         """
-        raise NotImplementedError
         return {}
     
 
     def compute_metrics(self, batch: Batch[FlowTensor]) -> dict[str, float]:
         """Compute relevant (global) metrics for the problem setup.
-        
+
         Parameters
         ----------
         batch : Batch[D]
@@ -280,7 +302,15 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         dict[str, float]
             A dictionary of computed metrics.
         """
-        return dict()
+        embeddings = batch.samples.data
+        X = embeddings.mean(dim=1)
+        kernel = gpytorch.kernels.RBFKernel()
+        if self.lengthscale is not None:
+            kernel.lengthscale = self.lengthscale
+        K = kernel(X, X).cpu().numpy()
+        vendi_score_val = vendi.score_K(K)
+
+        return {"vendi": float(vendi_score_val)}
     
 
     def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
@@ -296,4 +326,4 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         dict[str, dict[str, float]]
             A dictionary mapping sample names to their computed metrics.
         """
-        return dict()
+        return dict() # TODO maybe compute fitness etc

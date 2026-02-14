@@ -50,21 +50,29 @@ then
     cd $MAIN_DIR
 fi
 
-
-
-cd $MAIN_DIR
-if [ ! -d "openfold" ]
+if command -v uv >/dev/null 2>&1
 then
-    git clone https://github.com/Komod0D/openfold.git@4b41059694619831a7db195b7e0988fc4ff3a307
-    cd openfold
-    cat scripts/install_third_party_dependencies.sh | head -n 17 > scripts/our_install.sh
-    chmod +x scripts/our_install.sh
-    ./scripts/our_install.sh
-    echo "export CUTLASS_PATH=$(pwd)/cutlass" >> ~/.bashrc
-    echo "export KMP_AFFINITY=none" >> ~/.bashrc
-    echo "export LIBRARY_PATH=$ENV_DIR/.venv/lib:\$LIBRARY_PATH" >> ~/.bashrc
-    echo "export LD_LIBRARY_PATH=$ENV_DIR/.venv/lib:\$LD_LIBRARY_PATH" >> ~/.bashrc
+    uv pip install 'openfold @ git+https://github.com/aqlaboratory/openfold.git@4b41059694619831a7db195b7e0988fc4ff3a307'
+else
+    pip install 'openfold @ git+https://github.com/aqlaboratory/openfold.git@4b41059694619831a7db195b7e0988fc4ff3a307'
 fi
 
 
-# TODO then need to run SGPO once and change the downloaded checkpoint with the script in the repo
+cd $MAIN_DIR
+if  [ ! -d "sgpo" ]
+then
+    git clone https://github.com/Komod0D/SGPO/tree/main sgpo
+    cd sgpo
+    mkdir -p checkpoints/continuous_ESM/CreiLOV
+    cd checkpoints/continuous_ESM/CreiLOV
+    wget https://huggingface.co/jsunn-y/SGPO/resolve/main/checkpoints/continuous_ESM/CreiLOV/best_model.ckpt
+    cd $MAIN_DIR/sgpo
+    if command -v uv >/dev/null 2>&1
+        then
+            uv pip install -e . --config-settings editable_mode=strict
+        else
+            pip install -e . --config-settings editable_mode=strict
+    fi
+    cd sgpo
+    python fix_checkpoints.py
+fi

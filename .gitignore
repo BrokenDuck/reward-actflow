@@ -225,5 +225,10 @@ experiments/
 slurm-*
 jobs/
 *.ipynb
-NOTES.md
 runs
+*.png
+*.md
+*.sh
+*.pt
+run
+temp
