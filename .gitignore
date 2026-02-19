@@ -233,3 +233,6 @@ runs
 run
 temp
 sweep*
+output
+wandb
+configs

@@ -77,27 +77,12 @@ esmfold = setup.esmfold
 net = setup.base_model.sgpo_model
 net : ContinuousModel
 
-reward = DummyReward()
-env.reward = reward
+print('========= TRYING BATCH SAMPLE ================')
 
-num_samples = 1000
-N = 32
-init = net.get_start(N)
-x = FlowTensor(init)
-t = torch.ones((init.shape[0], )).to(net.device)* 0.5
+N = 1000
+batch_size = 64
+sample = env.batch_sample(N, batch_size=batch_size, pbar=True)
+batch = Batch.from_sample(sample)
 
-samples = torch.load('samples.pt')
-zeros = torch.zeros((len(samples), ))
-temp = FlowTensor(samples)
-batch = Batch(temp, temp, zeros, zeros, {})
-
-lengths = torch.linspace(0.00001, 200, 100)
-
-vendis = []
-for l in tqdm(lengths):
-    setup.lengthscale = l
-    metrics = setup.compute_metrics(batch)
-    vendis.append(metrics['vendi'])
-
-plt.plot(lengths, vendis)
-plt.savefig('lengthscales.png')
+metrics = setup.compute_metrics(batch)
+print(metrics)

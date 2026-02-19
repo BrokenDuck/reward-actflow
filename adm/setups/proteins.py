@@ -26,6 +26,14 @@ from flowgym.utils import append_dims
 
 from active_pretraining.problem_setup import ProblemSetup, SampleFile, Batch
 import sgpo
+from sgpo.oracle.train_oracle import OracleModel
+
+CREILOV_WILD_TYPE = "MAGLRHTFVVADATLPDCPLVYASEGFYAMTGYGPDEVLGHNARFLQGEGTDPKEVQKIRDAIKKGEACSVRLLNYRKDGTPFWNLLTVTPIKTPDGRVSKFVGVQVDVTSKTEGKALA"
+ORACLE_HIDDEN_DIM = 400
+ORACLE_DROPOUT = 0.1
+ORACLE_BATCH_SIZE = 128
+HAMMING_PENALTY_CUTOFF = 70
+HAMMING_PENALTY_RATE = 0.99
 
 
 def shim():
@@ -190,6 +198,9 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         self._base_model = ProteinModel(config, device=device)
         self.esmfold = esm.pretrained.esmfold_v1().eval().to(device)
 
+        oracle_path = Path(args['oracle_path']) if 'oracle_path' in args else files(sgpo) / Path('oracle/checkpoints/CreiLOV')
+        self.oracle_ensemble = self._load_oracle_ensemble(oracle_path)
+
 
     @classmethod
     def add_args(cls, parser: ArgumentParser): # TODO interface with hydra somehow to get hierarchical configs... for now use static one from existing run
@@ -197,7 +208,27 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         parser.add_argument('--cfg_path', type=str, default=default_path, help='Path for diffusion model config file')
         parser.add_argument('--threshold', type=float, default=65., help='Validity threshold for pLDDT')
         parser.add_argument('--lengthscale_vendi', type=float)
+        default_oracle_path = files(sgpo) / Path('oracle/checkpoints/CreiLOV')
+        parser.add_argument('--oracle_path', type=str, default=default_oracle_path, help='Path to oracle ensemble checkpoint directory')
 
+
+    def _load_oracle_ensemble(self, oracle_path: Path) -> Sequence[OracleModel]:
+        oracle_path = Path(oracle_path)
+        if not oracle_path.exists():
+            return []
+        model_files = sorted(oracle_path.glob('*.pth'))
+        if not model_files:
+            return []
+        seq_len = len(CREILOV_WILD_TYPE)
+        alphabet_size = 20
+        input_dim = seq_len * alphabet_size
+        ensemble = []
+        for f in model_files:
+            model = OracleModel(input_dim=input_dim, hidden_dim=ORACLE_HIDDEN_DIM, dropout_rate=ORACLE_DROPOUT)
+            model.load_state_dict(torch.load(f, map_location='cpu'))
+            model.eval()
+            ensemble.append(model)
+        return ensemble
 
     @property
     def base_model(self) -> ProteinModel:
@@ -313,6 +344,48 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         return {"vendi": float(vendi_score_val)}
     
 
+    @staticmethod
+    def _onehot_encode(sequence: str) -> np.ndarray:
+        alphabet = "ACDEFGHIKLMNPQRSTVWY"
+        encoding = np.zeros((len(sequence), len(alphabet)))
+        for i, aa in enumerate(sequence):
+            if aa in alphabet:
+                encoding[i, alphabet.index(aa)] = 1
+        return encoding.flatten()
+
+    @staticmethod
+    def _hamming_distance(s1: str, s2: str) -> int:
+        return sum(c1 != c2 for c1, c2 in zip(s1, s2))
+
+    # TODO this punished OOD generations... maybe it will be a problem
+    @staticmethod
+    def _hamming_penalty(distance: int, cutoff: int = HAMMING_PENALTY_CUTOFF, rate: float = HAMMING_PENALTY_RATE) -> float:
+        if distance <= cutoff:
+            return 1.0
+        return rate ** (distance - cutoff)
+
+    def _oracle_predict(self, sequences: Sequence[str]) -> np.ndarray:
+        """Run the oracle ensemble on a list of sequences, returning mean fitness predictions."""
+        if not self.oracle_ensemble:
+            return np.full(len(sequences), float('nan'))
+
+        encodings = np.array([self._onehot_encode(seq) for seq in sequences])
+        X = torch.tensor(encodings, dtype=torch.float32)
+
+        all_predictions = np.zeros((len(self.oracle_ensemble), len(sequences)))
+        with torch.no_grad():
+            for i, model in enumerate(self.oracle_ensemble):
+                preds = model(X).cpu().numpy().reshape(-1)
+                penalties = np.array([
+                    self._hamming_penalty(self._hamming_distance(CREILOV_WILD_TYPE, seq))
+                    for seq in sequences
+                ])
+                preds = preds * penalties
+                preds = np.maximum(preds, 0.0)
+                all_predictions[i] = preds
+
+        return np.mean(all_predictions, axis=0)
+
     def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
         """Compute relevant metrics on individual samples.
 
@@ -326,4 +399,28 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         dict[str, dict[str, float]]
             A dictionary mapping sample names to their computed metrics.
         """
-        return dict() # TODO maybe compute fitness etc
+        if not self.oracle_ensemble:
+            return dict()
+
+        # Load embeddings and convert to sequences
+        names = []
+        embeddings = []
+        for sf in sample_files:
+            data = torch.load(sf.file, map_location='cpu')
+            embeddings.append(data)
+            names.append(sf.file.stem)
+
+        stacked = FlowTensor(torch.stack(embeddings))
+        sequences = self.base_model.embed_to_sequence(stacked)
+
+        # Run oracle ensemble
+        fitness_scores = self._oracle_predict(sequences)
+
+        results: dict[str, dict[str, float]] = {}
+        for name, fitness, seq, sf in zip(names, fitness_scores, sequences, sample_files):
+            metrics: dict[str, float] = {'fitness': float(fitness)}
+            metrics['hamming_distance'] = float(self._hamming_distance(CREILOV_WILD_TYPE, seq))
+            metrics['is_valid'] = float(sf.is_valid)
+            results[name] = metrics
+
+        return results
