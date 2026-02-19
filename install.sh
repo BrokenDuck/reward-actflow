@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 if command -v module >/dev/null 2>&1
 then
-    module load stack/2024-06 gcc/12.2.0 cuda/11.8.0
+    module load stack/2024-04 gcc/8.5.0 cuda/11.3.1
 fi
 
 ENV_DIR=$(pwd)
@@ -52,17 +52,17 @@ fi
 
 if command -v uv >/dev/null 2>&1
 then
-    uv pip install 'openfold @ git+https://github.com/aqlaboratory/openfold.git@4b41059694619831a7db195b7e0988fc4ff3a307'
+    uv pip install 'openfold @ git+https://github.com/aqlaboratory/openfold.git@4b41059694619831a7db195b7e0988fc4ff3a307' --no-build-isolation
 else
-    pip install 'openfold @ git+https://github.com/aqlaboratory/openfold.git@4b41059694619831a7db195b7e0988fc4ff3a307'
+    pip install 'openfold @ git+https://github.com/aqlaboratory/openfold.git@4b41059694619831a7db195b7e0988fc4ff3a307' --no-build-isolation
 fi
 
 
 cd $MAIN_DIR
 if  [ ! -d "sgpo" ]
 then
-    git clone https://github.com/Komod0D/SGPO/tree/main sgpo
-    cd sgpo
+    git clone git@github.com:Komod0D/SGPO.git sgpo
+    cd sgpo/sgpo
     mkdir -p checkpoints/continuous_ESM/CreiLOV
     cd checkpoints/continuous_ESM/CreiLOV
     wget https://huggingface.co/jsunn-y/SGPO/resolve/main/checkpoints/continuous_ESM/CreiLOV/best_model.ckpt
