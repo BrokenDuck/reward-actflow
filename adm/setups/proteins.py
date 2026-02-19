@@ -207,7 +207,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         default_path = files(sgpo) / Path('configs/sample_config.yaml')
         parser.add_argument('--cfg_path', type=str, default=default_path, help='Path for diffusion model config file')
         parser.add_argument('--threshold', type=float, default=65., help='Validity threshold for pLDDT')
-        parser.add_argument('--lengthscale_vendi', type=float)
+        parser.add_argument('--lengthscale_vendi', type=float, default=2.)
         default_oracle_path = files(sgpo) / Path('oracle/checkpoints/CreiLOV')
         parser.add_argument('--oracle_path', type=str, default=default_oracle_path, help='Path to oracle ensemble checkpoint directory')
 
@@ -243,16 +243,10 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
     def validity(self, samples: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
         strings = self.base_model.embed_to_sequence(samples)
         
-        results = []
         with torch.no_grad():
-            if 'valid_pbar' in kwargs and kwargs['valid_pbar']:
-                it = tqdm(strings)
-            else:
-                it = strings
-            for s in it:
-                results.append(self.esmfold.infer(s))        
+            results = self.esmfold.infer(list(strings))        
         
-        plddt = torch.vstack([r['mean_plddt'] for r in results])
+        plddt = results['mean_plddt']
 
         threshold = kwargs['threshold'] if 'threshold' in kwargs else self.threshold
         return torch.where(plddt > threshold, 1., 0.)
