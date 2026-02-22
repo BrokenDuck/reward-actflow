@@ -6,13 +6,13 @@ from sgpo.models.continuous import ContinuousModel
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from active_pretraining.setups.proteins import ProteinModel, ProteinProblemSetup
-from active_pretraining.trainer import ActivePretrainingConfig, ActivePretraining
-from active_pretraining.run import build_parser, setup_logger
-from active_pretraining.problem_setup import Batch
-from flowgym import FlowTensor
-from flowgym.environments.endpoint import EndpointEnvironment
-from flowgym.rewards.base import DummyReward
+from adm.setups.proteins import ProteinModel, ProteinProblemSetup
+from adm.trainer import ActivePretrainingConfig, ActivePretraining
+from adm.run import build_parser, setup_logger
+from adm.problem_setup import Batch
+from diffusiongym import DDTensor
+from diffusiongym.environments.endpoint import EndpointEnvironment
+from diffusiongym.rewards.base import DummyReward
 from vendi_score import vendi
 import gpytorch
 
@@ -83,7 +83,7 @@ env.reward = reward
 num_samples = 1000
 N = 32
 init = net.get_start(N)
-x = FlowTensor(init)
+x = DDTensor(init)
 t = torch.ones((init.shape[0], )).to(net.device)* 0.5
 
 
@@ -94,7 +94,7 @@ for i in tqdm(range(num_samples)):
 
 
 
-batch: Batch[FlowTensor] = Batch.concat(samples)
+batch: Batch[DDTensor] = Batch.concat(samples)
 setup.save_sample(batch.samples, None, 'samples')
 metrics = setup.compute_metrics(batch)
 print(metrics)

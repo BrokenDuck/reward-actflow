@@ -1,15 +1,14 @@
-from typing import Any, Sequence
+from typing import Any, Sequence, List
 from argparse import ArgumentParser
 from importlib_resources import files
+from importlib_resources.abc import Traversable
 from pathlib import Path
 from hydra.utils import instantiate
 from torch import Tensor, device
-import torch.nn.functional as F
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
 import esm
 import numpy as np
-from tqdm import tqdm
 from vendi_score import vendi
 import gpytorch
 
@@ -17,14 +16,13 @@ from matplotlib.figure import Figure
 from matplotlib import pyplot as plt
 
 from sgpo.models.continuous import ContinuousModel
-from sgpo.models.pretraining.model.continuous_diffusion import GaussianDiffusionTransformer
-from flowgym.types import FlowTensor
-from flowgym.base_models import BaseModel
-from flowgym.schedulers import Scheduler, NoiseSchedule
-from flowgym.environments import Environment
-from flowgym.utils import append_dims
+from diffusiongym import DDTensor
+from diffusiongym.base_models import BaseModel
+from diffusiongym.schedulers import Scheduler, NoiseSchedule
+from diffusiongym.environments import Environment
+from diffusiongym.utils import append_dims
 
-from active_pretraining.problem_setup import ProblemSetup, SampleFile, Batch
+from adm.setups.problem_setup import ProblemSetup, SampleFile, Batch
 import sgpo
 from sgpo.oracle.train_oracle import OracleModel
 
@@ -77,44 +75,44 @@ def shim():
 shim()
 
 
-class DDPMNoiseSchedule(NoiseSchedule[FlowTensor]):
-    def __init__(self, scheduler: Scheduler[FlowTensor]) -> None:
+class DDPMNoiseSchedule(NoiseSchedule[DDTensor]):
+    def __init__(self, scheduler: Scheduler[DDTensor]) -> None:
         super().__init__()
         self.scheduler = scheduler
     
 
-    def __call__(self, x: FlowTensor, t: Tensor) -> FlowTensor:
+    def __call__(self, x: DDTensor, t: Tensor) -> DDTensor:
         return self.scheduler.beta(x, t) / self.scheduler.alpha(x, t)
 
 
-class CosineSchedule(Scheduler[FlowTensor]):
+class CosineSchedule(Scheduler[DDTensor]):
     def __init__(self) -> None:
         super().__init__()
         # self._noise_schedule = DDPMNoiseSchedule(self)
 
 
-    def alpha(self, x: FlowTensor, t: Tensor) -> FlowTensor:
+    def alpha(self, x: DDTensor, t: Tensor) -> DDTensor:
         sqrt_alpha_bar = torch.cos((1. - t) * torch.pi / 2.)
-        return FlowTensor(append_dims(sqrt_alpha_bar, x.data.ndim))
+        return DDTensor(append_dims(sqrt_alpha_bar, x.data.ndim))
 
 
-    def alpha_dot(self, x: FlowTensor, t: Tensor) -> FlowTensor:
+    def alpha_dot(self, x: DDTensor, t: Tensor) -> DDTensor:
         sqrt_alpha_bar_dot = torch.pi / 2. * torch.sin((1. - t) * torch.pi / 2.)
-        return FlowTensor(append_dims(sqrt_alpha_bar_dot.data, x.data.ndim))
+        return DDTensor(append_dims(sqrt_alpha_bar_dot.data, x.data.ndim))
     
 
-    def beta(self, x: FlowTensor, t: Tensor) -> FlowTensor:
+    def beta(self, x: DDTensor, t: Tensor) -> DDTensor:
         alpha_bar = torch.cos((1. - t) * torch.pi / 2.).square()
         beta = torch.sqrt(1. - alpha_bar)
-        return FlowTensor(append_dims(beta, x.data.ndim))
+        return DDTensor(append_dims(beta, x.data.ndim))
 
 
-    def beta_dot(self, x: FlowTensor, t: Tensor) -> FlowTensor:
+    def beta_dot(self, x: DDTensor, t: Tensor) -> DDTensor:
         alpha_bar_dot = 2. * torch.cos((1. - t) * torch.pi / 2.) * torch.pi / 2. * torch.sin((1. - t) * torch.pi / 2.)
-        return -FlowTensor(append_dims(alpha_bar_dot, x.data.ndim)) / (2. * self.beta(x, t))
+        return -DDTensor(append_dims(alpha_bar_dot, x.data.ndim)) / (2. * self.beta(x, t))
 
 
-class ProteinModel(BaseModel[FlowTensor]):
+class ProteinModel(BaseModel[DDTensor]):
 
     output_type = "endpoint"
 
@@ -130,31 +128,31 @@ class ProteinModel(BaseModel[FlowTensor]):
     
     
     @property
-    def scheduler(self) -> Scheduler[FlowTensor]:
+    def scheduler(self) -> Scheduler[DDTensor]:
         return self._scheduler
 
 
-    def preprocess(self, x: FlowTensor, **kwargs: Any) -> tuple[FlowTensor, dict[str, Any]]:
+    def preprocess(self, x: DDTensor, **kwargs: Any) -> tuple[DDTensor, dict[str, Any]]:
         # TODO maybe map to and from ESM embeddings???
         return x, kwargs
     
 
-    def postprocess(self, x: FlowTensor) -> FlowTensor:
+    def postprocess(self, x: DDTensor) -> DDTensor:
         # TODO maybe map to and from ESM embeddings???
         return x
     
 
-    def sample_p0(self, n: int, **kwargs: Any) -> tuple[FlowTensor, dict[str, Any]]:
-        return FlowTensor(self.sgpo_model.get_start(n)), kwargs
+    def sample_p0(self, n: int, **kwargs: Any) -> tuple[DDTensor, dict[str, Any]]:
+        return DDTensor(self.sgpo_model.get_start(n)), kwargs
     
 
-    def forward(self, x: FlowTensor, t: Tensor, **kwargs: Any) -> FlowTensor: 
+    def forward(self, x: DDTensor, t: Tensor, **kwargs: Any) -> DDTensor: 
         if 'debug' in kwargs and kwargs['debug']:
-            return FlowTensor(torch.randn_like(x.data).to(x.device))
-        return FlowTensor(self.network_forward(x.data, t)['xstart'])
+            return DDTensor(torch.randn_like(x.data).to(x.device))
+        return DDTensor(self.network_forward(x.data, t)['xstart'])
 
 
-    def embed_to_sequence(self, embeds: FlowTensor) -> Sequence[str]:
+    def embed_to_sequence(self, embeds: DDTensor) -> Sequence[str]:
         epsilon = 1e-4 # TODO change magic number
         t = (1. - epsilon) * torch.ones((embeds.data.shape[0],)).to(self.device)
         out = self.network_forward(embeds.data, t)
@@ -187,7 +185,7 @@ class ProteinModel(BaseModel[FlowTensor]):
         return out
 
 
-class ProteinProblemSetup(ProblemSetup[FlowTensor]):
+class ProteinProblemSetup(ProblemSetup[DDTensor]):
     def __init__(self, args: dict[str, Any], device: device | None):
         super().__init__(args)
         cfg_path: str = args['cfg_path']
@@ -212,7 +210,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         parser.add_argument('--oracle_path', type=str, default=default_oracle_path, help='Path to oracle ensemble checkpoint directory')
 
 
-    def _load_oracle_ensemble(self, oracle_path: Path) -> Sequence[OracleModel]:
+    def _load_oracle_ensemble(self, oracle_path: Path | Traversable) -> Sequence[OracleModel]:
         oracle_path = Path(oracle_path)
         if not oracle_path.exists():
             return []
@@ -240,7 +238,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         return self._base_model.device
 
 
-    def validity(self, samples: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
+    def validity(self, samples: DDTensor, kwargs: dict[str, Any]) -> torch.Tensor:
         if self.esmfold is None:
             return torch.ones((len(samples),))
 
@@ -261,16 +259,16 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         return 'input'
 
 
-    def postprocess_latents(self, batch: Batch[FlowTensor]) -> FlowTensor:
+    def postprocess_latents(self, batch: Batch[DDTensor]) -> DDTensor:
         return batch.latents
 
 
-    def postprocess_features(self, latents: FlowTensor, feats: Any) -> torch.Tensor:
+    def postprocess_features(self, latents: DDTensor, feats: Any) -> torch.Tensor:
         data: torch.Tensor = feats.data
         return data.mean(dim=-1)
 
 
-    def visualize_sample(self, env: Environment[FlowTensor], batch: Batch[FlowTensor]) -> Figure:
+    def visualize_sample(self, env: Environment[DDTensor], batch: Batch[DDTensor]) -> Figure:
         """Produce a matplotlib figure for visualizing the sample in the problem setup.
 
         Parameters
@@ -286,7 +284,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         return fig
     
 
-    def save_sample(self, sample: FlowTensor, kwargs: dict[str, Any], filename: Path):
+    def save_sample(self, sample: DDTensor, kwargs: dict[str, Any], filename: Path):
         """Save a *single* sample to the disk.
         
         Parameters
@@ -317,7 +315,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         return {}
     
 
-    def compute_metrics(self, batch: Batch[FlowTensor]) -> dict[str, float]:
+    def compute_metrics(self, sample_files: List[SampleFile]) -> dict[str, float]:
         """Compute relevant (global) metrics for the problem setup.
 
         Parameters
@@ -330,7 +328,16 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         dict[str, float]
             A dictionary of computed metrics.
         """
-        embeddings = batch.samples.data
+
+        names = []
+        samples = []
+        for sf in sample_files:
+            data = torch.load(sf.file, map_location='cpu')
+            samples.append(data)
+            names.append(sf.file.stem)
+
+        embeddings = torch.vstack(samples)
+
         X = embeddings.mean(dim=1)
         kernel = gpytorch.kernels.RBFKernel()
         if self.lengthscale is not None:
@@ -407,7 +414,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
             embeddings.append(data)
             names.append(sf.file.stem)
 
-        stacked = FlowTensor(torch.vstack(embeddings))
+        stacked = DDTensor(torch.vstack(embeddings))
         sequences = self.base_model.embed_to_sequence(stacked)
 
         # Run oracle ensemble

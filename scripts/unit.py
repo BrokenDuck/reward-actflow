@@ -1,18 +1,15 @@
-from hydra.utils import instantiate
 from omegaconf import OmegaConf
 import torch
-import esm
 from sgpo.models.continuous import ContinuousModel
-import torch.nn.functional as F
 from tqdm import tqdm
 import os
 from pathlib import Path
 
-from active_pretraining.setups.proteins import ProteinModel, ProteinProblemSetup
-from active_pretraining.trainer import ActivePretrainingConfig, ActivePretraining
-from active_pretraining.run import build_parser, setup_logger
-from active_pretraining.problem_setup import SampleFile
-from flowgym import FlowTensor
+from adm.setups.proteins import ProteinProblemSetup
+from adm.task_agnostic import TaskAgnosticConfig, TaskAgnostic, build_parser
+from adm.setups.problem_setup import SampleFile
+from adm.utils import setup_logger
+from diffusiongym import DDTensor
 
 from matplotlib import pyplot as plt
 
@@ -20,13 +17,13 @@ from matplotlib import pyplot as plt
 args = build_parser().parse_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-config = ActivePretrainingConfig.construct_from_args(args)
 setup = ProteinProblemSetup(vars(args), device=device)
 
 # Set up logging
-logger = setup_logger(config, args.verbose)
+config = TaskAgnosticConfig.construct_from_args(args)
+logger = setup_logger(config.folder, args.verbose)
 
-apt = ActivePretraining(problem_setup=setup, config=config, logger=logger)
+apt = TaskAgnostic(problem_setup=setup, config=config, logger=logger)
 
 
 env = apt.env
@@ -59,11 +56,11 @@ plt.savefig('schedulers.png')
 print('============= SAMPLING FROM ENVIRONMENT =============')
 N = 32
 init = net.get_start(N)
-x = FlowTensor(init)
+x = DDTensor(init)
 t = torch.ones((init.shape[0], )).to(net.device)* 0.5
 
 
-samples = env.sample(N, x0=FlowTensor(init), threshold=50, debug=False, valid_pbar=True)
+samples = env.sample(N, x0=DDTensor(init), threshold=50, debug=False, valid_pbar=True)
 
 print('=========== CHECKING METRICS =================')
 
@@ -83,7 +80,7 @@ print(sample_metrics)
 
 print('=========== CHECKING VALIDITY =================')
 
-samples_rand = env.sample(N, x0=FlowTensor(init), threshold=50, debug=True, valid_pbar=True)
+samples_rand = env.sample(N, x0=DDTensor(init), threshold=50, debug=True, valid_pbar=True)
 
 strings = setup.base_model.embed_to_sequence(samples.sample)
 strings_rand = setup.base_model.embed_to_sequence(samples_rand.sample)
@@ -108,33 +105,37 @@ strings_net = [net.tokenizer.untokenize(t) for t in tokens_net]
 random_tokens = torch.randint(0, net.model.network.vocab_size - 1, (N, seq_len))
 random_strings = [net.tokenizer.untokenize(t) for t in random_tokens]
 
-results = []
-results_rand = []
-results_net = []
-results_fullrand = []
-with torch.no_grad():
-    for i in tqdm(range(len(strings))):
-        s = strings[i]
-        sn = strings_net[i]
-        snr = strings_rand[i]
-        snfr = random_strings[i]
-        results.append(esmfold.infer(s))
-        results_net.append(esmfold.infer(sn))
-        results_rand.append(esmfold.infer(snr))
-        results_fullrand.append(esmfold.infer(snfr))
+if esmfold is not None:
+    results = []
+    results_rand = []
+    results_net = []
+    results_fullrand = []
+    with torch.no_grad():
+        for i in tqdm(range(len(strings))):
+            s = strings[i]
+            sn = strings_net[i]
+            snr = strings_rand[i]
+            snfr = random_strings[i]
+            results.append(esmfold.infer(s))
+            results_net.append(esmfold.infer(sn))
+            results_rand.append(esmfold.infer(snr))
+            results_fullrand.append(esmfold.infer(snfr))
         
 
-plddts = torch.vstack([r['mean_plddt'] for r in results])
-plddts_net = torch.vstack([r['mean_plddt'] for r in results_net])
-plddts_rand = torch.vstack([r['mean_plddt'] for r in results_rand])
-plddts_fullrand = torch.vstack([r['mean_plddt'] for r in results_fullrand])
+    plddts = torch.vstack([r['mean_plddt'] for r in results])
+    plddts_net = torch.vstack([r['mean_plddt'] for r in results_net])
+    plddts_rand = torch.vstack([r['mean_plddt'] for r in results_rand])
+    plddts_fullrand = torch.vstack([r['mean_plddt'] for r in results_fullrand])
 
 
 
-print(f'APT mean pLDDT: {plddts.mean()}')
-print(f'SGPO means pLDDT: {plddts_net.mean()}')
-print(f'random score : {plddts_rand.mean()}')
-print(f'random tokens : {plddts_fullrand.mean()}')
+    print(f'APT mean pLDDT: {plddts.mean()}')
+    print(f'SGPO means pLDDT: {plddts_net.mean()}')
+    print(f'random score : {plddts_rand.mean()}')
+    print(f'random tokens : {plddts_fullrand.mean()}')
+
+else:
+    print('No verifier')
 
 
 print('=========== CHECKING SGPO BASE FUNCTIONS ============')

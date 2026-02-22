@@ -13,6 +13,8 @@ import logging
 import yaml
 import time
 import csv
+import os
+
 
 from .inf_methods.dps import RewardGradient
 from .uncertainty import UncertaintyEstimator, FlowFeatureExtractor, uncertainty_estimators
@@ -25,6 +27,12 @@ def main(args):
     if args.seed is not None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
+
+    if os.environ.get("WANDB_SWEEP_ID"):
+        import wandb
+        wandb.init()
+        args.dir = args.dir / wandb.run.id
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

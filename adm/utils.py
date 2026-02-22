@@ -97,7 +97,7 @@ def serialize_args(args: argparse.Namespace) -> dict:
 
 
 def setup_logger(folder: Path | None = None, verbose: bool = False) -> logging.Logger:
-    logger = logging.getLogger("active_pretraining")
+    logger = logging.getLogger("adm")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.propagate = False
 
