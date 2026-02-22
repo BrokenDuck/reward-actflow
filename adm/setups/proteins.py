@@ -196,7 +196,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         config = OmegaConf.load(cfg_path)
 
         self._base_model = ProteinModel(config, device=device)
-        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device)
+        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device) if not args['no_verifier'] else None
 
         oracle_path = Path(args['oracle_path']) if 'oracle_path' in args else files(sgpo) / Path('oracle/checkpoints/CreiLOV')
         self.oracle_ensemble = self._load_oracle_ensemble(oracle_path)
@@ -241,6 +241,9 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
 
 
     def validity(self, samples: FlowTensor, kwargs: dict[str, Any]) -> torch.Tensor:
+        if self.esmfold is None:
+            return torch.ones((len(samples),))
+
         strings = self.base_model.embed_to_sequence(samples)
         
         with torch.no_grad():
@@ -404,7 +407,7 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
             embeddings.append(data)
             names.append(sf.file.stem)
 
-        stacked = FlowTensor(torch.stack(embeddings))
+        stacked = FlowTensor(torch.vstack(embeddings))
         sequences = self.base_model.embed_to_sequence(stacked)
 
         # Run oracle ensemble

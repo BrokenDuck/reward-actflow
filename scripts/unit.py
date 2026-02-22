@@ -5,55 +5,17 @@ import esm
 from sgpo.models.continuous import ContinuousModel
 import torch.nn.functional as F
 from tqdm import tqdm
+import os
+from pathlib import Path
 
 from active_pretraining.setups.proteins import ProteinModel, ProteinProblemSetup
 from active_pretraining.trainer import ActivePretrainingConfig, ActivePretraining
 from active_pretraining.run import build_parser, setup_logger
+from active_pretraining.problem_setup import SampleFile
 from flowgym import FlowTensor
 
 from matplotlib import pyplot as plt
 
-def shim():
-    # compatibility shim - put this before any imports that might call deepspeed.utils.is_initialized
-    import importlib
-    try:
-        import deepspeed
-    except Exception:
-        # deepspeed not installed yet; nothing to do
-        deepspeed = None
-
-    if deepspeed is not None:
-        # if utils.is_initialized already exists, do nothing
-        try:
-            if not (hasattr(deepspeed, "utils") and hasattr(deepspeed.utils, "is_initialized")):
-                # prefer comm.is_initialized if available
-                comm = None
-                try:
-                    # new DeepSpeed exposes the helper under deepspeed.comm (or deepspeed.comm.comm)
-                    from deepspeed import comm as _ds_comm  # most common
-                    comm = _ds_comm
-                except Exception:
-                    # fallback: try the nested comm module path sometimes used
-                    try:
-                        from deepspeed.comm import comm as _ds_comm2
-                        comm = _ds_comm2
-                    except Exception:
-                        comm = None
-
-                import types
-                if not hasattr(deepspeed, "utils"):
-                    deepspeed.utils = types.SimpleNamespace()
-
-                if comm is not None and hasattr(comm, "is_initialized"):
-                    deepspeed.utils.is_initialized = comm.is_initialized
-                else:
-                    # last resort: a safe function that returns False (won't crash callers that only expect a bool)
-                    deepspeed.utils.is_initialized = lambda: False
-        except Exception:
-            # defensive: if anything goes wrong creating the shim, don't crash here
-            pass
-
-shim()
 
 args = build_parser().parse_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -93,6 +55,7 @@ plt.legend()
 
 plt.savefig('schedulers.png')
 
+
 print('============= SAMPLING FROM ENVIRONMENT =============')
 N = 32
 init = net.get_start(N)
@@ -101,6 +64,25 @@ t = torch.ones((init.shape[0], )).to(net.device)* 0.5
 
 
 samples = env.sample(N, x0=FlowTensor(init), threshold=50, debug=False, valid_pbar=True)
+
+print('=========== CHECKING METRICS =================')
+
+temp_dir = Path('/cluster/scratch/kprotopapas/temp')
+os.makedirs(temp_dir, exist_ok=True)
+
+sample_files = []
+for i in range(N):
+    sample_path = temp_dir / f'{i:04d}'
+    setup.save_sample(samples.sample[i], {}, sample_path)
+    sample_files.append(SampleFile(is_valid=bool(samples.valids[i].item()), file=temp_dir / f'{i:04d}.pt'))
+
+sample_metrics = setup.compute_sample_metrics(sample_files)
+print('Ensemble: ', setup.oracle_ensemble)
+print()
+print(sample_metrics)
+
+print('=========== CHECKING VALIDITY =================')
+
 samples_rand = env.sample(N, x0=FlowTensor(init), threshold=50, debug=True, valid_pbar=True)
 
 strings = setup.base_model.embed_to_sequence(samples.sample)
