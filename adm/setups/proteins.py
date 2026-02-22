@@ -295,8 +295,8 @@ class ProteinProblemSetup(ProblemSetup[FlowTensor]):
         filename : Path
             The file path where to save the sample, without extension.
         """
-        torch.save(sample.data, f'{filename}.pt')
-    
+        torch.save(sample.data.clone(), f'{filename}.pt')
+
 
     def eval_sampling_kwargs(self, n: int) -> dict[str, Any]:
         """Provide keyword arguments for sampling during evaluation.
