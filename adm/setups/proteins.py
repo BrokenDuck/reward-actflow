@@ -284,7 +284,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         return fig
     
 
-    def save_sample(self, sample: DDTensor, kwargs: dict[str, Any], filename: Path):
+    def save_sample(self, sample: DDTensor, kwargs: dict[str, Any], filename: Path) -> Path | None:
         """Save a *single* sample to the disk.
         
         Parameters
@@ -297,6 +297,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
             The file path where to save the sample, without extension.
         """
         torch.save(sample.data.clone(), f'{filename}.pt')
+        return Path(f'{filename}.pt')
 
 
     def eval_sampling_kwargs(self, n: int) -> dict[str, Any]:
