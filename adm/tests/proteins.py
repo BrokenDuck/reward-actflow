@@ -2,7 +2,6 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from omegaconf import OmegaConf
 import pytest
 import torch
 
@@ -11,12 +10,16 @@ import diffusiongym
 
 from adm.setups.proteins import (
     CREILOV_WILD_TYPE,
+    CREILOV_ALPHABET,
     HAMMING_PENALTY_CUTOFF,
     HAMMING_PENALTY_RATE,
     CosineSchedule,
     ProteinFitnessReward,
+    ProteinProblemSetup,
     ProteinModel
 )
+
+from adm.setups.problem_setup import SampleFile
 
 CREILOV_PRETRAINED_REWARD = 3.78
 
@@ -118,12 +121,12 @@ class TestHammingPenalty:
 
 class TestLoadOracleEnsemble:
     def test_nonexistent_path(self):
-        result = ProteinFitnessReward._load_oracle_ensemble(Path("/nonexistent/path"))
+        result = ProteinFitnessReward._load_oracle_ensemble(CREILOV_WILD_TYPE, CREILOV_ALPHABET, Path("/nonexistent/path"))
         assert result == []
 
     def test_empty_directory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = ProteinFitnessReward._load_oracle_ensemble(Path(tmpdir))
+            result = ProteinFitnessReward._load_oracle_ensemble(CREILOV_WILD_TYPE, CREILOV_ALPHABET, Path(tmpdir))
             assert result == []
 
 
@@ -188,7 +191,7 @@ class TestCosineSchedule:
         assert (diffs > 0).all()
 
 
-class TestEmbeddingInvertibility:
+class TestProteinProblemSetup:
     def setup_method(self):
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -205,6 +208,9 @@ class TestEmbeddingInvertibility:
             base_model_kwargs={'cfg_path': temp.name},
             reward_kwargs={'cfg_path': temp.name}
         )
+
+        setup_args = {'cfg_path': temp.name, 'no_verifier': True}
+        self.setup = ProteinProblemSetup(setup_args, device=device)
 
         self.samples = self.env.sample(128)
         
@@ -223,7 +229,45 @@ class TestEmbeddingInvertibility:
 
     def test_creilov_close_pretrained(self):
         samples = self.samples
-
         avg_reward = samples.rewards.mean()
-
         assert avg_reward - CREILOV_PRETRAINED_REWARD < CREILOV_PRETRAINED_REWARD * 0.01
+    
+
+    def test_diversity_of_repeated_is_zero(self):
+        n = 100
+        sgpo_model = self.setup.base_model.sgpo_model
+        alphabet = sgpo_model.tokenizer.alphabet
+        probs = torch.zeros((n, sgpo_model.seq_len, len(alphabet)))
+
+        wt_tokens = sgpo_model.tokenizer.tokenize(CREILOV_WILD_TYPE)
+        probs = torch.zeros((n, sgpo_model.seq_len, len(alphabet)))
+        for pos, tok in enumerate(wt_tokens):
+            probs[:, pos, tok] = 1.0
+
+        tokens = probs.argmax(dim=-1)
+        assert tokens.shape == (n, sgpo_model.seq_len)
+        sequences = [sgpo_model.tokenizer.untokenize(s) for s in tokens]
+        for seq in sequences:
+            assert len(seq) == sgpo_model.seq_len
+            assert len(seq) == len(CREILOV_WILD_TYPE)
+
+
+    def test_entropy_of_all_diff_is_maximized(self):
+        n = len(CREILOV_ALPHABET)
+        sgpo_model = self.setup.base_model.sgpo_model
+        alphabet = sgpo_model.tokenizer.alphabet
+
+        actual_tokens = sgpo_model.tokenizer.tokenize(CREILOV_ALPHABET)
+        probs = torch.zeros((n, sgpo_model.seq_len, len(alphabet)))
+        for pos, tok in enumerate(actual_tokens):
+            probs[pos, :, tok] = 1.0
+
+        probs = DDTensor(probs)
+
+        tempdir = tempfile.gettempdir()
+
+        sample_path = self.setup.save_sample(probs, {}, Path(tempdir) / 'temp')
+        sample_file = SampleFile(is_valid=True, file=Path(sample_path))
+        metrics = self.setup.compute_metrics([sample_file])
+
+        assert np.allclose(metrics['shannon_entropy'], np.log(n))

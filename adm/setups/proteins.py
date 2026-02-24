@@ -1,11 +1,11 @@
-from typing import Any, Callable, Sequence, List
+from typing import Any, Sequence, List
 from argparse import ArgumentParser
 from importlib_resources import files
 from pathlib import Path
 from hydra.utils import instantiate
 from torch import Tensor, device
 import torch
-from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf import OmegaConf
 import esm
 import numpy as np
 from vendi_score import vendi
@@ -27,6 +27,8 @@ import sgpo
 from sgpo.oracle.train_oracle import OracleModel
 
 CREILOV_WILD_TYPE = "MAGLRHTFVVADATLPDCPLVYASEGFYAMTGYGPDEVLGHNARFLQGEGTDPKEVQKIRDAIKKGEACSVRLLNYRKDGTPFWNLLTVTPIKTPDGRVSKFVGVQVDVTSKTEGKALA"
+CREILOV_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
+
 ORACLE_HIDDEN_DIM = 400
 ORACLE_DROPOUT = 0.1
 ORACLE_BATCH_SIZE = 128
@@ -198,6 +200,7 @@ class ProteinModel(BaseModel[DDTensor]):
         return out
 
 
+# TODO make general e.g. TrpB compatible as well
 @reward_registry.register("proteins/fitness")
 class ProteinFitnessReward(Reward[DDTensor]):
     """Fitness reward for protein sequences using an oracle ensemble.
@@ -214,10 +217,13 @@ class ProteinFitnessReward(Reward[DDTensor]):
 
             if tokenizer_cfg is not None:
                 self.tokenizer = instantiate(tokenizer_cfg, sequences=True)
+            else:
+                self.tokenizer = ESMTokenizer(esm_model_name='esm2_t12_35M_UR50D')
         else:
             self.tokenizer = ESMTokenizer(esm_model_name='esm2_t12_35M_UR50D')
         resolved_path = Path(oracle_path) if oracle_path is not None else Path(str(files(sgpo) / Path('oracle/checkpoints/CreiLOV')))
-        self.oracle_ensemble = self._load_oracle_ensemble(resolved_path)
+
+        self.oracle_ensemble = self._load_oracle_ensemble(CREILOV_WILD_TYPE, CREILOV_ALPHABET, resolved_path)
 
     def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = sample.data.argmax(dim=-1)
@@ -227,15 +233,15 @@ class ProteinFitnessReward(Reward[DDTensor]):
         return reward, torch.ones_like(reward)
 
     @staticmethod
-    def _load_oracle_ensemble(oracle_path: Path) -> Sequence[OracleModel]:
+    def _load_oracle_ensemble(wild_type: str, alphabet: str, oracle_path: Path) -> Sequence[OracleModel]:
         oracle_path = Path(oracle_path)
         if not oracle_path.exists():
             return []
         model_files = sorted(oracle_path.glob('*.pth'))
         if not model_files:
             return []
-        seq_len = len(CREILOV_WILD_TYPE)
-        alphabet_size = 20
+        seq_len = len(wild_type)
+        alphabet_size = len(alphabet)
         input_dim = seq_len * alphabet_size
         ensemble = []
         for f in model_files:
@@ -246,8 +252,7 @@ class ProteinFitnessReward(Reward[DDTensor]):
         return ensemble
 
     @staticmethod
-    def _onehot_encode(sequence: str) -> np.ndarray:
-        alphabet = "ACDEFGHIKLMNPQRSTVWY"
+    def _onehot_encode(sequence: str, alphabet: str = CREILOV_ALPHABET) -> np.ndarray:
         encoding = np.zeros((len(sequence), len(alphabet)))
         for i, aa in enumerate(sequence):
             if aa in alphabet:
@@ -302,7 +307,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         self.lengthscale = args['lengthscale_vendi'] if 'lengthscale_vendi' in args else None
 
         self._base_model = ProteinModel(cfg_path, device=device)
-        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device) if not args['no_verifier'] or 'no_verifier' not in args else None
+        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device) if 'no_verifier' not in args or not args['no_verifier'] else None
 
         oracle_path = args.get('oracle_path')
         self.reward = ProteinFitnessReward(cfg_path=cfg_path, oracle_path=oracle_path)
@@ -339,7 +344,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         plddt = results['mean_plddt']
 
         threshold = kwargs['threshold'] if 'threshold' in kwargs else self.threshold
-        return torch.where(plddt > threshold, 1, 0).byte()
+        return torch.where(plddt > threshold, 1, 0).bool()
 
 
     @property
