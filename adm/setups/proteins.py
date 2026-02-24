@@ -1,7 +1,6 @@
-from typing import Any, Sequence, List
+from typing import Any, Callable, Sequence, List
 from argparse import ArgumentParser
 from importlib_resources import files
-from importlib_resources.abc import Traversable
 from pathlib import Path
 from hydra.utils import instantiate
 from torch import Tensor, device
@@ -16,7 +15,8 @@ from matplotlib.figure import Figure
 from matplotlib import pyplot as plt
 
 from sgpo.models.continuous import ContinuousModel
-from diffusiongym import DDTensor
+from sgpo.models.pretraining.collaters import ESMTokenizer
+from diffusiongym import DDTensor, Reward, base_model_registry, reward_registry
 from diffusiongym.base_models import BaseModel
 from diffusiongym.schedulers import Scheduler, NoiseSchedule
 from diffusiongym.environments import Environment
@@ -32,6 +32,8 @@ ORACLE_DROPOUT = 0.1
 ORACLE_BATCH_SIZE = 128
 HAMMING_PENALTY_CUTOFF = 70
 HAMMING_PENALTY_RATE = 0.99
+
+DEFAULT_PLDDT_THRESHOLD = 65.
 
 
 def shim():
@@ -112,12 +114,15 @@ class CosineSchedule(Scheduler[DDTensor]):
         return -DDTensor(append_dims(alpha_bar_dot, x.data.ndim)) / (2. * self.beta(x, t))
 
 
+@base_model_registry.register("proteins/continuous_ESM")
 class ProteinModel(BaseModel[DDTensor]):
 
     output_type = "endpoint"
 
-    def __init__(self, config: DictConfig | ListConfig, device: device | None):
+    def __init__(self, cfg_path: str, device: device | None):
         super().__init__(device)
+        config = OmegaConf.load(cfg_path)
+
         model = config.model.model
         model_name = config.pretrained_ckpt
         seq_len = config.data.seq_len
@@ -138,8 +143,10 @@ class ProteinModel(BaseModel[DDTensor]):
     
 
     def postprocess(self, x: DDTensor) -> DDTensor:
-        # TODO maybe map to and from ESM embeddings???
-        return x
+        epsilon = 1e-4
+        t = (1. - epsilon) * torch.ones((x.data.shape[0],)).to(self.device)
+        out = self.network_forward(x.data, t)
+        return DDTensor(out['probs'])
     
 
     def sample_p0(self, n: int, **kwargs: Any) -> tuple[DDTensor, dict[str, Any]]:
@@ -152,14 +159,20 @@ class ProteinModel(BaseModel[DDTensor]):
         return DDTensor(self.network_forward(x.data, t)['xstart'])
 
 
-    def embed_to_sequence(self, embeds: DDTensor) -> Sequence[str]:
-        epsilon = 1e-4 # TODO change magic number
-        t = (1. - epsilon) * torch.ones((embeds.data.shape[0],)).to(self.device)
-        out = self.network_forward(embeds.data, t)
+    def probs_to_sequence(self, probs: DDTensor) -> Sequence[str]:
+        tokens = probs.data.argmax(dim=-1)
+        return [self.sgpo_model.tokenizer.untokenize(s) for s in tokens]
 
-        tokens = out['probs'].argmax(dim=-1)
-        strings = [self.sgpo_model.tokenizer.untokenize(s) for s in tokens]
-        return strings
+
+    def probs_to_embedding(self, probs: DDTensor) -> DDTensor:
+        network = self.sgpo_model.model.network
+        with torch.no_grad():
+            emb_table = network.esm_model.embed_tokens.weight.detach().cpu().float()
+            emb_table = emb_table / (emb_table.norm(dim=-1, keepdim=True) + 1e-8)
+            emb_table = emb_table * (network.in_channels ** 0.5)
+
+        esm_embeds = probs.data @ emb_table
+        return DDTensor(esm_embeds)
 
 
     def network_forward(self, x: torch.Tensor, t: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -185,32 +198,36 @@ class ProteinModel(BaseModel[DDTensor]):
         return out
 
 
-class ProteinProblemSetup(ProblemSetup[DDTensor]):
-    def __init__(self, args: dict[str, Any], device: device | None):
-        super().__init__(args)
-        cfg_path: str = args['cfg_path']
-        self.threshold = args['threshold']
-        self.lengthscale = args['lengthscale_vendi'] if 'lengthscale_vendi' in args else None
-        config = OmegaConf.load(cfg_path)
+@reward_registry.register("proteins/fitness")
+class ProteinFitnessReward(Reward[DDTensor]):
+    """Fitness reward for protein sequences using an oracle ensemble.
 
-        self._base_model = ProteinModel(config, device=device)
-        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device) if not args['no_verifier'] else None
+    Expects ``sample`` to be token-probability tensors [batch, seq_len, vocab_size]
+    as produced by ``ProteinModel.postprocess``.
+    """
 
-        oracle_path = Path(args['oracle_path']) if 'oracle_path' in args else files(sgpo) / Path('oracle/checkpoints/CreiLOV')
-        self.oracle_ensemble = self._load_oracle_ensemble(oracle_path)
+    def __init__(self, cfg_path: str | None = None, oracle_path: str | None = None) -> None:
+        
+        if cfg_path is not None:
+            config = OmegaConf.load(cfg_path)
+            tokenizer_cfg = OmegaConf.select(config, 'model.model.tokenizer')
 
+            if tokenizer_cfg is not None:
+                self.tokenizer = instantiate(tokenizer_cfg, sequences=True)
+        else:
+            self.tokenizer = ESMTokenizer(esm_model_name='esm2_t12_35M_UR50D')
+        resolved_path = Path(oracle_path) if oracle_path is not None else Path(str(files(sgpo) / Path('oracle/checkpoints/CreiLOV')))
+        self.oracle_ensemble = self._load_oracle_ensemble(resolved_path)
 
-    @classmethod
-    def add_args(cls, parser: ArgumentParser): # TODO interface with hydra somehow to get hierarchical configs... for now use static one from existing run
-        default_path = files(sgpo) / Path('configs/sample_config.yaml')
-        parser.add_argument('--cfg_path', type=str, default=default_path, help='Path for diffusion model config file')
-        parser.add_argument('--threshold', type=float, default=65., help='Validity threshold for pLDDT')
-        parser.add_argument('--lengthscale_vendi', type=float, default=2.)
-        default_oracle_path = files(sgpo) / Path('oracle/checkpoints/CreiLOV')
-        parser.add_argument('--oracle_path', type=str, default=default_oracle_path, help='Path to oracle ensemble checkpoint directory')
+    def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens = sample.data.argmax(dim=-1)
+        sequences = [self.tokenizer.untokenize(s) for s in tokens]
+        fitness_scores = self._oracle_predict(sequences)
+        reward = torch.tensor(fitness_scores, dtype=torch.float32)
+        return reward, torch.ones_like(reward)
 
-
-    def _load_oracle_ensemble(self, oracle_path: Path | Traversable) -> Sequence[OracleModel]:
+    @staticmethod
+    def _load_oracle_ensemble(oracle_path: Path) -> Sequence[OracleModel]:
         oracle_path = Path(oracle_path)
         if not oracle_path.exists():
             return []
@@ -228,6 +245,78 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
             ensemble.append(model)
         return ensemble
 
+    @staticmethod
+    def _onehot_encode(sequence: str) -> np.ndarray:
+        alphabet = "ACDEFGHIKLMNPQRSTVWY"
+        encoding = np.zeros((len(sequence), len(alphabet)))
+        for i, aa in enumerate(sequence):
+            if aa in alphabet:
+                encoding[i, alphabet.index(aa)] = 1
+        return encoding.flatten()
+
+    @staticmethod
+    def _hamming_distance(s1: str, s2: str) -> int:
+        return sum(c1 != c2 for c1, c2 in zip(s1, s2))
+
+    # TODO this punishes OOD generations... maybe it will be a problem
+    @staticmethod
+    def _hamming_penalty(distance: int, cutoff: int = HAMMING_PENALTY_CUTOFF, rate: float = HAMMING_PENALTY_RATE) -> float:
+        if distance <= cutoff:
+            return 1.0
+        return rate ** (distance - cutoff)
+
+    def _oracle_predict(self, sequences: Sequence[str]) -> np.ndarray:
+        if not self.oracle_ensemble:
+            return np.full(len(sequences), float('nan'))
+
+        encodings = np.array([self._onehot_encode(seq) for seq in sequences])
+        X = torch.tensor(encodings, dtype=torch.float32)
+
+        all_predictions = np.zeros((len(self.oracle_ensemble), len(sequences)))
+        with torch.no_grad():
+            for i, model in enumerate(self.oracle_ensemble):
+                preds = model(X).cpu().numpy().reshape(-1)
+                penalties = np.array([
+                    self._hamming_penalty(self._hamming_distance(CREILOV_WILD_TYPE, seq))
+                    for seq in sequences
+                ])
+                preds = preds * penalties
+                preds = np.maximum(preds, 0.0)
+                all_predictions[i] = preds
+
+        return np.mean(all_predictions, axis=0)
+
+
+@reward_registry.register("proteins/creilov")
+class CreiLOVFitnessReward(ProteinFitnessReward):
+    def __init__(self, cfg_path: str | None = None):
+        creilov_path = str(files(sgpo) / Path('oracle/checkpoints/CreiLOV'))
+        super().__init__(cfg_path, creilov_path)
+
+
+class ProteinProblemSetup(ProblemSetup[DDTensor]):
+    def __init__(self, args: dict[str, Any], device: device | None):
+        super().__init__(args)
+        cfg_path: str = args['cfg_path']
+        self.threshold = args['threshold'] if 'threshold' in args else DEFAULT_PLDDT_THRESHOLD
+        self.lengthscale = args['lengthscale_vendi'] if 'lengthscale_vendi' in args else None
+
+        self._base_model = ProteinModel(cfg_path, device=device)
+        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device) if not args['no_verifier'] or 'no_verifier' not in args else None
+
+        oracle_path = args.get('oracle_path')
+        self.reward = ProteinFitnessReward(cfg_path=cfg_path, oracle_path=oracle_path)
+
+
+    @classmethod
+    def add_args(cls, parser: ArgumentParser): # TODO interface with hydra somehow to get hierarchical configs... for now use static one from existing run
+        default_path = files(sgpo) / Path('configs/sample_config.yaml')
+        parser.add_argument('--cfg_path', type=str, default=default_path, help='Path for diffusion model config file')
+        parser.add_argument('--threshold', type=float, default=DEFAULT_PLDDT_THRESHOLD, help='Validity threshold for pLDDT')
+        parser.add_argument('--lengthscale_vendi', type=float, default=2.)
+        default_oracle_path = files(sgpo) / Path('oracle/checkpoints/CreiLOV')
+        parser.add_argument('--oracle_path', type=str, default=default_oracle_path, help='Path to oracle ensemble checkpoint directory')
+
     @property
     def base_model(self) -> ProteinModel:
         return self._base_model
@@ -242,7 +331,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         if self.esmfold is None:
             return torch.ones((len(samples),))
 
-        strings = self.base_model.embed_to_sequence(samples)
+        strings = self.base_model.probs_to_sequence(samples)
         
         with torch.no_grad():
             results = self.esmfold.infer(list(strings))        
@@ -250,7 +339,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         plddt = results['mean_plddt']
 
         threshold = kwargs['threshold'] if 'threshold' in kwargs else self.threshold
-        return torch.where(plddt > threshold, 1., 0.)
+        return torch.where(plddt > threshold, 1, 0).byte()
 
 
     @property
@@ -336,60 +425,39 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
             data = torch.load(sf.file, map_location='cpu')
             samples.append(data)
             names.append(sf.file.stem)
+        
+        probs = torch.vstack(samples).float()
+        esm_embeds = self.base_model.probs_to_embedding(DDTensor(probs)).data
 
-        embeddings = torch.vstack(samples)
-
-        X = embeddings.mean(dim=1)
+        X = esm_embeds.mean(dim=1)
         kernel = gpytorch.kernels.RBFKernel()
         if self.lengthscale is not None:
             kernel.lengthscale = self.lengthscale
         K = kernel(X, X).cpu().numpy()
         vendi_score_val = vendi.score_K(K)
 
-        return {"vendi": float(vendi_score_val)}
+        tokens = probs.argmax(dim=-1)
+        sequences = [self.base_model.sgpo_model.tokenizer.untokenize(s) for s in tokens]
+        mutated_positions = [
+            i for i in range(len(CREILOV_WILD_TYPE))
+            if any(seq[i] != CREILOV_WILD_TYPE[i] for seq in sequences)
+        ]
+        if mutated_positions:
+            n = len(sequences)
+            position_entropies = []
+            for pos in mutated_positions:
+                counts = {}
+                for seq in sequences:
+                    aa = seq[pos]
+                    counts[aa] = counts.get(aa, 0) + 1
+                entropy = -sum((c / n) * np.log(c / n) for c in counts.values())
+                position_entropies.append(entropy)
+            shannon = float(np.mean(position_entropies))
+        else:
+            shannon = 0.0
+
+        return {"vendi": float(vendi_score_val), "shannon_entropy": shannon}
     
-
-    @staticmethod
-    def _onehot_encode(sequence: str) -> np.ndarray:
-        alphabet = "ACDEFGHIKLMNPQRSTVWY"
-        encoding = np.zeros((len(sequence), len(alphabet)))
-        for i, aa in enumerate(sequence):
-            if aa in alphabet:
-                encoding[i, alphabet.index(aa)] = 1
-        return encoding.flatten()
-
-    @staticmethod
-    def _hamming_distance(s1: str, s2: str) -> int:
-        return sum(c1 != c2 for c1, c2 in zip(s1, s2))
-
-    # TODO this punished OOD generations... maybe it will be a problem
-    @staticmethod
-    def _hamming_penalty(distance: int, cutoff: int = HAMMING_PENALTY_CUTOFF, rate: float = HAMMING_PENALTY_RATE) -> float:
-        if distance <= cutoff:
-            return 1.0
-        return rate ** (distance - cutoff)
-
-    def _oracle_predict(self, sequences: Sequence[str]) -> np.ndarray:
-        """Run the oracle ensemble on a list of sequences, returning mean fitness predictions."""
-        if not self.oracle_ensemble:
-            return np.full(len(sequences), float('nan'))
-
-        encodings = np.array([self._onehot_encode(seq) for seq in sequences])
-        X = torch.tensor(encodings, dtype=torch.float32)
-
-        all_predictions = np.zeros((len(self.oracle_ensemble), len(sequences)))
-        with torch.no_grad():
-            for i, model in enumerate(self.oracle_ensemble):
-                preds = model(X).cpu().numpy().reshape(-1)
-                penalties = np.array([
-                    self._hamming_penalty(self._hamming_distance(CREILOV_WILD_TYPE, seq))
-                    for seq in sequences
-                ])
-                preds = preds * penalties
-                preds = np.maximum(preds, 0.0)
-                all_predictions[i] = preds
-
-        return np.mean(all_predictions, axis=0)
 
     def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
         """Compute relevant metrics on individual samples.
@@ -404,27 +472,25 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         dict[str, dict[str, float]]
             A dictionary mapping sample names to their computed metrics.
         """
-        if not self.oracle_ensemble:
+        if not self.reward.oracle_ensemble:
             return dict()
 
-        # Load embeddings and convert to sequences
         names = []
-        embeddings = []
+        probs_list = []
         for sf in sample_files:
             data = torch.load(sf.file, map_location='cpu')
-            embeddings.append(data)
+            probs_list.append(data)
             names.append(sf.file.stem)
 
-        stacked = DDTensor(torch.vstack(embeddings))
-        sequences = self.base_model.embed_to_sequence(stacked)
+        stacked = DDTensor(torch.vstack(probs_list))
+        sequences = self.base_model.probs_to_sequence(stacked)
 
-        # Run oracle ensemble
-        fitness_scores = self._oracle_predict(sequences)
+        fitness_scores, _ = self.reward(stacked, stacked)
 
         results: dict[str, dict[str, float]] = {}
         for name, fitness, seq, sf in zip(names, fitness_scores, sequences, sample_files):
             metrics: dict[str, float] = {'fitness': float(fitness)}
-            metrics['hamming_distance'] = float(self._hamming_distance(CREILOV_WILD_TYPE, seq))
+            metrics['hamming_distance'] = float(ProteinFitnessReward._hamming_distance(CREILOV_WILD_TYPE, seq))
             metrics['is_valid'] = float(sf.is_valid)
             results[name] = metrics
 

@@ -4,6 +4,7 @@ from sgpo.models.continuous import ContinuousModel
 from tqdm import tqdm
 import os
 from pathlib import Path
+import pandas as pd
 
 from adm.setups.proteins import ProteinProblemSetup
 from adm.task_agnostic import TaskAgnosticConfig, TaskAgnostic, build_parser
@@ -74,16 +75,16 @@ for i in range(N):
     sample_files.append(SampleFile(is_valid=bool(samples.valids[i].item()), file=temp_dir / f'{i:04d}.pt'))
 
 sample_metrics = setup.compute_sample_metrics(sample_files)
-print('Ensemble: ', setup.oracle_ensemble)
-print()
-print(sample_metrics)
+metrics_df = pd.DataFrame.from_records(sample_metrics).T
+print(metrics_df.head(3))
+print(metrics_df['fitness'].mean())
 
 print('=========== CHECKING VALIDITY =================')
 
 samples_rand = env.sample(N, x0=DDTensor(init), threshold=50, debug=True, valid_pbar=True)
 
-strings = setup.base_model.embed_to_sequence(samples.sample)
-strings_rand = setup.base_model.embed_to_sequence(samples_rand.sample)
+strings = setup.base_model.probs_to_sequence(samples.sample)
+strings_rand = setup.base_model.probs_to_sequence(samples_rand.sample)
 
 print(f'Validity: {samples.valids.mean()}')
 
@@ -94,7 +95,6 @@ infill_seed = torch.randint(0, net.model.network.vocab_size, (seq_len,)).to(
 # 1 if != pad, else 0
 infill_mask = (torch.ones(seq_len) != net.tokenizer.pad_id-100).to(
     torch.device('cuda'))  # switch 30 for net.tokenizer.pad_id
-
 
 # corrupt_mask: 1 for real tokens, 0 for pad (Equivalent to "fully corrupt all real tokens")
 corrupt_mask = infill_mask.clone().to(torch.device('cuda')) 
@@ -126,7 +126,6 @@ if esmfold is not None:
     plddts_net = torch.vstack([r['mean_plddt'] for r in results_net])
     plddts_rand = torch.vstack([r['mean_plddt'] for r in results_rand])
     plddts_fullrand = torch.vstack([r['mean_plddt'] for r in results_fullrand])
-
 
 
     print(f'APT mean pLDDT: {plddts.mean()}')
