@@ -270,4 +270,4 @@ class TestProteinProblemSetup:
         sample_file = SampleFile(is_valid=True, file=Path(sample_path))
         metrics = self.setup.compute_metrics([sample_file])
 
-        assert np.allclose(metrics['shannon_entropy'], np.log(n))
+        assert metrics['shannon_entropy'] == pytest.approx(np.log(n))
