@@ -212,6 +212,9 @@ class TestProteinProblemSetup:
         setup_args = {'cfg_path': temp.name, 'no_verifier': True}
         self.setup = ProteinProblemSetup(setup_args, device=device)
 
+        setup_args_verifier = {'cfg_path': temp.name, 'no_verifier': False}
+        self.setup_verifier = ProteinProblemSetup(setup_args_verifier, device=device)
+
         self.samples = self.env.sample(128)
         
 
@@ -271,3 +274,23 @@ class TestProteinProblemSetup:
         metrics = self.setup.compute_metrics([sample_file])
 
         assert metrics['shannon_entropy'] == pytest.approx(np.log(n))
+
+
+    def test_wild_type_is_valid_but_random_is_not(self):
+        sgpo_model = self.setup.base_model.sgpo_model
+        wild_tokens = sgpo_model.tokenizer.tokenize(CREILOV_WILD_TYPE)
+
+        n = 32
+
+        wild_type_probs = torch.zeros((n, sgpo_model.seq_len, len(sgpo_model.tokenizer.alphabet)))
+        wild_type_probs[:, torch.arange(sgpo_model.seq_len), wild_tokens] = 1.
+        wild_type_probs = DDTensor(wild_type_probs)
+
+        random_probs = self.env.sample(n).sample
+
+        all_probs = DDTensor.collate([wild_type_probs, random_probs])
+        assert all_probs.data.shape == (2 * n, sgpo_model.seq_len, len(sgpo_model.tokenizer.alphabet))    
+
+        valids = self.setup_verifier.validity(all_probs, {})
+        assert torch.all(valids[:n] == 1)
+        assert torch.any(valids[n:] == 0)

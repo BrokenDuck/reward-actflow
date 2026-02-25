@@ -309,9 +309,6 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         self._base_model = ProteinModel(cfg_path, device=device)
         self.esmfold = esm.pretrained.esmfold_v1().eval().to(device) if 'no_verifier' not in args or not args['no_verifier'] else None
 
-        oracle_path = args.get('oracle_path')
-        self.reward = ProteinFitnessReward(cfg_path=cfg_path, oracle_path=oracle_path)
-
 
     @classmethod
     def add_args(cls, parser: ArgumentParser): # TODO interface with hydra somehow to get hierarchical configs... for now use static one from existing run
@@ -319,8 +316,6 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         parser.add_argument('--cfg_path', type=str, default=default_path, help='Path for diffusion model config file')
         parser.add_argument('--threshold', type=float, default=DEFAULT_PLDDT_THRESHOLD, help='Validity threshold for pLDDT')
         parser.add_argument('--lengthscale_vendi', type=float, default=2.)
-        default_oracle_path = files(sgpo) / Path('oracle/checkpoints/CreiLOV')
-        parser.add_argument('--oracle_path', type=str, default=default_oracle_path, help='Path to oracle ensemble checkpoint directory')
 
     @property
     def base_model(self) -> ProteinModel:
@@ -334,14 +329,22 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
 
     def validity(self, samples: DDTensor, kwargs: dict[str, Any]) -> torch.Tensor:
         if self.esmfold is None:
-            return torch.ones((len(samples),))
+            return torch.ones((len(samples),)).bool()
 
         strings = self.base_model.probs_to_sequence(samples)
+
+        bs = kwargs['batch_size'] if 'batch_size' in kwargs else 32
         
+        str_list = list(strings)
+        plddts = []
         with torch.no_grad():
-            results = self.esmfold.infer(list(strings))        
-        
-        plddt = results['mean_plddt']
+            for i in range(0, len(str_list), bs):
+                sublist = str_list[i: min(len(str_list), i + bs)]
+                results = self.esmfold.infer(sublist)        
+                plddt = results['mean_plddt']
+                plddts.append(plddt.squeeze())
+
+        plddt = torch.cat(plddts)
 
         threshold = kwargs['threshold'] if 'threshold' in kwargs else self.threshold
         return torch.where(plddt > threshold, 1, 0).bool()
@@ -477,26 +480,4 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         dict[str, dict[str, float]]
             A dictionary mapping sample names to their computed metrics.
         """
-        if not self.reward.oracle_ensemble:
-            return dict()
-
-        names = []
-        probs_list = []
-        for sf in sample_files:
-            data = torch.load(sf.file, map_location='cpu')
-            probs_list.append(data)
-            names.append(sf.file.stem)
-
-        stacked = DDTensor(torch.vstack(probs_list))
-        sequences = self.base_model.probs_to_sequence(stacked)
-
-        fitness_scores, _ = self.reward(stacked, stacked)
-
-        results: dict[str, dict[str, float]] = {}
-        for name, fitness, seq, sf in zip(names, fitness_scores, sequences, sample_files):
-            metrics: dict[str, float] = {'fitness': float(fitness)}
-            metrics['hamming_distance'] = float(ProteinFitnessReward._hamming_distance(CREILOV_WILD_TYPE, seq))
-            metrics['is_valid'] = float(sf.is_valid)
-            results[name] = metrics
-
-        return results
+        return dict()
