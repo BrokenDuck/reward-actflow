@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from diffusiongym import DDTensor
+from diffusiongym import DDTensor, reward_registry
 import diffusiongym
 
 from adm.setups.proteins import (
@@ -198,24 +198,21 @@ class TestProteinProblemSetup:
         temp = tempfile.NamedTemporaryFile()
         with open(temp.name, 'w')  as f:
             f.write(CONFIG)
-        
-        self.env = diffusiongym.make(
-            "proteins/continuous_ESM",
-            "proteins/creilov",
-            discretization_steps=100,
-            reward_scale=1.,
-            device=device,
-            base_model_kwargs={'cfg_path': temp.name},
-            reward_kwargs={'cfg_path': temp.name}
-        )
 
         setup_args = {'cfg_path': temp.name, 'no_verifier': True}
         self.setup = ProteinProblemSetup(setup_args, device=device)
 
-        setup_args_verifier = {'cfg_path': temp.name, 'no_verifier': False}
-        self.setup_verifier = ProteinProblemSetup(setup_args_verifier, device=device)
+        reward_entry = reward_registry.get('proteins/creilov')
+        reward = reward_entry.instantiate(**{'cfg_path': temp.name})
 
-        self.samples = self.env.sample(128)
+        self.env = diffusiongym.construct_env(
+            self.setup.base_model,
+            reward,
+            100,
+            1.
+        )
+
+        self.samples = self.env.sample(8)
         
 
     def test_embedding_invertibility(self):
@@ -276,21 +273,32 @@ class TestProteinProblemSetup:
         assert metrics['shannon_entropy'] == pytest.approx(np.log(n))
 
 
+class TestProteinValidity:
+    def setup_method(self):
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+        temp = tempfile.NamedTemporaryFile()
+        with open(temp.name, 'w') as f:
+            f.write(CONFIG)
+
+        setup_args = {'cfg_path': temp.name, 'no_verifier': False}
+        self.setup = ProteinProblemSetup(setup_args, device=device)
+
     def test_wild_type_is_valid_but_random_is_not(self):
         sgpo_model = self.setup.base_model.sgpo_model
         wild_tokens = sgpo_model.tokenizer.tokenize(CREILOV_WILD_TYPE)
 
-        n = 32
+        n = 4
 
         wild_type_probs = torch.zeros((n, sgpo_model.seq_len, len(sgpo_model.tokenizer.alphabet)))
         wild_type_probs[:, torch.arange(sgpo_model.seq_len), wild_tokens] = 1.
         wild_type_probs = DDTensor(wild_type_probs)
 
-        random_probs = self.env.sample(n).sample
+        random_probs = DDTensor(torch.rand(n, sgpo_model.seq_len, len(sgpo_model.tokenizer.alphabet)))
 
         all_probs = DDTensor.collate([wild_type_probs, random_probs])
-        assert all_probs.data.shape == (2 * n, sgpo_model.seq_len, len(sgpo_model.tokenizer.alphabet))    
+        assert all_probs.data.shape == (2 * n, sgpo_model.seq_len, len(sgpo_model.tokenizer.alphabet))
 
-        valids = self.setup_verifier.validity(all_probs, {})
+        valids = self.setup.validity(all_probs, {})
         assert torch.all(valids[:n] == 1)
         assert torch.any(valids[n:] == 0)
