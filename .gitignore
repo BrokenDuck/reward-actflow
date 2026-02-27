@@ -237,3 +237,5 @@ output
 wandb
 configs
 .claude
+*.py
+*.txt
