@@ -4,21 +4,20 @@ from contextlib import contextmanager
 
 import numpy as np
 import torch
-from diffusiongym import construct_env, D
-from diffusiongym.utils import train_base_model, index_dict
+from diffusiongym import construct_env, D, DummyReward
+from diffusiongym.utils import train_base_model
 import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
 import logging
 import yaml
-import shutil
 import time
 import csv
 
-from .gp import GPUncertaintyReward, FlowFeatureExtractor
 from .inf_methods.dps import RewardGradient
+from .uncertainty import UncertaintyEstimator, FlowFeatureExtractor, uncertainty_estimators
 from .setups import setups as problem_setups
-from .setups.problem_setup import ProblemSetup, SampleFile
+from .setups.problem_setup import ProblemSetup
 from .utils import write_video, filter_out_invalids, Batch, serialize_args, setup_logger
 
 
@@ -32,6 +31,33 @@ def main(args):
     config = TaskAgnosticConfig.construct_from_args(args)
     problem_setup = problem_setups[args.problem_setup](vars(args), device=device)
 
+    # Construct feature extractor for uncertainty quantification
+    feat_extractor = FlowFeatureExtractor(
+        problem_setup.base_model,
+        layer=problem_setup.feature_layer,
+        timestep=config.feat_timestep,
+        postprocess=problem_setup.postprocess_features,
+    )
+
+    # Probe the feature extractor for testing and obtaining the dimensionality of the features
+    x, kwargs = problem_setup.base_model.sample_p0(1)
+    x, kwargs = problem_setup.base_model.preprocess(x, **kwargs)
+    feat = feat_extractor(x, **kwargs)
+
+    if not isinstance(feat, torch.Tensor):
+        raise TypeError(f"Feature extractor output must be a torch.Tensor, got {type(feat)}")
+
+    if feat.ndim != 2:
+        raise ValueError(f"Feature extractor output must be a 2D tensor, got {feat.ndim}D tensor")
+
+    uncertainty = uncertainty_estimators[args.uncertainty_estimator](
+        feat_extractor,
+        feat_dim=feat.shape[1],
+        mean_weight=0,
+        device=device,
+        args=vars(args),
+    )
+
     # Save arguments
     with open(config.folder / "args.yaml", "w") as f:
         yaml.safe_dump(serialize_args(args), f)
@@ -40,7 +66,7 @@ def main(args):
     logger = setup_logger(config.folder, args.verbose)
     logger.info("starting...")
 
-    apt = TaskAgnostic(problem_setup=problem_setup, config=config, logger=logger)
+    apt = TaskAgnostic(problem_setup=problem_setup, uncertainty=uncertainty, config=config, logger=logger)
     apt.explore_loop(config.num_iters, config.samples_per_iter)
 
 
@@ -55,13 +81,9 @@ class TaskAgnosticConfig:
     sample_batch_size: int = 64
     num_steps: int = 100
 
-    # Feature extraction and Gaussian Process
+    # Feature extraction
     feat_timestep: float = 0.9
-    gp_kernel: str = "rbf"
-    gp_lengthscale: float = 0.1
-
-    # Uncertainty reward and uncertainty sampling algorithm
-    dps_weight : float = 100.0
+    dps_weight: float = 100.0
     
     # Fine-tuning
     ft_min_dataset_size: int = 64
@@ -92,13 +114,6 @@ class TaskAgnosticConfig:
         if self.dps_weight < 0:
             raise ValueError(f"dps_weight cannot be negative, got {self.dps_weight}")
 
-        if self.gp_lengthscale < 0:
-            raise ValueError(f"gp_lengthscale cannot be negative, got {self.gp_lengthscale}")
-
-        allowed_kernels = { "rbf", "linear" }
-        if self.gp_kernel not in allowed_kernels:
-            raise ValueError(f"gp_kernel must be one of {allowed_kernels}")
-
     @staticmethod
     def construct_from_args(args: argparse.Namespace | dict) -> "TaskAgnosticConfig":
         if isinstance(args, argparse.Namespace):
@@ -126,6 +141,7 @@ class TaskAgnostic(Generic[D]):
     def __init__(
         self,
         problem_setup: ProblemSetup[D],
+        uncertainty: UncertaintyEstimator[D],
         config: TaskAgnosticConfig,
         logger: logging.Logger,
     ):
@@ -151,23 +167,15 @@ class TaskAgnostic(Generic[D]):
         if feat.ndim != 2:
             raise ValueError(f"Feature extractor output must be a 2D tensor, got {feat.ndim}D tensor")
 
-        reward = GPUncertaintyReward(
-            feat_extractor=feat_extractor,
-            feat_dim=feat.shape[1],
-            valid_fn=self.problem.validity,
-            kernel=config.gp_kernel,
-            lengthscale=config.gp_lengthscale,
-            device=x.device,
-        )
         env = construct_env(
             problem_setup.base_model,
-            reward,
+            DummyReward(),
             discretization_steps=config.num_steps,
             reward_scale=config.dps_weight,
         )
 
         self.base_model = problem_setup.base_model
-        self.reward = reward
+        self.uncertainty = uncertainty
         self.env = env
 
         self.logger.info(f"base model parameters: {sum(p.numel() for p in self.base_model.parameters() if p.requires_grad):,}")
@@ -202,14 +210,17 @@ class TaskAgnostic(Generic[D]):
         ----------
         batches : list[Batch[D]]
             Data batches obtained so far, where each entry is from a separate iteration.
-
         pbar : bool, default: False
             Progress bar or not.
         """
-        valid_batch = filter_out_invalids(batches)
-        if len(valid_batch) == 0:
-            self.logger.warning("No valid data to fine-tune")
-            return
+
+        if not self.config.no_verifier:
+            valid_batch = filter_out_invalids(batches)
+            if len(valid_batch) == 0:
+                self.logger.warning("No valid data to fine-tune")
+                return
+        else:
+            valid_batch = Batch.concat(batches)
 
         # Fine-tune base model
         opt = torch.optim.AdamW(
@@ -236,11 +247,15 @@ class TaskAgnostic(Generic[D]):
         samples : list[Batch[D]]
             Data batches obtained so far, where one batch comes from one iteration in the order.
         """
-        self.reward.set_data([b.latents for b in batches], [b.kwargs for b in batches])
+        self.uncertainty.set_data(
+            [b.latents for b in batches],
+            [b.valids.float() for b in batches],
+            [b.kwargs for b in batches],
+        )
 
     def visualize_iter(self, batch: Batch[D], iteration: int):
         # Visualizing an iteration is problem-dependent
-        fig = self.problem.visualize_sample(self.env, batch)
+        fig = self.problem.visualize_sample(self.env, self.uncertainty, batch)
 
         # Save frame
         directory = self.config.folder / "frames"
@@ -260,30 +275,19 @@ class TaskAgnostic(Generic[D]):
         eval_kwargs = self.problem.eval_sampling_kwargs(n)
         sample = self.env.batch_sample(n, bs, **eval_kwargs)
         batch = Batch.from_sample(sample)
+        batch.valids = self.problem.validity(batch.samples, batch.kwargs)
 
         # Save samples
         directory = self.config.folder / "eval" / f"{iteration:04d}"
-        samples_dir = directory / "samples"
-        samples_dir.mkdir(parents=True, exist_ok=True)
-
-        sample_files = []
-        for i in range(len(sample)):
-            path = samples_dir / f"{i:04d}"
-            filename = self.problem.save_sample(batch.samples[i], index_dict(batch.kwargs, i), path)
-            if filename is not None:
-                sample_files.append(SampleFile(is_valid=bool(batch.valids[i]), file=filename))
-
-        torch.save(sample.valids, directory / "valids.pt")
+        directory.mkdir(parents=True, exist_ok=True)
+        self.problem.save_samples(batch.samples, batch.kwargs, directory)
+        torch.save(batch.valids, directory / "valids.pt")
 
         # Compute and save evaluation metrics
-        metrics = self.problem.compute_metrics(sample_files)
+        metrics = self.problem.compute_metrics(batch.samples, batch.kwargs)
         metrics["model_valid"] = batch.valids.float().mean().item()
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
-
-        # Zip and delete folder
-        shutil.make_archive(str(samples_dir), "zip", samples_dir)
-        shutil.rmtree(samples_dir)
 
         return metrics
 
@@ -306,11 +310,12 @@ class TaskAgnostic(Generic[D]):
             # Collect new samples
             with self._timer("sampling"):
                 if use_guidance:
-                    self.env.control_policy = RewardGradient(self.env)
+                    self.env.control_policy = RewardGradient(self.env, self.uncertainty)
 
                 sample = self.env.batch_sample(samples_per_iter, self.config.sample_batch_size)
                 batch = Batch.from_sample(sample)
                 batch.latents = self.problem.postprocess_latents(batch)
+                batch.valids = self.problem.validity(batch.samples, batch.kwargs)
                 total_valid_samples += batch.valids.int().sum().item()
 
                 self.env.control_policy = None
@@ -321,7 +326,11 @@ class TaskAgnostic(Generic[D]):
             # Logging and visualization
             with self._timer("visualize"):
                 self.visualize_iter(batch, i)
-                metrics["uncertainty"] = batch.rewards.mean().item()
+
+                with torch.no_grad():
+                    _, uncert = self.uncertainty.mean_and_uncertainty(batch.latents, **batch.kwargs)
+
+                metrics["uncertainty"] = uncert.mean().item()
                 metrics["biased_valid"] = batch.valids.float().mean().item()
                 metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
                 self.logger.info(f"(iter={i:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
@@ -351,12 +360,21 @@ class TaskAgnostic(Generic[D]):
 
 def build_parser():
     parser = argparse.ArgumentParser()
-
     subparsers = parser.add_subparsers(dest="problem_setup", required=True)
+
     for name, setup_cls in problem_setups.items():
         sub = subparsers.add_parser(name)
-        add_global_args(sub)
-        setup_cls.add_args(sub)
+
+        # Create nested uncertainty subparser first
+        uncertainty_subparsers = sub.add_subparsers(dest="uncertainty_estimator", required=True)
+
+        for u_name, u_cls in uncertainty_estimators.items():
+            u_sub = uncertainty_subparsers.add_parser(u_name)
+            
+            # Attach all arguments to the final nested subparser
+            add_global_args(u_sub)
+            setup_cls.add_args(u_sub)
+            u_cls.add_args(u_sub)
 
     return parser
 
@@ -377,8 +395,6 @@ def add_global_args(parser):
     parser.add_argument("--num_steps", type=int, default=100)
 
     # Uncertainty estimator
-    parser.add_argument("--gp_kernel", type=str, choices=["rbf", "linear"], default="rbf")
-    parser.add_argument("--gp_lengthscale", type=float, default=0.1)
     parser.add_argument("--feat_timestep", type=float, default=0.9)
     parser.add_argument("--dps_weight", type=float, default=100)
 

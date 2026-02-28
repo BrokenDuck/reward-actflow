@@ -11,6 +11,7 @@ from pathlib import Path
 import math
 
 from .problem_setup import ProblemSetup
+from adm.uncertainty import UncertaintyEstimator
 from adm.utils import Batch
 
 
@@ -20,6 +21,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self._base_model = ToyBaseModel(device=device)
+        self.device = device
 
     @property
     def base_model(self) -> BaseModel[DDTensor]:
@@ -40,10 +42,15 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         return "input"
 
     def postprocess_features(self, latents: DDTensor, feats: DDTensor) -> torch.Tensor:
-        return latents.data
+        return feats.data
 
     @torch.no_grad()
-    def visualize_sample(self, env: Environment[DDTensor], batch: Batch[DDTensor]) -> Figure:
+    def visualize_sample(
+        self,
+        env: Environment[DDTensor],
+        uncertainty: UncertaintyEstimator[DDTensor],
+        batch: Batch[DDTensor],
+    ) -> Figure:
         xmin = -3.5
         xmax = 3.5
         delta = 0.05
@@ -52,7 +59,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         y = torch.linspace(xmin, xmax, 100)
         X, Y = torch.meshgrid(x, y, indexing="ij")
         XY = torch.stack([X.flatten(), Y.flatten()], dim=-1)
-        Z, _ = env.reward(DDTensor(XY), DDTensor(XY), radius=math.sqrt(5)) 
+        Z, _ = uncertainty(DDTensor(XY).to(self.device), DDTensor(XY).to(self.device)) 
         Z = Z.reshape(X.shape) 
 
         fig, axes = plt.subplots(1, 2, figsize=(6, 3), constrained_layout=True)
@@ -69,7 +76,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         axes[0].set_xlim(xmin, xmax)
         axes[0].set_ylim(xmin, xmax)
 
-        many_samples = env.sample(50_000, pbar=False)[0].sample.data
+        many_samples = env.sample(50_000, pbar=False).sample.data
         H, _, _ = np.histogram2d(
             many_samples[:, 0].cpu().numpy(),
             many_samples[:, 1].cpu().numpy(),
@@ -77,12 +84,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
             density=True,
             range=[[xmin, xmax], [xmin, xmax]],
         )
-        H_flat = H.flatten()
-        idx = np.argsort(H_flat)[::-1]
-        cdf = np.cumsum(H_flat[idx])
-        cdf /= cdf[-1]
-        tau = H_flat[idx][np.searchsorted(cdf, 1 - delta)]
-        support = H >= tau
+        support = H >= 0.01
 
         axes[1].imshow(
             support.T,
@@ -90,7 +92,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
             origin="lower",
             cmap="binary",
         )
-        axes[1].set_title(r"Model Support (1-$\delta$)")
+        axes[1].set_title(r"Model Support (p >= 0.01)")
 
         V = self.validity(DDTensor(XY), {}).reshape(X.shape)
         for i in range(2):
@@ -98,7 +100,10 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
 
         return fig
 
-    def save_sample(self, sample: DDTensor, kwargs: dict, filename: Path):
+    def save_samples(self, samples: DDTensor, kwargs: dict, dir: Path) -> bool:
+        pass
+
+    def load_samples(self, dir: Path) -> tuple[DDTensor, dict]:  # type: ignore
         pass
 
 
@@ -106,7 +111,6 @@ class XReward(Reward[DDTensor]):
     def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         x = sample.data[:, 0]
         return x, torch.ones_like(x)
-
 
 
 class ToyBaseModel(BaseModel[DDTensor]):

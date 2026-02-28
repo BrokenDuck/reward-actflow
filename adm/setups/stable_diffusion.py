@@ -2,6 +2,7 @@ from typing import Any, Optional
 
 import torch
 from torchvision.utils import save_image, make_grid
+from torchvision.io import read_image
 from diffusiongym import BaseModel, Environment, DDTensor, ConstantNoiseSchedule
 from diffusiongym.images import SD15BaseModel, AestheticReward
 from vendi_score import vendi
@@ -10,8 +11,12 @@ from argparse import ArgumentParser
 from pathlib import Path
 from peft import LoraConfig
 import pyiqa
+import shutil
+import zipfile
+import yaml
 
-from adm.setups.problem_setup import ProblemSetup, SampleFile
+from adm.setups.problem_setup import ProblemSetup
+from adm.uncertainty import UncertaintyEstimator
 from adm.utils import add_valid_border, CLIP, Batch, to_pil_images
 
 
@@ -103,7 +108,12 @@ class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
 
         return feats.mean(dim=[-2, -1])
 
-    def visualize_sample(self, env: Environment[DDTensor], batch: Batch[DDTensor]) -> Figure:
+    def visualize_sample(
+        self,
+        env: Environment[DDTensor],
+        uncertainty: UncertaintyEstimator[DDTensor],
+        batch: Batch[DDTensor],
+    ) -> Figure:
         x = batch.samples.data.cpu()
         v = batch.valids.cpu()
         grid = make_grid(add_valid_border(x, v, thickness=16), nrow=8)
@@ -115,22 +125,59 @@ class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
 
         return fig
 
-    def save_sample(self, sample: DDTensor, kwargs: dict, filename: Path) -> Path:
-        x = sample.data.cpu()
-        save_image(x, filename.with_suffix(".png"))
+    def save_samples(self, samples: DDTensor, kwargs: dict, dir: Path) -> bool:
+        sample_dir = dir / "images"
+        sample_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save prompt
-        with open(filename.with_suffix("_prompt.txt"), "w") as f:
-            f.write(kwargs.get("prompt", "prompt not found"))
+        kwargs_data = []
 
-        # TODO: find some way to save image and prompt together, e.g. in a single file or directory
-        return filename.with_suffix(".png")
+        for i in range(len(samples)):
+            save_image(samples[i].data.cpu(), sample_dir / f"sample_{i}.png", normalize=True, value_range=(0, 1))
+            kwargs_data.append({
+                "prompt": kwargs["prompt"][i],
+                "cfg_scale": kwargs["cfg_scale"][i].item(),
+            })
 
-    # def compute_metrics(self, batch: Batch[DDTensor]) -> dict[str, float]:
-    #     img_list = to_pil_images(batch.samples)
-    #     feats = self.clip.embed_images(img_list)
-    #     return { "vendi": vendi.score_X(feats) }
+        # save kwargs data as yaml file
+        with open(dir / "kwargs.yaml", "w") as f:
+            yaml.dump(kwargs_data, f)
 
-    def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
-        # todo: aesthetic score?
-        return dict()
+        # zip the images directory
+        shutil.make_archive(str(sample_dir), "zip", sample_dir)
+        shutil.rmtree(sample_dir)
+
+        return True
+
+    def load_samples(self, dir: Path) -> tuple[DDTensor, dict]:
+        # unzip images
+        sample_zip = dir / "images.zip"
+        sample_dir = dir / "images"
+        with zipfile.ZipFile(sample_zip, "r") as zip_ref:
+            zip_ref.extractall(sample_dir)
+
+        # load images
+        img_paths = sorted(sample_dir.glob("sample_*.png"), key=lambda x: int(x.stem.split("_")[1]))
+        imgs = torch.stack([read_image(str(path)) for path in img_paths]).float() / 255.0
+        samples = DDTensor(imgs)
+
+        # load kwargs data
+        with open(dir / "kwargs.yaml", "r") as f:
+            kwargs_data = yaml.safe_load(f)
+
+        kwargs = {
+            "prompt": [item["prompt"] for item in kwargs_data],
+            "cfg_scale": [item["cfg_scale"] for item in kwargs_data],
+        }
+
+        return samples, kwargs
+
+    def eval_sampling_kwargs(self, n: int) -> dict[str, Any]:
+        return { "prompt": ["An impressionist painting"] * n, "cfg_scale": torch.full((n,), 4.0) }
+
+    def compute_metrics(self, samples: DDTensor, kwargs: dict) -> dict[str, float]:
+        img_list = to_pil_images(samples)
+        feats = self.clip.embed_images(img_list).cpu()
+        return { "vendi": vendi.score_X(feats) }
+
+    # def compute_sample_metrics(self, samples: DDTensor, kwargs: dict) -> list[dict[str, float]]:
+    #     return dict()

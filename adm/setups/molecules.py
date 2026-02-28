@@ -1,27 +1,28 @@
-from typing import Optional
+from typing import Optional, Any
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 import dgl
 from rdkit import Chem, RDLogger
 from rdkit.Chem import Draw, AllChem, Crippen, QED
-from flowmol.analysis.molecule_builder import SampledMolecule
+from flowmol.data_processing.utils import build_edge_idxs
+from flowmol.analysis.molecule_builder import SampledMolecule, bond_type_to_idx
 from diffusiongym import  BaseModel, Environment
 from diffusiongym.molecules import DDGraph, QM9BaseModel, GEOMBaseModel
+from diffusiongym.molecules.rewards.xtb import parallel_xtb
+from diffusiongym.molecules.rewards.utils import is_valid, is_not_fragmented
 from diffusiongym.utils import temporary_workdir
 from vendi_score import vendi, molecule_utils
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from pathlib import Path
 from argparse import ArgumentParser
-import json
-from json import JSONDecodeError
-import re
+import gzip
 import os
 
 import adm.sa_scorer.sascorer as sascorer
-from adm.setups.problem_setup import ProblemSetup, SampleFile
+from adm.setups.problem_setup import ProblemSetup
+from adm.uncertainty import UncertaintyEstimator
 from adm.utils import Batch
 
 
@@ -41,6 +42,9 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         else:
             raise ValueError(f"Unknown dataset: {dataset}")
 
+        self.atom_type_map = self.base_model.model.atom_type_map
+        self.atom_type_to_idx = { atom_type: i for i, atom_type in enumerate(self.atom_type_map) }
+
     @classmethod
     def add_args(cls, parser: ArgumentParser):
         parser.add_argument("--mol_geometry_opt", type=str, choices=["none", "mmff", "uff", "gfn2"], default="mmff")
@@ -48,6 +52,9 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
     @property
     def base_model(self) -> BaseModel[DDGraph]:
         return self._base_model
+
+    def _is_mol_valid(self, mol: Chem.Mol) -> bool:
+        return is_valid(mol) and is_not_fragmented(mol)
 
     def validity(self, samples: DDGraph, kwargs: dict) -> torch.Tensor:
         valids = torch.ones(len(samples), dtype=torch.bool)
@@ -58,15 +65,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         for i, g in enumerate(dgl.unbatch(batched_graph)):
             # Check if it passes rdkit validity rules
             mol = SampledMolecule(g, self.base_model.model.atom_type_map).rdkit_mol
-            mol = validate_mol(mol)
-
-            if mol is None:
-                valids[i] = False
-                continue
-
-            # Check if it has only a single connected component
-            if len(Chem.GetMolFrags(mol)) != 1:
-                valids[i] = False
+            valids[i] = self._is_mol_valid(mol)
 
         return valids
 
@@ -74,37 +73,42 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
     def feature_layer(self) -> str:
         return "model.vector_field.node_output_head.0"
 
-    def postprocess_latents(self, batch: Batch[DDGraph]) -> DDGraph:
-        latents = batch.latents
-        graph = latents.graph.clone()
+    def _postprocess_graph(self, samples: DDGraph) -> DDGraph:
+        graph = samples.graph.clone()
 
         def _discretize(x):
             # argmax finds the class index, one_hot creates the vector
             # type_as ensures we match the original float precision and device
             return F.one_hot(x.argmax(dim=-1), num_classes=x.shape[-1]).type_as(x)
 
-        # Set categorical features to be one-hot vectors over dim -1
-        graph.ndata["a_t"] = _discretize(graph.ndata["a_t"])
-        graph.ndata["c_t"] = _discretize(graph.ndata["c_t"])
-        graph.edata["e_t"] = _discretize(graph.edata["e_t"])
+        x_key = "x_1" if "x_1" in graph.ndata.keys() else "x_t"
+        a_key = "a_1" if "a_1" in graph.ndata.keys() else "a_t"
+        c_key = "c_1" if "c_1" in graph.ndata.keys() else "c_t"
+        e_key = "e_1" if "e_1" in graph.edata.keys() else "e_t"
+
+        # Set categorical features to be one-hot encoded
+        graph.ndata[a_key] = _discretize(graph.ndata[a_key])
+        graph.ndata[c_key] = _discretize(graph.ndata[c_key])
+        graph.edata[e_key] = _discretize(graph.edata[e_key])
 
         # Relax the geometry, otherwise the structures will become increasingly distorted
-        graph.edata["ue_mask"] = latents.ue_mask
+        graph.edata["ue_mask"] = samples.ue_mask
         if self.geometry_opt != "none":
             graphs = []
-            for i, g in enumerate(dgl.unbatch(graph)):
-                if batch.valids[i]:
-                    g = relax_positions(g, self.base_model.model.atom_type_map, self.geometry_opt)
-
+            for g in dgl.unbatch(graph):
+                g = relax_positions(g, self.base_model.model.atom_type_map, self.geometry_opt)
                 graphs.append(g)
 
             graph = dgl.batch(graphs)
 
         # Remove center of mass
-        init_coms = dgl.readout_nodes(graph, feat="x_t", op="mean")
-        graph.ndata["x_t"] = graph.ndata["x_t"] - init_coms[latents.n_idx]
+        init_coms = dgl.readout_nodes(graph, feat=x_key, op="mean")
+        graph.ndata[x_key] = graph.ndata[x_key] - init_coms[samples.n_idx]
 
-        return DDGraph(graph, latents.ue_mask, latents.n_idx, latents.e_idx)
+        return DDGraph(graph, samples.ue_mask, samples.n_idx, samples.e_idx)
+
+    def postprocess_latents(self, batch: Batch[DDGraph]) -> DDGraph:
+        return self._postprocess_graph(batch.latents)
 
     def postprocess_features(self, latents: DDGraph, feats: torch.Tensor) -> torch.Tensor:
         # `feats` is a tensor of shape (num_nodes, feature_dim), which we want to take the mean over
@@ -123,17 +127,55 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         # Mean pooling
         return graph_sums / graph_counts.unsqueeze(1)
 
-    def _to_mols(self, samples: DDGraph) -> list[Chem.Mol | None]:
+    def _graph_to_mols(self, graph: dgl.DGLGraph) -> list[Chem.Mol | None]:
         mols = []
-        for sample in dgl.unbatch(samples.graph):
-            mol = SampledMolecule(sample.cpu(), self.base_model.model.atom_type_map).rdkit_mol
+        for g in dgl.unbatch(graph):
+            mol = SampledMolecule(g.cpu(), self.atom_type_map).rdkit_mol
             mols.append(mol)
 
         return mols
 
+    def _mols_to_graph(self, mols: list[Chem.Mol]) -> dgl.DGLGraph:
+        graphs = []
+        for mol in mols:
+            n = mol.GetNumAtoms()
+
+            atom_positions = torch.from_numpy(mol.GetConformer().GetPositions())
+            atom_types_idx = torch.zeros(n, dtype=torch.int64)
+            atom_charges = torch.zeros(n, dtype=torch.int64)
+
+            for i, atom in enumerate(mol.GetAtoms()):
+                atom_types_idx[i] = self.atom_type_to_idx[atom.GetSymbol()]
+                atom_charges[i] = atom.GetFormalCharge()
+
+            src, dst = build_edge_idxs(n)
+            g = dgl.graph((src, dst), num_nodes=n)
+
+            e_idx = torch.empty(g.num_edges(), dtype=torch.int64)
+            for k in range(g.num_edges()):
+                a = int(src[k])
+                b = int(dst[k])
+                bond = mol.GetBondBetweenAtoms(a, b)
+                bond_type = bond.GetBondType() if bond is not None else None
+                e_idx[k] = bond_type_to_idx[bond_type]
+
+            g.ndata["x_1"] = atom_positions
+            g.ndata["a_1"] = F.one_hot(atom_types_idx, num_classes=len(self.atom_type_map)).float()
+            g.ndata["c_1"] = F.one_hot(atom_charges + 2, num_classes=6).float()
+            g.edata["e_1"] = F.one_hot(e_idx, num_classes=5).float()
+
+            graphs.append(g)
+
+        return dgl.batch(graphs)
+
     @torch.no_grad()
-    def visualize_sample(self, env: Environment[DDGraph], batch: Batch[DDGraph]) -> Figure:
-        mols = self._to_mols(batch.samples)
+    def visualize_sample(
+        self,
+        env: Environment[DDGraph],
+        uncertainty: UncertaintyEstimator[DDGraph],
+        batch: Batch[DDGraph],
+    ) -> Figure:
+        mols = self._graph_to_mols(batch.samples.graph)
 
         fig = plt.figure(figsize=(12, 8))
         cols = 8
@@ -147,8 +189,11 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
 
             ax.axis("off")
             if mol is not None:
-                img = Draw.MolToImage(mol, size=(150, 150))
-                ax.imshow(img)
+                try:
+                    img = Draw.MolToImage(mol, size=(150, 150))
+                    ax.imshow(img)
+                except Exception:
+                    pass
 
         return fig
 
@@ -173,36 +218,44 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         perm = torch.randperm(result.numel(), device=result.device)
         result = result[perm]
 
-        return {"n_atoms": result}
+        return { "n_atoms": result }
 
-    def save_sample(self, sample: DDGraph, kwargs: dict, filename: Path) -> Path | None:
-        if len(sample) != 1:
-            raise ValueError("Can only save a single sample at a time.")
+    def save_samples(self, samples: DDGraph, kwargs: dict, dir: Path) -> bool:
+        samples = self._postprocess_graph(samples)
+        mols = self._graph_to_mols(samples.graph)
+        mols = [mol for mol in mols if mol is not None and self._is_mol_valid(mol)]
 
-        mol = SampledMolecule(sample.graph.cpu(), self.base_model.model.atom_type_map).rdkit_mol
-        mol = validate_mol(mol)
+        sdf_path = dir / "samples.sdf.gz"
+        with gzip.open(sdf_path, "wt") as f:
+            w = Chem.SDWriter(f)
+            for mol in mols:
+                try:
+                    w.write(mol)
+                except Exception:
+                    pass
+            w.close()
 
-        if mol is None:
-            print("tried to save an invalid molecule...")
-            return None
+        return True
 
-        output_path = filename.with_suffix(".mol")
-        try:
-            Chem.MolToMolFile(mol, str(output_path))
-        except Exception as e:
-            print("MolToMolFile failed:", e)
-            return None
+    def load_samples(self, dir: Path) -> tuple[DDGraph, dict]:
+        sdf_path = dir / "samples.sdf.gz"
+        if not sdf_path.exists():
+            raise FileNotFoundError(f"No samples found in {dir}")
 
-        return output_path
-
-    def compute_metrics(self, sample_files: list[SampleFile]) -> dict[str, float]:
-        # Load molecule samples
-        mols: list[Chem.Mol] = []
-        for sample_file in sample_files:
-            if sample_file.is_valid:
-                mol = Chem.MolFromMolFile(str(sample_file.file.with_suffix(".mol")), sanitize=False, removeHs=False, strictParsing=False)
+        mols = []
+        with gzip.open(sdf_path, "rb") as f:
+            suppl = Chem.ForwardSDMolSupplier(f, sanitize=False, removeHs=False, strictParsing=False)
+            for mol in suppl:
                 if mol is not None:
                     mols.append(mol)
+
+        graph = self._mols_to_graph(mols)
+        return DDGraph(graph), {}
+
+    def compute_metrics(self, samples: DDGraph, kwargs: dict) -> dict[str, float]:
+        samples = self._postprocess_graph(samples)
+        mols = self._graph_to_mols(samples.graph)
+        mols = [mol for mol in mols if mol is not None and self._is_mol_valid(mol)]
 
         K = molecule_utils.get_tanimoto_K(mols)
         vendi_score = vendi.score_K(K)
@@ -211,39 +264,31 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         D = 1 - K
         avg_pairwise_dist = D.sum() / (n * (n - 1))
 
-        return { "vendi": float(vendi_score), "avg_pairwise_dist": 100 * float(avg_pairwise_dist) }
+        return { "vendi": float(vendi_score), "avg_pairwise_dist": float(avg_pairwise_dist) }
 
-    def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
-        # Load molecule samples
-        valid_mols: list[Chem.Mol] = []
-        valid_files: list[Path] = []
-        for sample_file in sample_files:
-            if sample_file.is_valid:
-                mol = Chem.MolFromMolFile(str(sample_file.file.with_suffix(".mol")), sanitize=False, removeHs=False, strictParsing=False)
-                if mol is not None:
-                    valid_files.append(sample_file.file)
-                    valid_mols.append(mol)
+    def compute_sample_metrics(self, samples: DDGraph, kwargs: dict) -> list[dict[str, Any]]:
+        # In case these were not loaded from file, we need to relax geometry
+        samples = self._postprocess_graph(samples)
+        mols = self._graph_to_mols(samples.graph)
 
-        # Compute quantum chemistry properties
+        valid_indices = [i for i, mol in enumerate(mols) if mol is not None and self._is_mol_valid(mol)]
+        valid_mols = [mols[i] for i in valid_indices]
         res = parallel_xtb(valid_mols)
 
-        # Return in nice format
-        out = dict()
+        metrics: list[dict[str, Any]] = [{ "is_valid": False } for _ in mols]
         metric_names = ["energy", "homo", "lumo", "homo_lumo_gap", "dipole_moment", "polarizability", "heat_capacity"]
-        for file_path, mol, xtb_res in zip(valid_files, valid_mols, res):
+        for mol, idx, xtb_res in zip(valid_mols, valid_indices, res):
             if xtb_res is None:
                 continue
 
-            sample_name = file_path.name.replace(".mol", "")
-            metrics = { name: getattr(xtb_res, name) for name in metric_names }
-            metrics["qed"] = QED.qed(mol)
-            metrics["logp"] = Crippen.MolLogP(mol)  # type: ignore
-            metrics["sa_score"] = sascorer.calculateScore(mol)
-            metrics["is_valid"] = True
+            metrics[idx] = { "is_valid": True }
+            for name in metric_names:
+                metrics[idx][name] = getattr(xtb_res, name)
+            metrics[idx]["qed"] = QED.qed(mol)
+            metrics[idx]["logp"] = Crippen.MolLogP(mol)  # type: ignore
+            metrics[idx]["sa_score"] = sascorer.calculateScore(mol)
 
-            out[sample_name] = metrics
-
-        return out
+        return metrics
 
 
 class QM9ProblemSetup(MoleculeProblemSetup):
@@ -259,17 +304,20 @@ class GEOMDrugsProblemSetup(MoleculeProblemSetup):
 def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff") -> dgl.DGLGraph:
     g_relaxed = g.clone()
 
-    g_relaxed.ndata["x_1"] = g_relaxed.ndata["x_t"]
-    g_relaxed.ndata["a_1"] = g_relaxed.ndata["a_t"]
-    g_relaxed.ndata["c_1"] = g_relaxed.ndata["c_t"]
-    g_relaxed.edata["e_1"] = g_relaxed.edata["e_t"]
+    if "x_1" not in g_relaxed.ndata.keys():
+        g_relaxed.ndata["x_1"] = g_relaxed.ndata["x_t"]
+
+    if "a_1" not in g_relaxed.ndata.keys():
+        g_relaxed.ndata["a_1"] = g_relaxed.ndata["a_t"]
+
+    if "c_1" not in g_relaxed.ndata.keys():
+        g_relaxed.ndata["c_1"] = g_relaxed.ndata["c_t"]
+
+    if "e_1" not in g_relaxed.edata.keys():
+        g_relaxed.edata["e_1"] = g_relaxed.edata["e_t"]
 
     mol = SampledMolecule(g_relaxed, atom_type_map).rdkit_mol
-    if mol is None:
-        return g
-
-    mol = validate_mol(mol)
-    if mol is None:
+    if mol is None or not is_valid(mol):
         return g
 
     if alg == "mmff":
@@ -292,7 +340,9 @@ def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff"
         return g
 
     positions = torch.from_numpy(mol.GetConformer().GetPositions())
-    g.ndata["x_t"] = positions.to(g.device).type_as(g.ndata["x_t"])  # type: ignore
+
+    x_key = "x_1" if "x_1" in g.ndata.keys() else "x_t"
+    g.ndata[x_key] = positions.to(g.device).type_as(g.ndata[x_key])  # type: ignore
 
     return g
 
@@ -336,197 +386,3 @@ def xtb_relax_geometry(mol: Chem.Mol) -> Chem.Mol | None:
             conf.SetAtomPosition(i, opt_conf.GetAtomPosition(i))  # type: ignore
 
     return mol
-
-
-def validate_mol(mol: Chem.Mol) -> Chem.Mol | None:
-    """Validate molecules according to chemical validity.
-
-    Source: https://arxiv.org/abs/2505.00518
-
-    Parameters
-    ----------
-    mol : Chem.Mol
-        The molecule to validate.
-
-    Returns
-    -------
-    validated_mol : Chem.Mol | None
-        The sanitized molecule if valid, else None.
-    """
-    # sometimes it crashes randomly in C++, so guard it defensively just in case
-    try:
-        Chem.RemoveStereochemistry(mol)
-        Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
-        Chem.AssignStereochemistryFrom3D(mol)
-
-        for a in mol.GetAtoms():
-            a.SetNoImplicit(True)  # type: ignore
-            if a.HasProp("_MolFileHCount"):
-                a.ClearProp("_MolFileHCount")
-
-        flags = Chem.SanitizeFlags.SANITIZE_ALL & ~Chem.SanitizeFlags.SANITIZE_ADJUSTHS  # type: ignore
-
-        # Full sanitization, minus ADJUSTHS
-        err = Chem.SanitizeMol(
-            mol,
-            sanitizeOps=flags,
-            catchErrors=True,
-        )
-
-        # Non-zero bitmask means some step failed
-        if err:
-            return None
-
-        mol.UpdatePropertyCache(strict=True)
-        return mol
-    except:
-        return None
-
-
-class XTBResult:
-    """Class to parse the output of GFN2-xTB."""
-
-    def __init__(self, filename: Path):
-        assert filename.suffix == ".json", f"Filename ({filename}) must end with .json"
-        
-        # Load JSON data
-        with open(filename, "r") as f:
-            self.data = json.load(f)
-
-        # Load Log data (assumes .out file exists next to .json)
-        # The parallel_xtb function saves JSON as *.xtbout.json and log as *.out
-        log_filename = filename.parent / (filename.stem.split(".")[0] + ".out")
-        
-        if log_filename.exists():
-            with open(log_filename, "r") as f:
-                self.log_content = f.read()
-        else:
-            raise FileNotFoundError(f"Log file {log_filename} not found.")
-
-    @property
-    def energy(self) -> float | None:
-        """Energy (Hartree)."""
-        total_energy = self.data.get("total energy")
-
-        if total_energy is None:
-            return None
-
-        return float(total_energy)
-
-    @property
-    def homo(self) -> float | None:
-        """Highest occupied molecular orbital (eV)."""
-        fractional_occupation = self.data.get("fractional occupation")
-        energies = self.data.get("orbital energies/eV")
-
-        if fractional_occupation is None or energies is None:
-            return None
-
-        occupation = np.asarray(fractional_occupation)
-        energies = np.asarray(energies)
-
-        occupied_indices = np.where(occupation > 0)[0]
-        if len(occupied_indices) == 0:
-            return None
-
-        highest_occupied_orbital = occupied_indices[-1]
-        return float(energies[highest_occupied_orbital])
-
-    @property
-    def lumo(self) -> float | None:
-        """Lowest unoccupied molecular orbital (eV)."""
-        fractional_occupation = self.data.get("fractional occupation")
-        energies = self.data.get("orbital energies/eV")
-
-        if fractional_occupation is None or energies is None:
-            return None
-
-        occupation = np.asarray(fractional_occupation)
-        energies = np.asarray(energies)
-
-        unoccupied_indices = np.where(occupation == 0)[0]
-        if len(unoccupied_indices) == 0:
-            return None
-
-        lowest_unoccupied_orbital = unoccupied_indices[0]
-        return float(energies[lowest_unoccupied_orbital])
-
-    @property
-    def homo_lumo_gap(self) -> float | None:
-        """HOMO-LUMO gap (eV)."""
-        homo = self.homo
-        lumo = self.lumo
-
-        if homo is None or lumo is None:
-            return None
-
-        return lumo - homo
-
-    @property
-    def dipole_moment(self) -> float | None:
-        """Dipole moment (Debye)."""
-        dipole = self.data.get("dipole")
-        if dipole is None:
-            return None
-
-        return 2.5417 * float(np.linalg.norm(dipole))
-
-    @property
-    def polarizability(self) -> float | None:
-        """Polarizability (Bohr^3)."""
-        # Regex to find: Mol. α(0) /au      :         <val>
-        match = re.search(r"Mol\.\s+α\(0\)\s+/au\s+:\s+([\d\.]+)", self.log_content)
-        if not match:
-            return None
-
-        return float(match.group(1))
-
-    @property
-    def heat_capacity(self) -> float | None:
-        """Heat Capacity (cal/K/mol) at 298.15K."""
-        # Look for the TOT line in the thermodynamic table.
-        # Format: TOT     enthalpy    heat_capacity    entropy    entropy(J)
-        # Example: TOT    5299.6013   30.4586          85.7819    358.9115
-        # We search for TOT, skipping the enthalpy (first number), capturing the second number.
-        # [+-]?\d+ matches integers, floats, scientific notation
-        number_pattern = r"[+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?"
-        pattern = fr"TOT\s+{number_pattern}\s+({number_pattern})"
-        
-        match = re.search(pattern, self.log_content)
-        if not match:
-            return None
-            
-        return float(match.group(1))
-
-
-def parallel_xtb(mols: list[Chem.Mol]):
-    """Run GFN2-xTB in parallel for molecules in the graph."""
-    results = []
-    with temporary_workdir():
-        i = 0
-        for mol in mols:
-            i += 1
-            Chem.MolToXYZFile(mol, f"{i}.xyz")
-
-        ncpus = len(os.sched_getaffinity(0))
-
-        # Compute properties using GFN2-xTB
-        # Added --ohess to calculate Hessian (needed for Heat Capacity)
-        os.system(
-            f"parallel -j {ncpus} "
-            f"'xtb {{}} --ohess --parallel 1 --namespace {{/.}} --json > {{/.}}.out 2>&1' "
-            "::: *.xyz"
-        )
-
-        # Read results
-        for i in range(1, len(mols) + 1):
-            path = Path(f"{i}.xtbout.json")
-
-            try:
-                res = XTBResult(path) if path.exists() else None
-            except JSONDecodeError:
-                res = None
-
-            results.append(res)
-
-    return results

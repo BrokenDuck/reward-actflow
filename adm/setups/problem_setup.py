@@ -1,6 +1,5 @@
 from typing import Generic, Any
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 import torch
 from diffusiongym import D, BaseModel, Environment
@@ -8,13 +7,8 @@ from matplotlib.figure import Figure
 from pathlib import Path
 from argparse import ArgumentParser
 
+from adm.uncertainty import UncertaintyEstimator
 from adm.utils import Batch
-
-
-@dataclass
-class SampleFile:
-    is_valid: bool
-    file: Path
 
 
 class ProblemSetup(ABC, Generic[D]):
@@ -103,35 +97,59 @@ class ProblemSetup(ABC, Generic[D]):
         raise NotImplementedError
 
     @abstractmethod
-    def visualize_sample(self, env: Environment[D], batch: Batch[D]) -> Figure:
+    def visualize_sample(self, env: Environment[D], uncertainty: UncertaintyEstimator[D], batch: Batch[D]) -> Figure:
         """Produce a matplotlib figure for visualizing the sample in the problem setup.
 
         Parameters
         ----------
         env : Environment[D]
             The environment in which the samples were generated.
+        uncertainty : UncertaintyEstimator[D]
+            Current uncertainty estimator.
         batch : Batch[D]
             The batch.
         """
         raise NotImplementedError
 
     @abstractmethod
-    def save_sample(self, sample: D, kwargs: dict[str, Any], filename: Path) -> Path | None:
-        """Save a *single* sample to the disk.
-        
+    def save_samples(self, samples: D, kwargs: dict, dir: Path) -> bool:
+        """Save a batch of samples to the disk.
+
         Parameters
         ----------
-        sample : D
-            The sample to save, batch-size 1.
+        samples : D
+            The samples to save.
         kwargs : dict
-            The keyword arguments used to generate the sample.
-        filename : Path
-            The file path where to save the sample, without extension.
+            The keyword arguments used to generate the samples.
+        dir : Path
+            The directory where to save the samples, without extension.
 
         Returns
         -------            
-        Path | None
-            The path to the saved sample file, None if failed.
+        bool
+            Whether the samples were saved successfully or not.
+
+        Notes
+        -----
+        You do not need to save all keyword arguments, only the ones that might be necessary for
+        evalation. For example, for Stable Diffusion, the encoder_hidden_states are not important,
+        but the prompts are.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_samples(self, dir: Path) -> tuple[D, dict]:
+        """Load a batch of samples from the disk, saved by `save_samples`.
+
+        Parameters
+        ----------
+        dir : Path
+            The directory from which to load the samples.
+
+        Returns
+        -------
+        tuple[D, dict] 
+            A tuple of the loaded samples and their corresponding keyword arguments.
         """
         raise NotImplementedError
 
@@ -150,13 +168,15 @@ class ProblemSetup(ABC, Generic[D]):
         """
         return {}
 
-    def compute_metrics(self, sample_files: list[SampleFile]) -> dict[str, float]:
-        """Compute relevant (global) metrics for the problem setup.
+    def compute_metrics(self, samples: D, kwargs: dict) -> dict[str, float]:
+        """Compute global metrics for the problem setup.
         
         Parameters
         ----------
-        sample_files : list[SampleFile]
-            List of files containing the samples to compute metrics on.
+        samples : D
+            The samples to compute metrics on.
+        kwargs : dict
+            The keyword arguments used to generate the samples.
 
         Returns
         -------
@@ -165,17 +185,19 @@ class ProblemSetup(ABC, Generic[D]):
         """
         return dict()
 
-    def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
+    def compute_sample_metrics(self, samples: D, kwargs: dict) -> list[dict[str, float]]:
         """Compute relevant metrics on individual samples.
 
         Parameters
         ----------
-        sample_files : list[SampleFile]
-            List of files containing the samples to compute metrics on.
+        samples : D
+            The samples to compute metrics on.
+        kwargs : dict
+            The keyword arguments used to generate the samples.
 
         Returns
         -------
-        dict[str, dict[str, float]]
-            A dictionary mapping sample names to their computed metrics.
+        list[dict[str, float]]
+            A list of dictionaries of computed metrics for each sample.
         """
-        return dict()
+        return [{} for _ in range(len(samples))]

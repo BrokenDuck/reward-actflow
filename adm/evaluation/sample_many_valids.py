@@ -4,10 +4,10 @@ import argparse
 import yaml
 from pathlib import Path
 from diffusiongym import DummyReward, construct_env
-import shutil
+from diffusiongym.utils import index_dict
 
 from adm.setups import setups as problem_setups
-from adm.utils import index_dict, Batch, setup_logger
+from adm.utils import Batch, setup_logger
 
 
 @torch.no_grad()
@@ -18,8 +18,7 @@ def main(args):
     exp_dir: Path = args.dir
 
     folder = exp_dir / args.samples_dir
-    samples_dir = folder / "samples"
-    samples_dir.mkdir(parents=True, exist_ok=True)
+    folder.mkdir(parents=True, exist_ok=False)
 
     with open(exp_dir / "args.yaml", "r") as f:
         exp_args = yaml.safe_load(f)
@@ -39,6 +38,8 @@ def main(args):
 
     eval_kwargs = problem_setup.eval_sampling_kwargs(args.n_samples)
     consecutive_all_invalid = 0
+
+    batches = []
 
     # We want `n_samples` valid samples
     is_valid_sampled = torch.zeros((args.n_samples,), dtype=torch.bool, device=device)
@@ -63,27 +64,17 @@ def main(args):
             sampling_kwargs = default_collate(kwargs_list)
 
         sample = env.sample(current_batch_size, pbar=False, **sampling_kwargs)
-        sample.valids = problem_setup.validity(sample.sample, sample.kwargs)
         batch = Batch.from_sample(sample)
-        batch.kwargs = dict_to_cpu(batch.kwargs)
-
-        n_valids = batch.valids.int().sum().item()
+        batch.valids = problem_setup.validity(batch.samples, batch.kwargs)
 
         for i, index in enumerate(indices):
             if not batch.valids[i]:
                 continue
 
-            file_path = samples_dir / f"{index:06d}"
-
-            # Save only valid samples
-            problem_setup.save_sample(
-                batch.samples[i],
-                index_dict(batch.kwargs, i),
-                file_path,
-            )
-            # Mark those kwargs as sampled
+            batches.append(batch[i])
             is_valid_sampled[index] = True
 
+        n_valids = batch.valids.int().sum().item()
         if n_valids == 0:
             consecutive_all_invalid += 1
         else:
@@ -100,22 +91,15 @@ def main(args):
             display_pct = (current_pct // 5) * 5
             logger.info(f"Progress: {display_pct}% ({n_valids_new}/{args.n_samples} valid samples)")
 
-    logger.info("Zipping samples...")
-    shutil.make_archive(str(samples_dir), "zip", samples_dir)
-
-    logger.info("Deleting unzipped samples...")
-    shutil.rmtree(samples_dir)
-
-
-def dict_to_cpu(d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    return {k: v.cpu() for k, v in d.items()}
+    batch = Batch.concat(batches)
+    problem_setup.save_samples(batch.samples, batch.kwargs, folder)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("dir", type=Path)
     parser.add_argument("--n_samples", type=int, required=True)
-    parser.add_argument("--samples_dir", type=Path, default=Path("final_samples"))
+    parser.add_argument("--samples_dir", type=Path, default=Path("eval_samples_valid"))
     parser.add_argument("--ckpt", type=Path, default=None)
     parser.add_argument("--batch_size", type=int, default=64)
     args = parser.parse_args()
