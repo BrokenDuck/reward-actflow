@@ -93,6 +93,9 @@ class TaskAgnosticConfig:
     ft_lr: float = 1e-4
     ft_weight_decay: float = 0.0
 
+    # Checkpointing
+    ckpt_every: int = 100
+
     # Sampling and evaluation
     eval_samples: int = 0
     eval_batch_size: int = 64
@@ -346,7 +349,14 @@ class TaskAgnostic(Generic[D]):
 
             # Save checkpoint
             with self._timer("checkpoint"):
-                torch.save(self.base_model.state_dict(), self.config.folder / "base_model.pt")
+                ckpt_dir = self.config.folder / "checkpoints"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+                state_dict = self.base_model.state_dict()
+                torch.save(state_dict, ckpt_dir / "last.pt")
+
+                if self.config.ckpt_every > 0 and i % self.config.ckpt_every == 0:
+                    torch.save(state_dict, ckpt_dir / f"ckpt_{i}.pt")
 
             # Write timings to CSV
             self._flush_timings(i)
@@ -405,6 +415,9 @@ def add_global_args(parser):
     parser.add_argument("--ft_accumulate_steps", type=int, default=1)
     parser.add_argument("--ft_lr", type=float, default=1e-4)
     parser.add_argument("--ft_weight_decay", type=float, default=0.0)
+
+    # Checkpointing
+    parser.add_argument("--ckpt_every", type=int, default=100)
 
     # Sampling
     parser.add_argument("--eval_samples", type=int, default=0)

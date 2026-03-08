@@ -30,7 +30,7 @@ def main(args):
 
     if args.ckpt is not None:
         logger.info(f"Loading model checkpoint from {args.ckpt}")
-        ckpt_path = exp_dir / args.ckpt
+        ckpt_path = exp_dir / "checkpoints" / args.ckpt
         state_dict = torch.load(ckpt_path, map_location=device)
         env.base_model.load_state_dict(state_dict)
 
