@@ -26,12 +26,13 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         self._base_model = ToyBaseModel(device=device)
         self.device = device
         self.validity_mode = args.get("validity_mode", "original")
+        self.N = 5
 
     @classmethod
     def add_args(cls, parser: ArgumentParser):
         parser.add_argument("--validity_mode", type=str, default="original",
                             choices=["original", "grid"],
-                            help="Validity function: 'original' (C-shape) or 'grid' (9x9 checkerboard)")
+                            help="Validity function: 'original' (C-shape) or 'grid' (NxN checkerboard)")
 
     @property
     def base_model(self) -> BaseModel[DDTensor]:
@@ -53,13 +54,14 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
 
     def _grid_validity(self, samples: DDTensor) -> torch.Tensor:
         xmin, xmax = -3.5, 3.5
-        cell_size = (xmax - xmin) / 9
+        N = 5
+        cell_size = (xmax - xmin) / N
         x = samples.data[:, 0]
         y = samples.data[:, 1]
 
         in_bounds = (x >= xmin) & (x < xmax) & (y >= xmin) & (y < xmax)
-        i = ((x - xmin) / cell_size).long().clamp(0, 8)
-        j = ((y - xmin) / cell_size).long().clamp(0, 8)
+        i = ((x - xmin) / cell_size).long().clamp(0, N - 1)
+        j = ((y - xmin) / cell_size).long().clamp(0, N - 1)
         checkerboard = (i + j) % 2 == 0
         return (in_bounds & checkerboard).bool()
 
@@ -156,7 +158,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
     def compute_metrics(self, samples: DDTensor, kwargs: dict) -> dict[str, float]:
         valid_data = samples.data[self.validity(samples, kwargs)]
         vendi_linear = score_X(valid_data)
-        
+
         length_scale = kwargs['vendi_lengthscale'] if 'vendi_lengthscale' in kwargs else 0.1
 
         kernel = gpytorch.kernels.RBFKernel()
@@ -164,7 +166,35 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         K = kernel(valid_data, valid_data).cpu().numpy()
         vendi_rbf = score_K(K)
 
-        return {'vendi_rbf': float(vendi_rbf), 'vendi_linear': float(vendi_linear)}
+        coverage = self._compute_coverage(valid_data, subgrid=100)
+
+        return {'vendi_rbf': float(vendi_rbf), 'vendi_linear': float(vendi_linear), 'coverage': float(coverage)}
+
+    def _compute_coverage(self, valid_data: torch.Tensor, subgrid: int = 100) -> float:
+        """Fraction of valid sub-cells that contain at least one sample."""
+        xmin, xmax = -3.5, 3.5
+        n = self.N * subgrid  # total sub-cells per axis
+
+        # Build the valid-cell mask once on a sub-grid
+        coords = torch.linspace(xmin, xmax, n + 1)
+        centers_x = (coords[:-1] + coords[1:]) / 2
+        centers_y = centers_x.clone()
+        CX, CY = torch.meshgrid(centers_x, centers_y, indexing="ij")
+        grid_pts = torch.stack([CX.flatten(), CY.flatten()], dim=-1)
+        valid_mask = self.validity(DDTensor(grid_pts), {}).reshape(n, n)
+        n_valid = valid_mask.sum().item()
+        if n_valid == 0:
+            return 0.0
+
+        # Bin the valid samples into the sub-grid
+        cell_size = (xmax - xmin) / n
+        ix = ((valid_data[:, 0] - xmin) / cell_size).long().clamp(0, n - 1)
+        iy = ((valid_data[:, 1] - xmin) / cell_size).long().clamp(0, n - 1)
+        occupied = torch.zeros(n, n, dtype=torch.bool)
+        occupied[ix.cpu(), iy.cpu()] = True
+
+        covered = (occupied & valid_mask.cpu()).sum().item()
+        return covered / n_valid
 
 
 
