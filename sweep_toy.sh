@@ -3,16 +3,22 @@
 #SBATCH --job-name=toy_sweep
 #SBATCH --time=04:00:00
 #SBATCH --mem-per-cpu=16G
-#SBATCH --array=0-35
+#SBATCH --array=0
 #SBATCH --gpus=rtx_2080:1
 #SBATCH --output=output/toy_sweep_%A_%a.out
 #SBATCH --error=output/toy_sweep_%A_%a.err
 
 
-DPS_WEIGHTS=(7.0 8.0 8.5 9.0 11.0 13.0)
+# DPS_WEIGHTS=(13.0 13.5 14.0 15.0)
+# GP_LENGTHSCALES=(0.05 0.08 0.1)
+# NUM_ITERS=(500)
+# FT_STEPS=(150 200 250)
+
+DPS_WEIGHTS=(13.0)
 GP_LENGTHSCALES=(0.1)
-NUM_ITERS=(2000)
-FT_STEPS=(20 50 70 100 130 150)
+NUM_ITERS=(4)
+FT_STEPS=(150)
+
 
 N_DPS=${#DPS_WEIGHTS[@]}
 N_FT=${#FT_STEPS[@]}
@@ -36,4 +42,5 @@ mkdir -p "$OUTDIR"
     --samples_per_iter 64 \
     --ft_batch_size 256 \
     --ft_steps "$FT_STEP" \
-    --eval_every 50
+    --eval_every 1
+    # --eval_every 50

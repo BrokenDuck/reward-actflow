@@ -102,6 +102,7 @@ class TaskAgnosticConfig:
     # Flags
     no_uncertainty: bool = False
     no_verifier: bool = False
+    plot_uncertainty: bool = False
 
     def __post_init__(self):
         # Create experiment directory if it doesn't exist
@@ -254,15 +255,18 @@ class TaskAgnostic(Generic[D]):
         )
 
     def visualize_iter(self, batch: Batch[D], iteration: int):
-        # Visualizing an iteration is problem-dependent
         fig = self.problem.visualize_sample(self.env, self.uncertainty, batch)
-
-        # Save frame
         directory = self.config.folder / "frames"
         directory.mkdir(parents=True, exist_ok=True)
-        fig_path = directory / f"{iteration:04d}.png"
-        fig.savefig(fig_path, dpi=300)
+        fig.savefig(directory / f"{iteration:04d}.png", dpi=300)
         plt.close(fig)
+
+        if self.config.plot_uncertainty and hasattr(self.problem, 'visualize_uncertainty'):
+            fig_unc = self.problem.visualize_uncertainty(self.uncertainty, batch)
+            unc_directory = self.config.folder / "uncertainty_frames"
+            unc_directory.mkdir(parents=True, exist_ok=True)
+            fig_unc.savefig(unc_directory / f"{iteration:04d}.png", dpi=300)
+            plt.close(fig_unc)
 
     @torch.no_grad()
     def eval_model(self, iteration: int) -> dict[str, float]:
@@ -288,7 +292,8 @@ class TaskAgnostic(Generic[D]):
         metrics["model_valid"] = batch.valids.float().mean().item()
 
         if hasattr(self.problem, 'compute_generable_coverage'):
-            metrics["generable_coverage"] = self.problem.compute_generable_coverage(self.env, n_samples=n)
+            metrics["generable_coverage"] = self.problem.compute_generable_coverage(
+                self.env, n_samples=n, save_dir=directory)
 
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
@@ -364,7 +369,25 @@ class TaskAgnostic(Generic[D]):
             fps=self.config.video_fps,
         )
 
+        if self.config.plot_uncertainty:
+            write_video(
+                sorted(self.config.folder.glob("uncertainty_frames/*.png")),
+                self.config.folder / "uncertainty_video.mp4",
+                fps=self.config.video_fps,
+            )
+
+        self._save_eval_history(eval_history)
         self._plot_eval_curves(eval_history)
+
+    def _save_eval_history(self, eval_history: list[dict]):
+        if not eval_history:
+            return
+        path = self.config.folder / "eval_history.csv"
+        keys = list(eval_history[0].keys())
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(eval_history)
 
     def _plot_eval_curves(self, eval_history: list[dict]):
         if not eval_history:
@@ -426,6 +449,7 @@ def add_global_args(parser):
     # Baselines
     parser.add_argument("--no_uncertainty", action="store_true")
     parser.add_argument("--no_verifier", action="store_true")
+    parser.add_argument("--plot_uncertainty", action="store_true")
 
     # Exploration sampling
     parser.add_argument("--num_iters", type=int, default=1000)

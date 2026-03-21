@@ -108,29 +108,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         uncertainty: UncertaintyEstimator[DDTensor],
         batch: Batch[DDTensor],
     ) -> Figure:
-        xmin = -3.5
-        xmax = 3.5
-
-        x = torch.linspace(xmin, xmax, 100)
-        y = torch.linspace(xmin, xmax, 100)
-        X, Y = torch.meshgrid(x, y, indexing="ij")
-        XY = torch.stack([X.flatten(), Y.flatten()], dim=-1)
-        Z, _ = uncertainty(DDTensor(XY).to(self.device), DDTensor(XY).to(self.device)) 
-        Z = Z.reshape(X.shape) 
-
-        fig, axes = plt.subplots(1, 2, figsize=(6, 3), constrained_layout=True)
-        im = axes[0].imshow(Z.T.cpu(), extent=(xmin, xmax, xmin, xmax), origin="lower", cmap="YlGn", aspect="equal") 
-        axes[0].set_title("Uncertainty") 
-        fig.colorbar(im, ax=axes[0], shrink=0.8)
-
-        data = batch.samples.data
-        valid = batch.valids
-
-        axes[0].scatter(data[valid][:, 0].cpu(), data[valid][:, 1].cpu(), s=2, alpha=1.0)
-        axes[0].scatter(data[~valid][:, 0].cpu(), data[~valid][:, 1].cpu(), s=2, alpha=1.0)
-
-        axes[0].set_xlim(xmin, xmax)
-        axes[0].set_ylim(xmin, xmax)
+        xmin, xmax = -3.5, 3.5
 
         many_samples = env.sample(50_000, pbar=False).sample.data
         H, _, _ = np.histogram2d(
@@ -142,17 +120,53 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         )
         support = H >= self.support_epsilon
 
-        axes[1].imshow(
+        fig, ax = plt.subplots(figsize=(4, 4), constrained_layout=True)
+        ax.imshow(
             support.T,
             extent=(xmin, xmax, xmin, xmax),
             origin="lower",
             cmap="binary",
         )
-        axes[1].set_title(f"Generable Set (p >= {self.support_epsilon})")
+        ax.set_title(f"Generable Set (p >= {self.support_epsilon})")
+
+        x = torch.linspace(xmin, xmax, 100)
+        y = torch.linspace(xmin, xmax, 100)
+        X, Y = torch.meshgrid(x, y, indexing="ij")
+        XY = torch.stack([X.flatten(), Y.flatten()], dim=-1)
+        V = self.validity(DDTensor(XY), {}).reshape(X.shape)
+        ax.contour(X.cpu(), Y.cpu(), V.cpu(), levels=[0.5], colors="black", alpha=0.3)
+
+        return fig
+
+    @torch.no_grad()
+    def visualize_uncertainty(
+        self,
+        uncertainty: UncertaintyEstimator[DDTensor],
+        batch: Batch[DDTensor],
+    ) -> Figure:
+        xmin, xmax = -3.5, 3.5
+
+        x = torch.linspace(xmin, xmax, 100)
+        y = torch.linspace(xmin, xmax, 100)
+        X, Y = torch.meshgrid(x, y, indexing="ij")
+        XY = torch.stack([X.flatten(), Y.flatten()], dim=-1)
+        Z, _ = uncertainty(DDTensor(XY).to(self.device), DDTensor(XY).to(self.device))
+        Z = Z.reshape(X.shape)
+
+        fig, ax = plt.subplots(figsize=(4, 4), constrained_layout=True)
+        im = ax.imshow(Z.T.cpu(), extent=(xmin, xmax, xmin, xmax), origin="lower", cmap="YlGn", aspect="equal")
+        ax.set_title("Uncertainty")
+        fig.colorbar(im, ax=ax, shrink=0.8)
+
+        data = batch.samples.data
+        valid = batch.valids
+        ax.scatter(data[valid][:, 0].cpu(), data[valid][:, 1].cpu(), s=2, alpha=1.0)
+        ax.scatter(data[~valid][:, 0].cpu(), data[~valid][:, 1].cpu(), s=2, alpha=1.0)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(xmin, xmax)
 
         V = self.validity(DDTensor(XY), {}).reshape(X.shape)
-        for i in range(2):
-            axes[i].contour(X.cpu(), Y.cpu(), V.cpu(), levels=[0.5], colors="black", alpha=0.3)
+        ax.contour(X.cpu(), Y.cpu(), V.cpu(), levels=[0.5], colors="black", alpha=0.3)
 
         return fig
 
@@ -205,8 +219,9 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
 
     @torch.no_grad()
     def compute_generable_coverage(self, env: Environment[DDTensor],
-                                   n_samples: int = 50_000, bins: int = 100) -> float:
-        """Fraction of valid cells covered by the generable set (density >= SUPPORT_EPSILON)."""
+                                   n_samples: int = 50_000, bins: int = 100,
+                                   save_dir: Optional[Path] = None) -> float:
+        """Fraction of valid cells covered by the generable set (density >= support_epsilon)."""
         xmin, xmax = -3.5, 3.5
 
         samples = env.sample(n_samples, pbar=False).sample.data
@@ -224,6 +239,12 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         CX, CY = torch.meshgrid(cx, cy, indexing="ij")
         grid_pts = torch.stack([CX.flatten(), CY.flatten()], dim=-1)
         valid_mask = self.validity(DDTensor(grid_pts), {}).reshape(bins, bins).cpu().numpy()
+
+        if save_dir is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            np.savez(save_dir / "generable_set.npz",
+                     support=generable, valid_mask=valid_mask,
+                     xmin=xmin, xmax=xmax, epsilon=self.support_epsilon)
 
         n_valid = valid_mask.sum()
         if n_valid == 0:
