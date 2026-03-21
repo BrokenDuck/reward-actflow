@@ -13,7 +13,7 @@ mkdir -p "$OUTDIR"
 
 .pixi/envs/default/bin/python -m adm.task_agnostic toy gp \
     --dir "$OUTDIR" \
-    --validity_mode grid \
+    --validity_mode grid3 \
     --no_uncertainty \
     --eval_samples 24000 \
     --eval_batch_size 24000 \

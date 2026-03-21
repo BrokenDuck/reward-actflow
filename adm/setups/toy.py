@@ -19,27 +19,34 @@ from vendi_score.vendi import score_K, score_X
 import gpytorch
 
 class ToyProblemSetup(ProblemSetup[DDTensor]):
+    support_epsilon = 0.01
+
     def __init__(self, args: dict[str, Any], device: Optional[torch.device]=None):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self._base_model = ToyBaseModel(device=device)
         self.device = device
-        self.validity_mode = args.get("validity_mode", "original")
-        self.N = 5
+        self.validity_mode = args.get("validity_mode", "grid3")
+        if self.validity_mode == "grid3":
+            self.N = 3
+        elif self.validity_mode == "grid5":
+            self.N = 5
+        else:
+            self.N = 3
 
     @classmethod
     def add_args(cls, parser: ArgumentParser):
-        parser.add_argument("--validity_mode", type=str, default="original",
-                            choices=["original", "grid"],
-                            help="Validity function: 'original' (C-shape) or 'grid' (NxN checkerboard)")
+        parser.add_argument("--validity_mode", type=str, default="grid3",
+                            choices=["original", "grid3", "grid5"],
+                            help="Validity function: 'original' (C-shape), 'grid3' (3x3 checkerboard), 'grid5' (5x5 checkerboard).")
 
     @property
     def base_model(self) -> BaseModel[DDTensor]:
         return self._base_model
 
-    def validity(self, samples: DDTensor, kwargs: dict[str, Any]) -> torch.Tensor: # TODO move validity mode to kwargs
-        if self.validity_mode == "grid":
+    def validity(self, samples: DDTensor, kwargs: dict[str, Any]) -> torch.Tensor:
+        if self.validity_mode in ("grid3", "grid5"):
             return self._grid_validity(samples)
         return self._original_validity(samples)
 
@@ -54,7 +61,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
 
     def _grid_validity(self, samples: DDTensor) -> torch.Tensor:
         xmin, xmax = -3.5, 3.5
-        N = 5
+        N = self.N
         cell_size = (xmax - xmin) / N
         x = samples.data[:, 0]
         y = samples.data[:, 1]
@@ -133,7 +140,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
             density=True,
             range=[[xmin, xmax], [xmin, xmax]],
         )
-        support = H >= 0.01
+        support = H >= self.support_epsilon
 
         axes[1].imshow(
             support.T,
@@ -141,7 +148,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
             origin="lower",
             cmap="binary",
         )
-        axes[1].set_title(r"Model Support (p >= 0.01)")
+        axes[1].set_title(f"Generable Set (p >= {self.support_epsilon})")
 
         V = self.validity(DDTensor(XY), {}).reshape(X.shape)
         for i in range(2):
@@ -196,6 +203,33 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         covered = (occupied & valid_mask.cpu()).sum().item()
         return covered / n_valid
 
+    @torch.no_grad()
+    def compute_generable_coverage(self, env: Environment[DDTensor],
+                                   n_samples: int = 50_000, bins: int = 100) -> float:
+        """Fraction of valid cells covered by the generable set (density >= SUPPORT_EPSILON)."""
+        xmin, xmax = -3.5, 3.5
+
+        samples = env.sample(n_samples, pbar=False).sample.data
+        H, xedges, yedges = np.histogram2d(
+            samples[:, 0].cpu().numpy(),
+            samples[:, 1].cpu().numpy(),
+            bins=bins,
+            density=True,
+            range=[[xmin, xmax], [xmin, xmax]],
+        )
+        generable = H >= self.support_epsilon
+
+        cx = torch.tensor((xedges[:-1] + xedges[1:]) / 2, dtype=torch.float32)
+        cy = torch.tensor((yedges[:-1] + yedges[1:]) / 2, dtype=torch.float32)
+        CX, CY = torch.meshgrid(cx, cy, indexing="ij")
+        grid_pts = torch.stack([CX.flatten(), CY.flatten()], dim=-1)
+        valid_mask = self.validity(DDTensor(grid_pts), {}).reshape(bins, bins).cpu().numpy()
+
+        n_valid = valid_mask.sum()
+        if n_valid == 0:
+            return 0.0
+
+        return float((generable & valid_mask).sum() / n_valid)
 
 
 class XReward(Reward[DDTensor]):

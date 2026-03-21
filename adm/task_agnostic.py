@@ -286,6 +286,10 @@ class TaskAgnostic(Generic[D]):
         # Compute and save evaluation metrics
         metrics = self.problem.compute_metrics(batch.samples, batch.kwargs)
         metrics["model_valid"] = batch.valids.float().mean().item()
+
+        if hasattr(self.problem, 'compute_generable_coverage'):
+            metrics["generable_coverage"] = self.problem.compute_generable_coverage(self.env, n_samples=n)
+
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
 
@@ -295,6 +299,7 @@ class TaskAgnostic(Generic[D]):
         metrics = dict()
         batches: list[Batch[D]] = []
         total_valid_samples = 0
+        eval_history: list[dict] = []
 
         for i in range(num_iterations):
             # Evaluate current model state
@@ -302,6 +307,7 @@ class TaskAgnostic(Generic[D]):
                 metrics = {}
                 if i % self.config.eval_every == 0:
                     metrics = self.eval_model(i)
+                    eval_history.append({"iteration": i, **metrics})
 
             # Determine if we should use uncertainty guidance
             has_enough_data = total_valid_samples > self.config.ft_min_dataset_size
@@ -325,7 +331,8 @@ class TaskAgnostic(Generic[D]):
 
             # Logging and visualization
             with self._timer("visualize"):
-                self.visualize_iter(batch, i)
+                if i % self.config.eval_every == 0:
+                    self.visualize_iter(batch, i)
 
                 with torch.no_grad():
                     _, uncert = self.uncertainty.mean_and_uncertainty(batch.latents, **batch.kwargs)
@@ -356,6 +363,38 @@ class TaskAgnostic(Generic[D]):
             self.config.folder / "video.mp4",
             fps=self.config.video_fps,
         )
+
+        self._plot_eval_curves(eval_history)
+
+    def _plot_eval_curves(self, eval_history: list[dict]):
+        if not eval_history:
+            return
+
+        iters = [h["iteration"] for h in eval_history]
+
+        if "model_valid" in eval_history[0]:
+            validity = [h["model_valid"] * 100 for h in eval_history]
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(iters, validity, marker="o", color="steelblue")
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel("Validity (%)")
+            ax.set_ylim(0, 105)
+            ax.grid(True)
+            fig.tight_layout()
+            fig.savefig(self.config.folder / "validity_curve.png", dpi=150)
+            plt.close(fig)
+
+        if "generable_coverage" in eval_history[0]:
+            coverage = [h["generable_coverage"] * 100 for h in eval_history]
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(iters, coverage, marker="o", color="seagreen")
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel("Generable Coverage (%)")
+            ax.set_ylim(0, 105)
+            ax.grid(True)
+            fig.tight_layout()
+            fig.savefig(self.config.folder / "coverage_curve.png", dpi=150)
+            plt.close(fig)
 
 
 def build_parser():

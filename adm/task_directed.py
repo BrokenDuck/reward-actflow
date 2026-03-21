@@ -331,7 +331,8 @@ class TaskDirected(Generic[D]):
 
             # Logging and visualization
             with self._timer("visualize"):
-                self.visualize_iter(batch, i)
+                if i % self.config.eval_every == 0:
+                    self.visualize_iter(batch, i)
 
                 with torch.no_grad():
                     mean, uncert = self.uncertainty.mean_and_uncertainty(batch.latents, **batch.kwargs)
