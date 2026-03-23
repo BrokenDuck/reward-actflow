@@ -9,23 +9,24 @@
 #SBATCH --error=output/toy_sweep_%A_%a.err
 
 
-# DPS_WEIGHTS=(13.0 13.5 14.0 15.0)
-# GP_LENGTHSCALES=(0.05 0.08 0.1)
-# NUM_ITERS=(500)
-# FT_STEPS=(150 200 250)
-
 DPS_WEIGHTS=(13.0)
-GP_LENGTHSCALES=(0.1)
-NUM_ITERS=(4)
-FT_STEPS=(150)
+GP_LENGTHSCALES=(0.8 0.1)
+NUM_ITERS=(501)
+FT_STEPS=(250 300 350)
+
+# DPS_WEIGHTS=(20.0)
+# GP_LENGTHSCALES=(0.1)
+# NUM_ITERS=(50)
+# FT_STEPS=(150)
 
 
 N_DPS=${#DPS_WEIGHTS[@]}
+N_LS=${#GP_LENGTHSCALES[@]}
 N_FT=${#FT_STEPS[@]}
 
-DPS=${DPS_WEIGHTS[$((SLURM_ARRAY_TASK_ID / N_FT))]}
+DPS=${DPS_WEIGHTS[$((SLURM_ARRAY_TASK_ID / (N_LS * N_FT)))]}
+LS=${GP_LENGTHSCALES[$(( (SLURM_ARRAY_TASK_ID / N_FT) % N_LS ))]}
 FT_STEP=${FT_STEPS[$((SLURM_ARRAY_TASK_ID % N_FT))]}
-LS=${GP_LENGTHSCALES[0]}
 
 OUTDIR=/cluster/scratch/$USER/toy_sweep/dps_${DPS}_ls_${LS}_num_iters_${NUM_ITERS}_ft_steps_${FT_STEP}
 mkdir -p "$OUTDIR"
@@ -36,11 +37,11 @@ mkdir -p "$OUTDIR"
     --dps_weight "$DPS" \
     --gp_lengthscale "$LS" \
     --num_iters "$NUM_ITERS" \
-    --eval_samples 3000 \
-    --eval_batch_size 3000 \
+    --eval_samples 50000 \
+    --eval_samples_curves 3000 \
+    --eval_batch_size 50000 \
     --sample_batch_size 512 \
     --samples_per_iter 64 \
     --ft_batch_size 256 \
     --ft_steps "$FT_STEP" \
-    --eval_every 1
-    # --eval_every 50
+    --eval_every 50

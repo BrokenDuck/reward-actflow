@@ -95,6 +95,7 @@ class TaskAgnosticConfig:
 
     # Sampling and evaluation
     eval_samples: int = 0
+    eval_samples_curves: int = 0
     eval_batch_size: int = 64
     eval_every: int = 10
     video_fps: int = 4
@@ -254,8 +255,20 @@ class TaskAgnostic(Generic[D]):
             [b.kwargs for b in batches],
         )
 
-    def visualize_iter(self, batch: Batch[D], iteration: int):
-        fig = self.problem.visualize_sample(self.env, self.uncertainty, batch)
+    def visualize_iter(self, batch: Batch[D], iteration: int) -> dict[str, float]:
+        save_dir = self.config.folder / "eval" / f"{iteration:04d}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        result = self.problem.visualize_sample(
+            self.env, self.uncertainty, batch,
+            n_samples=self.config.eval_samples,
+            save_dir=save_dir,
+        )
+        if isinstance(result, tuple):
+            fig, vis_metrics = result
+        else:
+            fig, vis_metrics = result, {}
+
         directory = self.config.folder / "frames"
         directory.mkdir(parents=True, exist_ok=True)
         fig.savefig(directory / f"{iteration:04d}.png", dpi=300)
@@ -268,9 +281,11 @@ class TaskAgnostic(Generic[D]):
             fig_unc.savefig(unc_directory / f"{iteration:04d}.png", dpi=300)
             plt.close(fig_unc)
 
+        return vis_metrics
+
     @torch.no_grad()
     def eval_model(self, iteration: int) -> dict[str, float]:
-        n = self.config.eval_samples
+        n = self.config.eval_samples_curves if self.config.eval_samples_curves > 0 else self.config.eval_samples
         bs = self.config.eval_batch_size
 
         if n <= 0:
@@ -291,10 +306,6 @@ class TaskAgnostic(Generic[D]):
         metrics = self.problem.compute_metrics(batch.samples, batch.kwargs)
         metrics["model_valid"] = batch.valids.float().mean().item()
 
-        if hasattr(self.problem, 'compute_generable_coverage'):
-            metrics["generable_coverage"] = self.problem.compute_generable_coverage(
-                self.env, n_samples=n, save_dir=directory)
-
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
 
@@ -312,7 +323,6 @@ class TaskAgnostic(Generic[D]):
                 metrics = {}
                 if i % self.config.eval_every == 0:
                     metrics = self.eval_model(i)
-                    eval_history.append({"iteration": i, **metrics})
 
             # Determine if we should use uncertainty guidance
             has_enough_data = total_valid_samples > self.config.ft_min_dataset_size
@@ -337,7 +347,9 @@ class TaskAgnostic(Generic[D]):
             # Logging and visualization
             with self._timer("visualize"):
                 if i % self.config.eval_every == 0:
-                    self.visualize_iter(batch, i)
+                    vis_metrics = self.visualize_iter(batch, i)
+                    metrics.update(vis_metrics)
+                    eval_history.append({"iteration": i, **metrics})
 
                 with torch.no_grad():
                     _, uncert = self.uncertainty.mean_and_uncertainty(batch.latents, **batch.kwargs)
@@ -471,6 +483,7 @@ def add_global_args(parser):
 
     # Sampling
     parser.add_argument("--eval_samples", type=int, default=0)
+    parser.add_argument("--eval_samples_curves", type=int, default=0)
     parser.add_argument("--eval_batch_size", type=int, default=64)
     parser.add_argument("--eval_every", type=int, default=10)
 

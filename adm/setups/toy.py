@@ -107,19 +107,45 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         env: Environment[DDTensor],
         uncertainty: UncertaintyEstimator[DDTensor],
         batch: Batch[DDTensor],
-    ) -> Figure:
+        n_samples: int = 50_000,
+        save_dir: Optional[Path] = None,
+    ) -> tuple[Figure, dict[str, float]]:
         xmin, xmax = -3.5, 3.5
+        bins = 100
 
-        many_samples = env.sample(50_000, pbar=False).sample.data
-        H, _, _ = np.histogram2d(
-            many_samples[:, 0].cpu().numpy(),
-            many_samples[:, 1].cpu().numpy(),
-            bins=100,
+        samples = env.sample(n_samples, pbar=False).sample.data
+        H, xedges, yedges = np.histogram2d(
+            samples[:, 0].cpu().numpy(),
+            samples[:, 1].cpu().numpy(),
+            bins=bins,
             density=True,
             range=[[xmin, xmax], [xmin, xmax]],
         )
         support = H >= self.support_epsilon
 
+        x = torch.linspace(xmin, xmax, bins)
+        y = torch.linspace(xmin, xmax, bins)
+        X, Y = torch.meshgrid(x, y, indexing="ij")
+        XY = torch.stack([X.flatten(), Y.flatten()], dim=-1)
+        V = self.validity(DDTensor(XY), {}).reshape(X.shape)
+
+        # Compute generable coverage
+        cx = torch.tensor((xedges[:-1] + xedges[1:]) / 2, dtype=torch.float32)
+        cy = torch.tensor((yedges[:-1] + yedges[1:]) / 2, dtype=torch.float32)
+        CX, CY = torch.meshgrid(cx, cy, indexing="ij")
+        grid_pts = torch.stack([CX.flatten(), CY.flatten()], dim=-1)
+        valid_mask = self.validity(DDTensor(grid_pts), {}).reshape(bins, bins).cpu().numpy()
+
+        n_valid = valid_mask.sum()
+        generable_coverage = float((support & valid_mask).sum() / n_valid) if n_valid > 0 else 0.0
+
+        if save_dir is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            np.savez(save_dir / "generable_set.npz",
+                     support=support, valid_mask=valid_mask,
+                     xmin=xmin, xmax=xmax, epsilon=self.support_epsilon)
+
+        # Plot
         fig, ax = plt.subplots(figsize=(4, 4), constrained_layout=True)
         ax.imshow(
             support.T,
@@ -128,15 +154,9 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
             cmap="binary",
         )
         ax.set_title(f"Generable Set (p >= {self.support_epsilon})")
-
-        x = torch.linspace(xmin, xmax, 100)
-        y = torch.linspace(xmin, xmax, 100)
-        X, Y = torch.meshgrid(x, y, indexing="ij")
-        XY = torch.stack([X.flatten(), Y.flatten()], dim=-1)
-        V = self.validity(DDTensor(XY), {}).reshape(X.shape)
         ax.contour(X.cpu(), Y.cpu(), V.cpu(), levels=[0.5], colors="black", alpha=0.3)
 
-        return fig
+        return fig, {"generable_coverage": generable_coverage}
 
     @torch.no_grad()
     def visualize_uncertainty(
@@ -216,42 +236,6 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
 
         covered = (occupied & valid_mask.cpu()).sum().item()
         return covered / n_valid
-
-    @torch.no_grad()
-    def compute_generable_coverage(self, env: Environment[DDTensor],
-                                   n_samples: int = 50_000, bins: int = 100,
-                                   save_dir: Optional[Path] = None) -> float:
-        """Fraction of valid cells covered by the generable set (density >= support_epsilon)."""
-        xmin, xmax = -3.5, 3.5
-
-        samples = env.sample(n_samples, pbar=False).sample.data
-        H, xedges, yedges = np.histogram2d(
-            samples[:, 0].cpu().numpy(),
-            samples[:, 1].cpu().numpy(),
-            bins=bins,
-            density=True,
-            range=[[xmin, xmax], [xmin, xmax]],
-        )
-        generable = H >= self.support_epsilon
-
-        cx = torch.tensor((xedges[:-1] + xedges[1:]) / 2, dtype=torch.float32)
-        cy = torch.tensor((yedges[:-1] + yedges[1:]) / 2, dtype=torch.float32)
-        CX, CY = torch.meshgrid(cx, cy, indexing="ij")
-        grid_pts = torch.stack([CX.flatten(), CY.flatten()], dim=-1)
-        valid_mask = self.validity(DDTensor(grid_pts), {}).reshape(bins, bins).cpu().numpy()
-
-        if save_dir is not None:
-            save_dir.mkdir(parents=True, exist_ok=True)
-            np.savez(save_dir / "generable_set.npz",
-                     support=generable, valid_mask=valid_mask,
-                     xmin=xmin, xmax=xmax, epsilon=self.support_epsilon)
-
-        n_valid = valid_mask.sum()
-        if n_valid == 0:
-            return 0.0
-
-        return float((generable & valid_mask).sum() / n_valid)
-
 
 class XReward(Reward[DDTensor]):
     def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
