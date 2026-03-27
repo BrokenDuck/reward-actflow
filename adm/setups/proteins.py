@@ -1,4 +1,4 @@
-from typing import Any, Sequence, List
+from typing import Any, Sequence
 from argparse import ArgumentParser
 from importlib_resources import files
 from pathlib import Path
@@ -22,7 +22,9 @@ from diffusiongym.schedulers import Scheduler, NoiseSchedule
 from diffusiongym.environments import Environment
 from diffusiongym.utils import append_dims
 
-from adm.setups.problem_setup import ProblemSetup, SampleFile, Batch
+from adm.setups.problem_setup import ProblemSetup
+from adm.uncertainty import UncertaintyEstimator
+from adm.utils import Batch
 import sgpo
 from sgpo.oracle.train_oracle import OracleModel
 
@@ -365,7 +367,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         return data.mean(dim=-1)
 
 
-    def visualize_sample(self, env: Environment[DDTensor], batch: Batch[DDTensor]) -> Figure:
+    def visualize_sample(self, env: Environment[DDTensor], uncertainty: UncertaintyEstimator[DDTensor], batch: Batch[DDTensor]) -> Figure:
         """Produce a matplotlib figure for visualizing the sample in the problem setup.
 
         Parameters
@@ -381,20 +383,13 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         return fig
     
 
-    def save_sample(self, sample: DDTensor, kwargs: dict[str, Any], filename: Path) -> Path | None:
-        """Save a *single* sample to the disk.
-        
-        Parameters
-        ----------
-        sample : D
-            The sample to save, batch-size 1.
-        kwargs : dict
-            The keyword arguments used to generate the sample.
-        filename : Path
-            The file path where to save the sample, without extension.
-        """
-        torch.save(sample.data.clone(), f'{filename}.pt')
-        return Path(f'{filename}.pt')
+    def save_samples(self, samples: DDTensor, kwargs: dict, dir: Path) -> bool:
+        torch.save(samples.data.clone(), dir / "samples.pt")
+        return True
+
+    def load_samples(self, dir: Path) -> tuple[DDTensor, dict]:
+        data = torch.load(dir / "samples.pt", map_location="cpu")
+        return DDTensor(data), {}
 
 
     def eval_sampling_kwargs(self, n: int) -> dict[str, Any]:
@@ -413,28 +408,8 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         return {}
     
 
-    def compute_metrics(self, sample_files: List[SampleFile]) -> dict[str, float]:
-        """Compute relevant (global) metrics for the problem setup.
-
-        Parameters
-        ----------
-        batch : Batch[D]
-            The batch.
-
-        Returns
-        -------
-        dict[str, float]
-            A dictionary of computed metrics.
-        """
-
-        names = []
-        samples = []
-        for sf in sample_files:
-            data = torch.load(sf.file, map_location='cpu')
-            samples.append(data)
-            names.append(sf.file.stem)
-        
-        probs = torch.vstack(samples).float()
+    def compute_metrics(self, samples: DDTensor, kwargs: dict) -> dict[str, float]:
+        probs = samples.data.float()
         esm_embeds = self.base_model.probs_to_embedding(DDTensor(probs)).data
 
         X = esm_embeds.mean(dim=1)
@@ -467,17 +442,5 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         return {"vendi": float(vendi_score_val), "shannon_entropy": shannon}
     
 
-    def compute_sample_metrics(self, sample_files: list[SampleFile]) -> dict[str, dict[str, float]]:
-        """Compute relevant metrics on individual samples.
-
-        Parameters
-        ----------
-        sample_files : list[SampleFile]
-            List of files containing the samples to compute metrics on.
-
-        Returns
-        -------
-        dict[str, dict[str, float]]
-            A dictionary mapping sample names to their computed metrics.
-        """
-        return dict()
+    def compute_sample_metrics(self, samples: DDTensor, kwargs: dict) -> list[dict[str, float]]:
+        return [{} for _ in range(len(samples.data))]

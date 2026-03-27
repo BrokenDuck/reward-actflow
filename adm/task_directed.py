@@ -54,7 +54,7 @@ def main(args):
     uncertainty = uncertainty_estimators[args.uncertainty_estimator](
         feat_extractor,
         feat_dim=feat.shape[1],
-        mean_weight=args.mean_weight,
+        beta=args.beta,
         device=device,
         args=vars(args),
     )
@@ -92,7 +92,7 @@ class TaskDirectedConfig:
 
     # Uncertainty reward and uncertainty sampling algorithm
     dps_weight: float = 100.0
-    mean_weight: float = 1.0
+    beta: float = 0.5
     
     # Fine-tuning
     ft_min_dataset_size: int = 64
@@ -107,6 +107,9 @@ class TaskDirectedConfig:
     eval_batch_size: int = 64
     eval_every: int = 10
     video_fps: int = 4
+
+    # Flags
+    no_uncertainty: bool = False
 
     def __post_init__(self):
         # Create experiment directory if it doesn't exist
@@ -311,7 +314,7 @@ class TaskDirected(Generic[D]):
 
             # Determine if we should use uncertainty guidance
             has_enough_data = total_valid_samples > self.config.ft_min_dataset_size
-            use_guidance = has_enough_data
+            use_guidance = has_enough_data and not self.config.no_uncertainty
 
             # Collect new samples
             with self._timer("sampling"):
@@ -349,7 +352,8 @@ class TaskDirected(Generic[D]):
                     self.finetune_base_model(batches, pbar=False)
 
             with self._timer("uncertainty_update"):
-                self.update_uncertainty_estimator(batches)
+                if not self.config.no_uncertainty:
+                    self.update_uncertainty_estimator(batches)
 
             # Save checkpoint
             with self._timer("checkpoint"):
@@ -397,6 +401,7 @@ def add_global_args(parser):
     )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--no_uncertainty", action="store_true")
 
     # Exploration sampling
     parser.add_argument("--num_iters", type=int, default=1000)
@@ -407,7 +412,7 @@ def add_global_args(parser):
     # Uncertainty estimator
     parser.add_argument("--feat_timestep", type=float, default=0.9)
     parser.add_argument("--dps_weight", type=float, default=100)
-    parser.add_argument("--mean_weight", type=float, default=1.0)
+    parser.add_argument("--beta", type=float, default=0.5)
 
     # Fine-tuning
     parser.add_argument("--ft_min_dataset_size", type=int, default=64)

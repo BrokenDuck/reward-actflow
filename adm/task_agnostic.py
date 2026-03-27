@@ -61,7 +61,7 @@ def main(args):
     uncertainty = uncertainty_estimators[args.uncertainty_estimator](
         feat_extractor,
         feat_dim=feat.shape[1],
-        mean_weight=0,
+        beta=1,
         device=device,
         args=vars(args),
     )

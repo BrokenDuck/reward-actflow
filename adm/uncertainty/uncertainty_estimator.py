@@ -105,7 +105,7 @@ class UncertaintyEstimator(Reward[D]):
         self,
         feat_extractor: FlowFeatureExtractor[D],
         feat_dim: int,
-        mean_weight: float = 0.0,
+        beta: float = 1.0,
         device: Optional[torch.device | str] = None,
         args: dict[str, Any] = {},
     ):
@@ -114,7 +114,7 @@ class UncertaintyEstimator(Reward[D]):
 
         self.feat_extractor = feat_extractor
         self.feat_dim = feat_dim
-        self.mean_weight = mean_weight
+        self.beta = beta
         self.device = device
         self.args = args
 
@@ -207,4 +207,4 @@ class UncertaintyEstimator(Reward[D]):
 
     def __call__(self, sample: D | None, latent: D, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         mean, uncertainty = self.mean_and_uncertainty(latent, **kwargs)
-        return self.mean_weight * mean + uncertainty, torch.ones(len(latent), dtype=torch.bool)
+        return (1 - self.beta) * mean + self.beta * uncertainty, torch.ones(len(latent), dtype=torch.bool)
