@@ -16,8 +16,8 @@ def load_metrics(path):
                 return yaml.safe_load(fh)
     return None
 
-BASELINE = Path("/cluster/scratch/kprotopapas/baseline")
-BASELINE_NO_VALID = Path("/cluster/scratch/kprotopapas/baseline_no_valid")
+BASELINE_WITH_FILTER = Path("/cluster/scratch/kprotopapas/baseline_with_filter")
+BASELINE_NO_FILTER = Path("/cluster/scratch/kprotopapas/baseline_no_filter")
 
 def to_point(metrics, label):
     return {
@@ -28,8 +28,8 @@ def to_point(metrics, label):
         "vendi_rbf": metrics["vendi_rbf"],
     }
 
-baseline_pt = to_point(load_metrics(BASELINE), "baseline")
-baseline_nv_pt = to_point(load_metrics(BASELINE_NO_VALID), "baseline_no_valid")
+baseline_pt = to_point(load_metrics(BASELINE_WITH_FILTER), "baseline_with_filter")
+baseline_nv_pt = to_point(load_metrics(BASELINE_NO_FILTER), "baseline_no_filter")
 
 points = []
 iter0_metrics = []
@@ -124,7 +124,7 @@ for col, (vendi_key, xlabel) in enumerate([
         ax.plot(px, py, color="steelblue", linewidth=1.5, label="_nolegend_")
 
         ax.scatter(norm_vendi[id(baseline_pt)], norm_y[id(baseline_pt)],
-                   color="tomato", marker="*", s=150, zorder=5, label="baseline")
+                   color="tomato", marker="*", s=150, zorder=5, label="baseline_with_filter")
         ax.scatter(norm_vendi[id(baseline_nv_pt)], norm_y[id(baseline_nv_pt)],
                    color="darkorange", marker="*", s=150, zorder=5, label="baseline (no verifier)")
         ax.scatter(norm_vendi[id(pretrained_pt)], norm_y[id(pretrained_pt)],

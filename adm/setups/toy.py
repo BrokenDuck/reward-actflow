@@ -25,7 +25,9 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self._base_model = ToyBaseModel(device=device)
+        initial_model_invalid = args.get("initial_model_invalid", "false") == "true"
+        data_mean = torch.tensor([-1.0, 0.0]) if initial_model_invalid else torch.zeros((2,))
+        self._base_model = ToyBaseModel(device=device, data_mean=data_mean)
         self.device = device
         self.validity_mode = args.get("validity_mode", "grid3")
         if self.validity_mode == "grid3":
@@ -40,6 +42,9 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         parser.add_argument("--validity_mode", type=str, default="grid3",
                             choices=["original", "grid3", "grid5"],
                             help="Validity function: 'original' (C-shape), 'grid3' (3x3 checkerboard), 'grid5' (5x5 checkerboard).")
+        parser.add_argument("--initial_model_invalid", type=str, default="false",
+                            choices=["true", "false"],
+                            help="Set to 'true' to center initial model at (-1,0) instead of origin.")
 
     @property
     def base_model(self) -> BaseModel[DDTensor]:
@@ -246,14 +251,15 @@ class XReward(Reward[DDTensor]):
 class ToyBaseModel(BaseModel[DDTensor]):
     output_type = "velocity"
 
-    def __init__(self, device: Optional[torch.device]=None, val_mode: str = 'grid'):
+    def __init__(self, device: Optional[torch.device]=None, data_mean: Optional[torch.Tensor]=None):
         super().__init__(device)
         device = self.device
 
         self._scheduler = OptimalTransportScheduler()
         self.model = MLP(2, 2).to(device)
 
-        data_mean = torch.zeros((2,)) if val_mode == 'grid' else torch.tensor([-1, 1.5])
+        if data_mean is None:
+            data_mean = torch.zeros((2,))
         data = data_mean.unsqueeze(0) + 0.1 * torch.randn(512, 2)
         opt = torch.optim.Adam(self.parameters(), lr=1e-3)
         train_base_model(self, opt, [DDTensor(data)], steps=2500, batch_size=256, pbar=True)

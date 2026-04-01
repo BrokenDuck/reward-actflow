@@ -1,6 +1,7 @@
 from typing import Generic
 from dataclasses import dataclass
 from contextlib import contextmanager
+import math
 
 import numpy as np
 import torch
@@ -19,6 +20,42 @@ from .uncertainty import UncertaintyEstimator, FlowFeatureExtractor, uncertainty
 from .setups import setups as problem_setups
 from .setups.problem_setup import ProblemSetup
 from .utils import write_video, filter_out_invalids, Batch, serialize_args, setup_logger
+
+
+class RandomGPRewards:
+    """Random reward functions sampled from a GP prior (Matern-5/2) via Random Fourier Features."""
+
+    def __init__(self, dim: int, n_functions: int = 20, n_features: int = 256,
+                 lengthscale: float = 1.0, output_scale: float = 1.0, seed: int = 123):
+        rng = torch.Generator()
+        rng.manual_seed(seed)
+
+        nu = 2.5
+        df = int(2 * nu)  # 5 for Matern-5/2
+        z = torch.randn(n_functions, n_features, dim, generator=rng)
+        chi2 = sum(torch.randn(n_functions, n_features, generator=rng) ** 2 for _ in range(df))
+        self.omega = z / (lengthscale * torch.sqrt(chi2 / df).unsqueeze(-1))
+        self.bias = torch.rand(n_functions, n_features, generator=rng) * 2 * math.pi
+        self.weights = (torch.randn(n_functions, n_features, generator=rng)
+                        * output_scale * math.sqrt(2.0 / n_features))
+
+    def to(self, device: torch.device) -> "RandomGPRewards":
+        self.omega = self.omega.to(device)
+        self.bias = self.bias.to(device)
+        self.weights = self.weights.to(device)
+        return self
+
+    @torch.no_grad()
+    def evaluate(self, x: torch.Tensor) -> torch.Tensor:
+        """Evaluate all reward functions at points x.
+
+        Args:
+            x: (N, D) tensor of sample locations.
+        Returns:
+            (n_functions, N) tensor of reward values.
+        """
+        proj = torch.einsum('fmd,nd->fmn', self.omega, x) + self.bias.unsqueeze(-1)
+        return torch.einsum('fm,fmn->fn', self.weights, torch.cos(proj))
 
 
 def main(args):
@@ -100,8 +137,18 @@ class TaskAgnosticConfig:
     eval_every: int = 10
     video_fps: int = 4
     
+    # Particle guidance (Corso et al.; feature-space repulsion, GP-aligned RBF bandwidth when gp_kernel=rbf)
+    particle_guidance_coeff: float = 0.0
+    particle_guidance_sigma_break: float = 1.0
+
+    # Best-of-N evaluation with GP reward functions
+    bon_n: int = 100
+    bon_k: int = 10
+    bon_n_functions: int = 20
+    bon_lengthscale: float = 1.0
+
     # Flags
-    no_uncertainty: bool = False
+    guidance_method: str = "uncertainty_tilting"  # "uncertainty_tilting", "particle_guidance", "none"
     no_verifier: bool = False
     plot_uncertainty: bool = False
 
@@ -284,6 +331,50 @@ class TaskAgnostic(Generic[D]):
         return vis_metrics
 
     @torch.no_grad()
+    def _evaluate_bon(self, gp_rewards: RandomGPRewards) -> dict[str, torch.Tensor]:
+        """Sample from the current model and compute Best-of-N metrics."""
+        old_policy = self.env.control_policy
+        self.env.control_policy = None
+
+        samples = self.env.sample(self.config.bon_n, pbar=False).sample.data
+        device = gp_rewards.omega.device
+        rewards = gp_rewards.evaluate(samples.to(device))  # (F, N)
+
+        top1 = rewards.max(dim=1).values  # (F,)
+        topk = rewards.topk(min(self.config.bon_k, rewards.shape[1]), dim=1).values.mean(dim=1)
+
+        self.env.control_policy = old_policy
+        return {"top1": top1, "topk": topk}
+
+    def _plot_bon(self, initial_bon: dict, current_bon: dict, iteration: int,
+                  save_dir: Path):
+        """Bar chart comparing initial vs expanded model on BoN metrics."""
+        save_dir.mkdir(parents=True, exist_ok=True)
+        k = self.config.bon_k
+        n = self.config.bon_n
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4), constrained_layout=True)
+
+        for ax, key, title in [
+            (ax1, "top1", f"Best-of-{n}"),
+            (ax2, "topk", f"Avg Top-{k}-of-{n}"),
+        ]:
+            init_vals = initial_bon[key]
+            curr_vals = current_bon[key]
+            means = [init_vals.mean().item(), curr_vals.mean().item()]
+            n_fn = len(init_vals)
+            ci95 = [1.96 * init_vals.std().item() / math.sqrt(n_fn),
+                    1.96 * curr_vals.std().item() / math.sqrt(n_fn)]
+            ax.bar(["Initial", "Expanded"], means, yerr=ci95, capsize=5,
+                   color=["#888888", "#4CAF50"])
+            ax.set_title(title)
+            ax.set_ylabel("Reward")
+
+        fig.suptitle(f"Best-of-N Evaluation (iter {iteration})")
+        fig.savefig(save_dir / f"bon_{iteration:04d}.png", dpi=300)
+        plt.close(fig)
+
+    @torch.no_grad()
     def eval_model(self, iteration: int) -> dict[str, float]:
         n = self.config.eval_samples_curves if self.config.eval_samples_curves > 0 else self.config.eval_samples
         bs = self.config.eval_batch_size
@@ -317,6 +408,17 @@ class TaskAgnostic(Generic[D]):
         total_valid_samples = 0
         eval_history: list[dict] = []
 
+        # Set up GP reward functions for Best-of-N evaluation
+        sample_dim = self.env.sample(1, pbar=False).sample.data.shape[1]
+        gp_rewards = RandomGPRewards(
+            dim=sample_dim,
+            n_functions=self.config.bon_n_functions,
+            n_features=256,
+            lengthscale=self.config.bon_lengthscale,
+            seed=123,
+        ).to(self.base_model.device)
+        initial_bon = self._evaluate_bon(gp_rewards)
+
         for i in range(num_iterations):
             # Evaluate current model state
             with self._timer("eval"):
@@ -324,14 +426,22 @@ class TaskAgnostic(Generic[D]):
                 if i % self.config.eval_every == 0:
                     metrics = self.eval_model(i)
 
-            # Determine if we should use uncertainty guidance
+            # Determine if we should use guidance
             has_enough_data = total_valid_samples > self.config.ft_min_dataset_size
-            use_guidance = has_enough_data and not self.config.no_uncertainty
+            method = self.config.guidance_method
 
             # Collect new samples
             with self._timer("sampling"):
-                if use_guidance:
+                if has_enough_data and method == "uncertainty_tilting":
                     self.env.control_policy = RewardGradient(self.env, self.uncertainty)
+                elif has_enough_data and method == "particle_guidance":
+                    from adm.inf_methods.particle_guidance import ParticleGuidance
+                    self.env.control_policy = ParticleGuidance(
+                        self.env,
+                        self.uncertainty,
+                        coeff=self.config.particle_guidance_coeff,
+                        sigma_break=self.config.particle_guidance_sigma_break,
+                    )
 
                 sample = self.env.batch_sample(samples_per_iter, self.config.sample_batch_size)
                 batch = Batch.from_sample(sample)
@@ -348,6 +458,23 @@ class TaskAgnostic(Generic[D]):
             with self._timer("visualize"):
                 if i % self.config.eval_every == 0:
                     vis_metrics = self.visualize_iter(batch, i)
+
+                    current_bon = self._evaluate_bon(gp_rewards)
+                    bon_dir = self.config.folder / "bon_frames"
+                    self._plot_bon(initial_bon, current_bon, i, bon_dir)
+
+                    eval_dir = self.config.folder / "eval" / f"{i:04d}"
+                    eval_dir.mkdir(parents=True, exist_ok=True)
+                    np.savez(
+                        eval_dir / "bon_results.npz",
+                        initial_top1=initial_bon["top1"].cpu().numpy(),
+                        initial_topk=initial_bon["topk"].cpu().numpy(),
+                        current_top1=current_bon["top1"].cpu().numpy(),
+                        current_topk=current_bon["topk"].cpu().numpy(),
+                    )
+
+                    vis_metrics["bon_avg_top1"] = current_bon["top1"].mean().item()
+                    vis_metrics["bon_avg_topk"] = current_bon["topk"].mean().item()
                     metrics.update(vis_metrics)
                     eval_history.append({"iteration": i, **metrics})
 
@@ -365,7 +492,7 @@ class TaskAgnostic(Generic[D]):
                     self.finetune_base_model(batches, pbar=False)
 
             with self._timer("uncertainty_update"):
-                if not self.config.no_uncertainty:
+                if method != "none":
                     self.update_uncertainty_estimator(batches)
 
             # Save checkpoint
@@ -459,7 +586,12 @@ def add_global_args(parser):
     parser.add_argument("--seed", type=int, default=None)
 
     # Baselines
-    parser.add_argument("--no_uncertainty", action="store_true")
+    parser.add_argument("--guidance_method", type=str, default="uncertainty_tilting",
+                        choices=["uncertainty_tilting", "particle_guidance", "none"])
+    parser.add_argument("--particle_guidance_coeff", type=float, default=0.0,
+                        help="Particle guidance strength (0 disables term; try 0.1–5 as in reference --coeff)")
+    parser.add_argument("--particle_guidance_sigma_break", type=float, default=1.0,
+                        help="Apply particle guidance only when memoryless sigma exceeds this (cf. reference code)")
     parser.add_argument("--no_verifier", action="store_true")
     parser.add_argument("--plot_uncertainty", action="store_true")
 
@@ -486,6 +618,12 @@ def add_global_args(parser):
     parser.add_argument("--eval_samples_curves", type=int, default=0)
     parser.add_argument("--eval_batch_size", type=int, default=64)
     parser.add_argument("--eval_every", type=int, default=10)
+
+    # Best-of-N evaluation
+    parser.add_argument("--bon_n", type=int, default=100, help="N for Best-of-N sampling")
+    parser.add_argument("--bon_k", type=int, default=10, help="K for Top-K-of-N")
+    parser.add_argument("--bon_n_functions", type=int, default=20, help="Number of GP reward functions")
+    parser.add_argument("--bon_lengthscale", type=float, default=1.0, help="Matern-5/2 lengthscale for GP rewards")
 
     # Logging
     parser.add_argument("--video_fps", type=int, default=4)
