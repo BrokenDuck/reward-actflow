@@ -151,6 +151,7 @@ class TaskAgnosticConfig:
     guidance_method: str = "uncertainty_tilting"  # "uncertainty_tilting", "particle_guidance", "none"
     no_verifier: bool = False
     plot_uncertainty: bool = False
+    save_frames: bool = False
 
     def __post_init__(self):
         # Create experiment directory if it doesn't exist
@@ -309,41 +310,62 @@ class TaskAgnostic(Generic[D]):
         result = self.problem.visualize_sample(
             self.env, self.uncertainty, batch,
             n_samples=self.config.eval_samples,
-            save_dir=save_dir,
+            save_dir=save_dir if self.config.save_frames else None,
         )
         if isinstance(result, tuple):
             fig, vis_metrics = result
         else:
             fig, vis_metrics = result, {}
 
-        directory = self.config.folder / "frames"
-        directory.mkdir(parents=True, exist_ok=True)
-        fig.savefig(directory / f"{iteration:04d}.png", dpi=300)
+        if self.config.save_frames:
+            directory = self.config.folder / "frames"
+            directory.mkdir(parents=True, exist_ok=True)
+            fig.savefig(directory / f"{iteration:04d}.png", dpi=300)
+
+            if self.config.plot_uncertainty and hasattr(self.problem, 'visualize_uncertainty'):
+                fig_unc = self.problem.visualize_uncertainty(self.uncertainty, batch)
+                unc_directory = self.config.folder / "uncertainty_frames"
+                unc_directory.mkdir(parents=True, exist_ok=True)
+                fig_unc.savefig(unc_directory / f"{iteration:04d}.png", dpi=300)
+                plt.close(fig_unc)
+
         plt.close(fig)
-
-        if self.config.plot_uncertainty and hasattr(self.problem, 'visualize_uncertainty'):
-            fig_unc = self.problem.visualize_uncertainty(self.uncertainty, batch)
-            unc_directory = self.config.folder / "uncertainty_frames"
-            unc_directory.mkdir(parents=True, exist_ok=True)
-            fig_unc.savefig(unc_directory / f"{iteration:04d}.png", dpi=300)
-            plt.close(fig_unc)
-
         return vis_metrics
 
     @torch.no_grad()
     def _evaluate_bon(self, gp_rewards: RandomGPRewards) -> dict[str, torch.Tensor]:
-        """Sample from the current model and compute Best-of-N metrics."""
+        """Sample valid points from the current model and compute Best-of-N metrics."""
         old_policy = self.env.control_policy
         self.env.control_policy = None
 
-        samples = self.env.sample(self.config.bon_n, pbar=False).sample.data
+        n_target = self.config.bon_n
+        valid_chunks: list[torch.Tensor] = []
+        n_collected = 0
+        max_rounds = 200
+        for _ in range(max_rounds):
+            sample = self.env.sample(n_target, pbar=False)
+            valids = self.problem.validity(sample.sample, {})
+            valid_data = sample.sample.data[valids]
+            if len(valid_data) > 0:
+                valid_chunks.append(valid_data)
+                n_collected += len(valid_data)
+            if n_collected >= n_target:
+                break
+        else:
+            raise RuntimeError(
+                f"BoN evaluation failed: only collected {n_collected}/{n_target} valid samples "
+                f"after {max_rounds} rounds. The model's validity is too low."
+            )
+
+        self.env.control_policy = old_policy
+
+        samples = torch.cat(valid_chunks, dim=0)[:n_target]
         device = gp_rewards.omega.device
         rewards = gp_rewards.evaluate(samples.to(device))  # (F, N)
 
         top1 = rewards.max(dim=1).values  # (F,)
         topk = rewards.topk(min(self.config.bon_k, rewards.shape[1]), dim=1).values.mean(dim=1)
 
-        self.env.control_policy = old_policy
         return {"top1": top1, "topk": topk}
 
     def _plot_bon(self, initial_bon: dict, current_bon: dict, iteration: int,
@@ -460,8 +482,10 @@ class TaskAgnostic(Generic[D]):
                     vis_metrics = self.visualize_iter(batch, i)
 
                     current_bon = self._evaluate_bon(gp_rewards)
-                    bon_dir = self.config.folder / "bon_frames"
-                    self._plot_bon(initial_bon, current_bon, i, bon_dir)
+
+                    if self.config.save_frames:
+                        bon_dir = self.config.folder / "bon_frames"
+                        self._plot_bon(initial_bon, current_bon, i, bon_dir)
 
                     eval_dir = self.config.folder / "eval" / f"{i:04d}"
                     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -502,18 +526,19 @@ class TaskAgnostic(Generic[D]):
             # Write timings to CSV
             self._flush_timings(i)
         
-        write_video(
-            sorted(self.config.folder.glob("frames/*.png")),
-            self.config.folder / "video.mp4",
-            fps=self.config.video_fps,
-        )
-
-        if self.config.plot_uncertainty:
+        if self.config.save_frames:
             write_video(
-                sorted(self.config.folder.glob("uncertainty_frames/*.png")),
-                self.config.folder / "uncertainty_video.mp4",
+                sorted(self.config.folder.glob("frames/*.png")),
+                self.config.folder / "video.mp4",
                 fps=self.config.video_fps,
             )
+
+            if self.config.plot_uncertainty:
+                write_video(
+                    sorted(self.config.folder.glob("uncertainty_frames/*.png")),
+                    self.config.folder / "uncertainty_video.mp4",
+                    fps=self.config.video_fps,
+                )
 
         self._save_eval_history(eval_history)
         self._plot_eval_curves(eval_history)
@@ -594,6 +619,8 @@ def add_global_args(parser):
                         help="Apply particle guidance only when memoryless sigma exceeds this (cf. reference code)")
     parser.add_argument("--no_verifier", action="store_true")
     parser.add_argument("--plot_uncertainty", action="store_true")
+    parser.add_argument("--save_frames", action="store_true",
+                        help="Save generable set frames, videos, and generable_set.npz")
 
     # Exploration sampling
     parser.add_argument("--num_iters", type=int, default=1000)

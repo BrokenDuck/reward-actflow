@@ -26,7 +26,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         initial_model_invalid = args.get("initial_model_invalid", "false") == "true"
-        data_mean = torch.tensor([-1.0, 0.0]) if initial_model_invalid else torch.zeros((2,))
+        data_mean = torch.tensor([-1.1, 0.0]) if initial_model_invalid else torch.zeros((2,))
         self._base_model = ToyBaseModel(device=device, data_mean=data_mean)
         self.device = device
         self.validity_mode = args.get("validity_mode", "grid3")
