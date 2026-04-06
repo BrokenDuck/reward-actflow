@@ -484,7 +484,9 @@ class TaskAgnostic(Generic[D]):
                 if p.grad is not None and name in grad_pos:
                     p.grad.data = grad_pos[name] - rescale * p.grad.data
                 elif name in grad_pos:
-                    p.grad = -grad_pos[name]
+                    p.grad = grad_pos[name].clone()
+                elif p.grad is not None:
+                    p.grad.data = -rescale * p.grad.data
 
             _nn.utils.clip_grad_norm_(self.base_model.parameters(), 0.1)
             opt.step()
