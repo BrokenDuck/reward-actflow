@@ -58,7 +58,7 @@ mkdir -p "$OUTDIR"
     --samples_per_iter 64 \
     --ft_batch_size 256 \
     --ft_steps "$FT_STEPS" \
-    --eval_every 10 \
+    --eval_every 50 \
     --guidance_method uncertainty_tilting \
     --initial_model_invalid "$INITIAL_MODEL_INVALID" \
     --save_frames \
