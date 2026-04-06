@@ -3,19 +3,18 @@
 #SBATCH --job-name=toy_posneg
 #SBATCH --time=04:00:00
 #SBATCH --mem-per-cpu=16G
-#SBATCH --array=0-34
+#SBATCH --array=0-19
 #SBATCH --gpus=rtx_2080:1
 #SBATCH --output=output/toy_posneg_%A_%a.out
 #SBATCH --error=output/toy_posneg_%A_%a.err
 
 # ---------------------------------------------------------------------------
-# Sweep: combined pos+neg finetuning (SISS No-IS, gradient norm scaling)
-# 7 configs × 5 seeds = 35 jobs (array 0-34)
+# Sweep: combined ngs=0.005, 20 seeds
+# 1 config x 20 seeds = 20 jobs (array 0-19)
 #
-#   Config 0:    Baseline — positive-only
-#   Config 1-6:  Combined, neg_grad_scale = 0.0, 0.005, 0.01, 0.015, 0.02, 0.03
+#   Combined, neg_grad_scale = 0.005
 #
-#   Seeds: 42, 43, 44, 45, 46
+#   Seeds: 42..61
 # ---------------------------------------------------------------------------
 DPS=13.0
 LS=0.08
@@ -23,23 +22,11 @@ NUM_ITERS=501
 FT_STEPS=250
 INITIAL_MODEL_INVALID=true
 
-SCALE_VALUES=(0.0 0.005 0.006 0.007 0.008 0.009 0.01)
-SEEDS=(42 43 44 45 46)
-N_SEEDS=${#SEEDS[@]}
+SEEDS=(42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61)
+SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
-CONFIG_IDX=$(( SLURM_ARRAY_TASK_ID / N_SEEDS ))
-SEED_IDX=$(( SLURM_ARRAY_TASK_ID % N_SEEDS ))
-SEED=${SEEDS[$SEED_IDX]}
-
-if [ "$CONFIG_IDX" -eq 0 ]; then
-    EXTRA_FLAGS=""
-    TAG="baseline"
-else
-    S_IDX=$(( CONFIG_IDX - 1 ))
-    SCALE=${SCALE_VALUES[$S_IDX]}
-    EXTRA_FLAGS="--combined_finetuning --neg_grad_scale $SCALE"
-    TAG="combined_ngs${SCALE}"
-fi
+EXTRA_FLAGS="--combined_finetuning --neg_grad_scale 0.005"
+TAG="combined_ngs0.005"
 
 OUTDIR=/cluster/scratch/$USER/toy_sweep_posneg/dps_${DPS}_ls_${LS}_ft${FT_STEPS}_initinvalid_${INITIAL_MODEL_INVALID}_${TAG}/seed_${SEED}
 mkdir -p "$OUTDIR"
