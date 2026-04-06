@@ -36,7 +36,8 @@ torch_scatter = "==2.1.2"
 torch_cluster = "==1.6.3"
 flowmol = { git = "https://github.com/cristianpjensen/FlowMol.git", rev = "8f4c98cbe68111e4e63480b250d925b6d960d3bc" }
 clip = { git = "https://github.com/openai/CLIP.git" }
-diffusiongym = "==2.0.1"
+# diffusiongym = "==2.0.1"
+diffusiongym = { path = "../diffusiongym", editable = true }
 
 [tool.pixi.pypi-options.dependency-overrides]
 transformers = ">=4.45.0"

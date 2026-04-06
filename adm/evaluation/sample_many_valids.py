@@ -71,7 +71,7 @@ def main(args):
             if not batch.valids[i]:
                 continue
 
-            batches.append(batch[i])
+            batches.append(batch[i].cpu())
             is_valid_sampled[index] = True
 
         n_valids = batch.valids.int().sum().item()

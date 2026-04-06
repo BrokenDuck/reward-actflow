@@ -40,7 +40,7 @@ def main(args):
         samples = env.sample(current_n, pbar=False)
         batch = Batch.from_sample(samples)
         batch.valids = problem_setup.validity(batch.samples, batch.kwargs)
-        batches.append(batch)
+        batches.append(batch.cpu())
 
     batch = Batch.concat(batches)
     problem_setup.save_samples(batch.samples, batch.kwargs, folder)
