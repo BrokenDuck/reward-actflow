@@ -6,8 +6,11 @@ import math
 import numpy as np
 import torch
 from diffusiongym import construct_env, D, DummyReward
-from diffusiongym.utils import train_base_model
+from diffusiongym.utils import train_base_model, DDDataset, dict_to_device
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+from torch import nn as _nn
+from tqdm import tqdm as _tqdm
 from pathlib import Path
 import argparse
 import logging
@@ -19,7 +22,7 @@ from .inf_methods.dps import RewardGradient
 from .uncertainty import UncertaintyEstimator, FlowFeatureExtractor, uncertainty_estimators
 from .setups import setups as problem_setups
 from .setups.problem_setup import ProblemSetup
-from .utils import write_video, filter_out_invalids, Batch, serialize_args, setup_logger
+from .utils import write_video, filter_out_invalids, filter_out_valids, Batch, serialize_args, setup_logger
 
 
 class RandomGPRewards:
@@ -141,6 +144,27 @@ class TaskAgnosticConfig:
     particle_guidance_coeff: float = 0.0
     particle_guidance_sigma_break: float = 1.0
 
+    # DPP sampling: sample a large pool, greedily select diverse subset
+    dpp_pool_size: int = 512
+    dpp_space: str = "features"  # "features" or "data"
+    dpp_kernel: str = "linear"   # "linear" or "rbf"
+    dpp_rbf_lengthscale: float = 1.0
+
+    # Negative score matching (gradient ascent on flow matching loss for invalid samples)
+    nsm_enabled: bool = False
+    nsm_weight: float = 1.0
+    nsm_steps: int = 0       # 0 → use ft_steps
+    nsm_lr: float = 0.0      # 0 → use ft_lr
+
+    # Combined pos+neg finetuning (SISS No-IS) with gradient norm scaling:
+    # two backward passes per step; the negative gradient is rescaled so its
+    # L2 norm equals neg_grad_scale × ||grad_pos||.
+    combined_finetuning: bool = False
+    neg_grad_scale: float = 0.1  # target ||grad_neg|| as fraction of ||grad_pos||
+
+    # Fine-tune on new samples only (current iteration) instead of full buffer
+    ft_new_only: bool = False
+
     # Best-of-N evaluation with GP reward functions
     bon_n: int = 100
     bon_k: int = 10
@@ -148,7 +172,7 @@ class TaskAgnosticConfig:
     bon_lengthscale: float = 1.0
 
     # Flags
-    guidance_method: str = "uncertainty_tilting"  # "uncertainty_tilting", "particle_guidance", "none"
+    guidance_method: str = "uncertainty_tilting"  # "uncertainty_tilting", "particle_guidance", "dpp_sampling", "none"
     no_verifier: bool = False
     plot_uncertainty: bool = False
     save_frames: bool = False
@@ -233,7 +257,7 @@ class TaskAgnostic(Generic[D]):
         self._timings = {}
 
         # Create file and write headers
-        self.timing_heads = ["iteration", "eval", "sampling", "visualize", "finetune", "uncertainty_update", "checkpoint"]
+        self.timing_heads = ["iteration", "eval", "sampling", "visualize", "finetune", "negative_finetune", "uncertainty_update", "checkpoint"]
         self.timing_path = self.config.folder / "timings.csv"
         with open(self.timing_path, "w", newline="") as f:
             csv.writer(f).writerow(self.timing_heads)
@@ -289,6 +313,185 @@ class TaskAgnostic(Generic[D]):
             pbar=pbar,
         )
 
+    def negative_finetune_base_model(self, batches: list[Batch[D]], pbar: bool = False):
+        """Push the model away from invalid samples via negative score matching.
+
+        Uses the same flow matching machinery as positive finetuning, but with
+        negated per-sample weights so that gradient descent becomes gradient ascent
+        on the flow matching loss for invalid data.  This implements a first-order
+        approximation of Eq. 8 in the negative score matching paper.
+        """
+        invalid_batch = filter_out_valids(batches)
+        if invalid_batch is None:
+            self.logger.info("NSM: no invalid samples, skipping")
+            return
+
+        nsm_steps = self.config.nsm_steps if self.config.nsm_steps > 0 else self.config.ft_steps
+        nsm_lr = self.config.nsm_lr if self.config.nsm_lr > 0 else self.config.ft_lr
+
+        opt = torch.optim.AdamW(
+            self.base_model.parameters(),
+            lr=nsm_lr,
+            weight_decay=self.config.ft_weight_decay,
+        )
+
+        neg_weights = torch.full(
+            (len(invalid_batch),), -self.config.nsm_weight, dtype=torch.float32,
+        )
+
+        train_base_model(
+            self.base_model,
+            opt,
+            [invalid_batch.latents.to(self.env.base_model.device)],
+            [invalid_batch.kwargs],
+            weights=[neg_weights],
+            steps=nsm_steps,
+            batch_size=self.config.ft_batch_size,
+            accumulate_steps=self.config.ft_accumulate_steps,
+            pbar=pbar,
+        )
+
+    def combined_finetune_base_model(self, batches: list[Batch[D]], pbar: bool = False):
+        """Fine-tune with combined pos+neg signal (SISS No-IS, gradient norm scaling).
+
+        Uses **separate dataloaders** for valid and invalid data so that:
+        - The positive update always sees a full batch of valid samples
+          (identical to finetune_base_model).
+        - The negative gradient is computed from a full batch of invalid
+          samples and rescaled so ||grad_neg|| = neg_grad_scale × ||grad_pos||.
+
+        When neg_grad_scale=0 or there are no invalid samples the method
+        is exactly equivalent to finetune_base_model.
+        """
+        if self.config.no_verifier:
+            self.finetune_base_model(batches, pbar=pbar)
+            return
+
+        valid_batch = filter_out_invalids(batches)
+        invalid_batch = filter_out_valids(batches)
+
+        m = len(valid_batch) if valid_batch is not None else 0
+        k = len(invalid_batch) if invalid_batch is not None else 0
+
+        if m == 0:
+            self.logger.warning("Combined FT: no valid data, skipping")
+            return
+
+        scale = self.config.neg_grad_scale
+        use_neg = scale > 0 and k > 0
+        self.logger.info(
+            f"Combined FT (grad-norm): m={m} k={k}, "
+            f"neg_grad_scale={scale}, use_neg={use_neg}"
+        )
+
+        device = self.env.base_model.device
+        bs = self.config.ft_batch_size
+
+        pos_dataset = DDDataset(
+            [valid_batch.latents.to(device)],
+            [valid_batch.kwargs],
+            None,
+        )
+        pos_loader = DataLoader(
+            pos_dataset, bs, shuffle=True,
+            collate_fn=pos_dataset.collate, num_workers=0, pin_memory=False,
+        )
+
+        neg_loader = None
+        if use_neg:
+            neg_dataset = DDDataset(
+                [invalid_batch.latents.to(device)],
+                [invalid_batch.kwargs],
+                None,
+            )
+            neg_loader = DataLoader(
+                neg_dataset, bs, shuffle=True,
+                collate_fn=neg_dataset.collate, num_workers=0, pin_memory=False,
+            )
+
+        opt = torch.optim.AdamW(
+            self.base_model.parameters(),
+            lr=self.config.ft_lr,
+            weight_decay=self.config.ft_weight_decay,
+        )
+
+        self.base_model.train()
+        opt.zero_grad()
+        pos_iter = iter(pos_loader)
+        neg_iter = iter(neg_loader) if neg_loader is not None else None
+
+        iterator = range(self.config.ft_steps)
+        if pbar:
+            iterator = _tqdm(iterator)
+
+        for _ in iterator:
+            # --- positive batch (full batch of valid samples) ---
+            try:
+                x1_pos, kw_pos, _ = next(pos_iter)
+            except StopIteration:
+                pos_iter = iter(pos_loader)
+                x1_pos, kw_pos, _ = next(pos_iter)
+
+            x1_pos = x1_pos.to(self.base_model.device)
+            kw_pos = dict_to_device(kw_pos, self.base_model.device)
+
+            loss_pos = self.base_model.train_loss(x1_pos, **kw_pos).mean()
+            loss_pos.backward()
+
+            if neg_iter is None:
+                _nn.utils.clip_grad_norm_(self.base_model.parameters(), 0.1)
+                opt.step()
+                opt.zero_grad()
+                continue
+
+            # Store positive gradients
+            grad_pos = {
+                name: p.grad.clone()
+                for name, p in self.base_model.named_parameters()
+                if p.grad is not None
+            }
+            norm_pos = torch.sqrt(sum(
+                g.pow(2).sum() for g in grad_pos.values()
+            ))
+
+            # --- negative batch (full batch of invalid samples) ---
+            opt.zero_grad()
+
+            try:
+                x1_neg, kw_neg, _ = next(neg_iter)
+            except StopIteration:
+                neg_iter = iter(neg_loader)
+                x1_neg, kw_neg, _ = next(neg_iter)
+
+            x1_neg = x1_neg.to(self.base_model.device)
+            kw_neg = dict_to_device(kw_neg, self.base_model.device)
+
+            loss_neg = self.base_model.train_loss(x1_neg, **kw_neg).mean()
+            loss_neg.backward()
+
+            norm_neg = torch.sqrt(sum(
+                p.grad.pow(2).sum()
+                for p in self.base_model.parameters()
+                if p.grad is not None
+            ))
+
+            if norm_neg > 0:
+                rescale = (scale * norm_pos) / norm_neg
+            else:
+                rescale = 0.0
+
+            for name, p in self.base_model.named_parameters():
+                if p.grad is not None and name in grad_pos:
+                    p.grad.data = grad_pos[name] - rescale * p.grad.data
+                elif name in grad_pos:
+                    p.grad = -grad_pos[name]
+
+            _nn.utils.clip_grad_norm_(self.base_model.parameters(), 0.1)
+            opt.step()
+            opt.zero_grad()
+
+        self.base_model.eval()
+
     def update_uncertainty_estimator(self, batches: list[Batch[D]]):
         """Update the uncertainty estimator with obtained samples.
 
@@ -331,6 +534,48 @@ class TaskAgnostic(Generic[D]):
 
         plt.close(fig)
         return vis_metrics
+
+    @torch.no_grad()
+    def _dpp_sample(self, k: int) -> Batch[D]:
+        """Sample a large pool, then select k diverse points via greedy DPP.
+
+        Diversity selection is verifier-agnostic: validity is checked
+        *after* selection, identically to how other methods work.
+        """
+        from adm.inf_methods.dpp_sampling import dpp_select
+
+        pool_size = self.config.dpp_pool_size
+        sample = self.env.batch_sample(pool_size, self.config.sample_batch_size)
+        pool = Batch.from_sample(sample)
+        pool.latents = self.problem.postprocess_latents(pool)
+
+        if self.config.dpp_space == "data":
+            embeddings = pool.samples.data
+        else:
+            embeddings = self.uncertainty.feat_extractor(pool.samples, **pool.kwargs)
+            if not isinstance(embeddings, torch.Tensor):
+                embeddings = embeddings.data
+
+        sel = dpp_select(
+            embeddings, k,
+            kernel=self.config.dpp_kernel,
+            rbf_lengthscale=self.config.dpp_rbf_lengthscale,
+        )
+
+        from diffusiongym import DDTensor
+        selected_data = pool.samples.data[sel]
+        selected_latents = pool.latents.data[sel]
+
+        batch = Batch(
+            samples=DDTensor(selected_data),
+            latents=DDTensor(selected_latents),
+            rewards=pool.rewards[sel],
+            valids=torch.zeros(len(sel), dtype=torch.bool),
+            kwargs={key: val[sel] if isinstance(val, torch.Tensor) else val
+                    for key, val in pool.kwargs.items()},
+        )
+        batch.valids = self.problem.validity(batch.samples, batch.kwargs)
+        return batch
 
     @torch.no_grad()
     def _evaluate_bon(self, gp_rewards: RandomGPRewards) -> dict[str, torch.Tensor]:
@@ -465,12 +710,15 @@ class TaskAgnostic(Generic[D]):
                         sigma_break=self.config.particle_guidance_sigma_break,
                     )
 
-                sample = self.env.batch_sample(samples_per_iter, self.config.sample_batch_size)
-                batch = Batch.from_sample(sample)
-                batch.latents = self.problem.postprocess_latents(batch)
-                batch.valids = self.problem.validity(batch.samples, batch.kwargs)
-                total_valid_samples += batch.valids.int().sum().item()
+                if method == "dpp_sampling":
+                    batch = self._dpp_sample(samples_per_iter)
+                else:
+                    sample = self.env.batch_sample(samples_per_iter, self.config.sample_batch_size)
+                    batch = Batch.from_sample(sample)
+                    batch.latents = self.problem.postprocess_latents(batch)
+                    batch.valids = self.problem.validity(batch.samples, batch.kwargs)
 
+                total_valid_samples += batch.valids.int().sum().item()
                 self.env.control_policy = None
 
             # Store data
@@ -510,10 +758,18 @@ class TaskAgnostic(Generic[D]):
                 metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
                 self.logger.info(f"(iter={i:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
 
-            # Update models with full buffer
+            # Update models
+            ft_data = [batch] if self.config.ft_new_only else batches
             with self._timer("finetune"):
                 if has_enough_data:
-                    self.finetune_base_model(batches, pbar=False)
+                    if self.config.combined_finetuning:
+                        self.combined_finetune_base_model(ft_data, pbar=False)
+                    else:
+                        self.finetune_base_model(ft_data, pbar=False)
+
+            with self._timer("negative_finetune"):
+                if has_enough_data and self.config.nsm_enabled and not self.config.no_verifier and not self.config.combined_finetuning:
+                    self.negative_finetune_base_model(batches, pbar=False)
 
             with self._timer("uncertainty_update"):
                 if method != "none":
@@ -612,11 +868,19 @@ def add_global_args(parser):
 
     # Baselines
     parser.add_argument("--guidance_method", type=str, default="uncertainty_tilting",
-                        choices=["uncertainty_tilting", "particle_guidance", "none"])
+                        choices=["uncertainty_tilting", "particle_guidance", "dpp_sampling", "none"])
     parser.add_argument("--particle_guidance_coeff", type=float, default=0.0,
                         help="Particle guidance strength (0 disables term; try 0.1–5 as in reference --coeff)")
     parser.add_argument("--particle_guidance_sigma_break", type=float, default=1.0,
                         help="Apply particle guidance only when memoryless sigma exceeds this (cf. reference code)")
+    parser.add_argument("--dpp_pool_size", type=int, default=512,
+                        help="Candidate pool size N for DPP sampling (selects samples_per_iter from N)")
+    parser.add_argument("--dpp_space", type=str, default="features", choices=["features", "data"],
+                        help="Space for DPP diversity: 'features' (learned representation) or 'data' (raw x,y)")
+    parser.add_argument("--dpp_kernel", type=str, default="linear", choices=["linear", "rbf"],
+                        help="Kernel for DPP selection: 'linear' (cosine) or 'rbf' (Gaussian)")
+    parser.add_argument("--dpp_rbf_lengthscale", type=float, default=1.0,
+                        help="Lengthscale for the RBF kernel (only used when --dpp_kernel rbf)")
     parser.add_argument("--no_verifier", action="store_true")
     parser.add_argument("--plot_uncertainty", action="store_true")
     parser.add_argument("--save_frames", action="store_true",
@@ -639,6 +903,24 @@ def add_global_args(parser):
     parser.add_argument("--ft_accumulate_steps", type=int, default=1)
     parser.add_argument("--ft_lr", type=float, default=1e-4)
     parser.add_argument("--ft_weight_decay", type=float, default=0.0)
+
+    # Negative score matching (gradient ascent on flow matching loss for invalid samples)
+    parser.add_argument("--nsm_enabled", action="store_true",
+                        help="Enable negative score matching: push model away from invalid samples")
+    parser.add_argument("--nsm_weight", type=float, default=1.0,
+                        help="Weight (alpha) for the negative loss; controls push-away strength")
+    parser.add_argument("--nsm_steps", type=int, default=0,
+                        help="Gradient steps for NSM per iteration (0 = same as --ft_steps)")
+    parser.add_argument("--nsm_lr", type=float, default=0.0,
+                        help="Learning rate for NSM steps (0 = same as --ft_lr)")
+
+    # Combined positive+negative finetuning (SISS No-IS)
+    parser.add_argument("--combined_finetuning", action="store_true",
+                        help="Use combined pos+neg SISS finetuning instead of separate steps")
+    parser.add_argument("--neg_grad_scale", type=float, default=0.1,
+                        help="Target ||grad_neg|| as fraction of ||grad_pos|| (0 = positive-only)")
+    parser.add_argument("--ft_new_only", action="store_true",
+                        help="Fine-tune on new samples only (current iteration) instead of full buffer")
 
     # Sampling
     parser.add_argument("--eval_samples", type=int, default=0)

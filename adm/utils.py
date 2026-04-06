@@ -77,6 +77,21 @@ def filter_out_invalids(batches: list[Batch[D]]) -> Batch[D]:
     return Batch.concat(valid_batches)
 
 
+def filter_out_valids(batches: list[Batch[D]]) -> Batch[D] | None:
+    """Return only the invalid samples from the batches, or None if there are none."""
+    invalid_batches: list[Batch[D]] = []
+
+    for batch in batches:
+        for i in range(len(batch)):
+            if not batch.valids[i]:
+                invalid_batches.append(batch[i])
+
+    if len(invalid_batches) == 0:
+        return None
+
+    return Batch.concat(invalid_batches)
+
+
 def write_video(frame_paths: list[Path], video_path: Path, fps: int):
     if len(frame_paths) == 0:
         return

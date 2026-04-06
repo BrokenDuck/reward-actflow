@@ -212,9 +212,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         K = kernel(valid_data, valid_data).cpu().numpy()
         vendi_rbf = score_K(K)
 
-        coverage = self._compute_coverage(valid_data, subgrid=100)
-
-        return {'vendi_rbf': float(vendi_rbf), 'vendi_linear': float(vendi_linear), 'coverage': float(coverage)}
+        return {'vendi_rbf': float(vendi_rbf), 'vendi_linear': float(vendi_linear)}
 
     def _compute_coverage(self, valid_data: torch.Tensor, subgrid: int = 100) -> float:
         """Fraction of valid sub-cells that contain at least one sample."""
