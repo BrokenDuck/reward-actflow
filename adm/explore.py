@@ -1,4 +1,4 @@
-from typing import Generic, Literal
+from typing import Generic, Literal, Optional
 from dataclasses import dataclass
 from contextlib import contextmanager
 
@@ -60,6 +60,14 @@ class ExploreConfig:
     # Flags
     no_uncertainty: bool = False
     no_verifier: bool = False
+
+    # Warmup caching
+    warmup_cache_dir: Optional[Path] = None
+
+    # Regularization data from base model distribution
+    reg_data: bool = False
+    alpha_reg: float = 1.0
+    n_reg_samples: int = 10000
 
     def __post_init__(self):
         # Create experiment directory if it doesn't exist
@@ -144,13 +152,15 @@ class ExploreLoop(Generic[D]):
 
         self._timings = {}
 
-    def finetune_base_model(self, batches: list[Batch[D]], pbar: bool = False):
+    def finetune_base_model(self, batches: list[Batch[D]], reg_batch: Batch[D] | None = None, pbar: bool = False):
         """Fine-tune the base model with obtained valid samples.
 
         Parameters
         ----------
         batches : list[Batch[D]]
             Data batches obtained so far, where each entry is from a separate iteration.
+        reg_batch : Batch[D] | None
+            Regularization data sampled from the base model at init, weighted by alpha_reg.
         pbar : bool, default: False
             Progress bar or not.
         """
@@ -163,7 +173,16 @@ class ExploreLoop(Generic[D]):
         else:
             valid_batch = Batch.concat(batches)
 
-        # Fine-tune base model
+        device = self.env.base_model.device
+        data = [valid_batch.latents.to(device)]
+        kw = [valid_batch.kwargs]
+        weights = [torch.ones(len(valid_batch))]
+
+        if reg_batch is not None:
+            data.append(reg_batch.latents.to(device))
+            kw.append(reg_batch.kwargs)
+            weights.append(self.config.alpha_reg * torch.ones(len(reg_batch)))
+
         opt = torch.optim.AdamW(
             self.base_model.parameters(),
             lr=self.config.ft_lr,
@@ -172,8 +191,9 @@ class ExploreLoop(Generic[D]):
         train_base_model(
             self.base_model,
             opt,
-            [valid_batch.latents.to(self.env.base_model.device)],
-            [valid_batch.kwargs],
+            data,
+            kw,
+            weights=weights,
             steps=self.config.ft_steps,
             batch_size=self.config.ft_batch_size,
             accumulate_steps=self.config.ft_accumulate_steps,
@@ -238,21 +258,112 @@ class ExploreLoop(Generic[D]):
 
         return metrics
 
+    def _warmup_cache_path(self) -> Path | None:
+        if self.config.warmup_cache_dir is None:
+            return None
+        return self.config.warmup_cache_dir / "warmup_batches.pt"
+
+    def _save_warmup_cache(self, batches: list[Batch[D]], total_valid_samples: int, warmup_iters: int):
+        cache_path = self._warmup_cache_path()
+        if cache_path is None or cache_path.exists():
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(".tmp")
+        torch.save({
+            "batches": [b.cpu() for b in batches],
+            "total_valid_samples": total_valid_samples,
+            "warmup_iters": warmup_iters,
+        }, tmp_path)
+        tmp_path.rename(cache_path)
+        self.logger.info(f"Saved warmup cache ({warmup_iters} iters, {total_valid_samples} valid samples) to {cache_path}")
+
+    def _load_warmup_cache(self) -> tuple[list[Batch[D]], int, int] | None:
+        cache_path = self._warmup_cache_path()
+        if cache_path is None or not cache_path.exists():
+            return None
+        cache = torch.load(cache_path, weights_only=False)
+        batches = cache["batches"]
+        total_valid = cache["total_valid_samples"]
+        warmup_iters = cache["warmup_iters"]
+        self.logger.info(f"Loaded warmup cache: {warmup_iters} iters, {len(batches)} batches, {total_valid} valid samples")
+        return batches, total_valid, warmup_iters
+
+    def _reg_cache_path(self) -> Path | None:
+        if self.config.warmup_cache_dir is not None:
+            return self.config.warmup_cache_dir / "reg_data.pt"
+        return self.config.folder / "reg_data.pt"
+
+    @torch.no_grad()
+    def _generate_or_load_reg_data(self) -> Batch[D] | None:
+        if not self.config.reg_data:
+            return None
+
+        cache_path = self._reg_cache_path()
+        if cache_path is not None and cache_path.exists():
+            reg_batch = torch.load(cache_path, weights_only=False)
+            self.logger.info(f"Loaded reg data: {len(reg_batch)} samples from {cache_path}")
+            return reg_batch
+
+        n = self.config.n_reg_samples
+        bs = self.config.sample_batch_size
+        chunk = self.config.samples_per_iter
+        self.logger.info(f"Generating {n} regularization samples from base model...")
+        batches: list[Batch[D]] = []
+        for i in range(0, n, chunk):
+            current_n = min(chunk, n - i)
+            sample = self.env.batch_sample(current_n, bs)
+            b = Batch.from_sample(sample)
+            b.latents = self.problem.postprocess_latents(b)
+            batches.append(b.cpu())
+            self.logger.info(f"  generated {i + current_n}/{n} reg samples")
+        reg_batch = Batch.concat(batches)
+
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(".tmp")
+            torch.save(reg_batch, tmp_path)
+            tmp_path.rename(cache_path)
+            self.logger.info(f"Saved reg data ({n} samples) to {cache_path}")
+
+        return reg_batch
+
     def explore_loop(self, num_iterations: int, samples_per_iter: int):
         metrics = dict()
         batches: list[Batch[D]] = []
         total_valid_samples = 0
+        ft_start_iter: int | None = None
+        start_iter = 0
 
-        for i in range(num_iterations):
-            # Evaluate current model state
+        reg_batch = self._generate_or_load_reg_data()
+
+        cached = self._load_warmup_cache()
+        if cached is not None:
+            batches, total_valid_samples, start_iter = cached
+            ft_start_iter = start_iter
+            self.logger.info(f"Resuming from warmup cache at iter={start_iter}, ft_iter=1")
+
             with self._timer("eval"):
-                metrics = {}
-                if i % self.config.eval_every == 0:
-                    metrics = self.eval_model(i)
+                metrics = self.eval_model(start_iter)
+            self.logger.info(f"(ft_iter=00000) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
 
+        for i in range(start_iter, num_iterations):
             # Determine if we should use uncertainty guidance
             has_enough_data = total_valid_samples > self.config.ft_min_dataset_size
             use_guidance = has_enough_data and not self.config.no_uncertainty
+
+            if has_enough_data and ft_start_iter is None:
+                ft_start_iter = i
+                self.logger.info(f"fine-tuning starts at iter={i}, ft_iter=1")
+                self._save_warmup_cache(batches, total_valid_samples, i)
+
+            ft_iter = i - (ft_start_iter - 1) if ft_start_iter is not None else i - num_iterations
+
+            # Evaluate current model state: at iter 0, at ft_iter=0, then every eval_every ft_iters
+            with self._timer("eval"):
+                metrics = {}
+                should_eval = (i == 0) or (ft_iter == 0) or (ft_iter > 0 and ft_iter % self.config.eval_every == 0)
+                if should_eval:
+                    metrics = self.eval_model(i)
 
             # Collect new samples
             with self._timer("sampling"):
@@ -283,12 +394,12 @@ class ExploreLoop(Generic[D]):
                 metrics["uncertainty"] = uncert.mean().item()
                 metrics["biased_valid"] = batch.valids.float().mean().item()
                 metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
-                self.logger.info(f"(iter={i:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+                self.logger.info(f"(ft_iter={ft_iter:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
 
             # Update models with full buffer
             with self._timer("finetune"):
                 if has_enough_data:
-                    self.finetune_base_model(batches, pbar=False)
+                    self.finetune_base_model(batches, reg_batch=reg_batch, pbar=False)
 
             with self._timer("uncertainty_update"):
                 if not self.config.no_uncertainty:
@@ -427,3 +538,11 @@ def add_global_args(parser):
 
     # Logging
     parser.add_argument("--video_fps", type=int, default=4)
+
+    # Warmup caching
+    parser.add_argument("--warmup_cache_dir", type=Path, default=None)
+
+    # Regularization data
+    parser.add_argument("--reg_data", action="store_true")
+    parser.add_argument("--alpha_reg", type=float, default=1.0)
+    parser.add_argument("--n_reg_samples", type=int, default=10000)

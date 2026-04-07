@@ -16,9 +16,25 @@ module load eth_proxy
 
 TIMESTEP=$1
 DPS_WEIGHT=$2
-BASE_DIR="${3:-$SCRATCH/adm/geom_ensemble_long}"
+FT_STEPS=$3
+FT_LR=1e-4
+BASE_DIR="${4:-$SCRATCH/adm/geom_ensemble_long}"
+WARMUP_CACHE_DIR="${5:-}"
+ALPHA_REG="${6:-0}"
+SEED="${7:-}"
 
-FOLDER="${BASE_DIR}/ade_${TIMESTEP}_${DPS_WEIGHT}"
+NUM_FT_ITERS=500
+SAMPLES_PER_ITER=64
+FT_MIN_DATASET_SIZE=2048
+# ~3x ratio accounts for ~33% validity rate during warmup
+WARMUP_ITERS=$(( FT_MIN_DATASET_SIZE * 3 / SAMPLES_PER_ITER + 10 ))
+NUM_ITERS=$(( NUM_FT_ITERS + WARMUP_ITERS ))
+
+if [ -n "$SEED" ]; then
+    FOLDER="${BASE_DIR}/ade_t${TIMESTEP}_dps${DPS_WEIGHT}_ftsteps${FT_STEPS}_seed${SEED}"
+else
+    FOLDER="${BASE_DIR}/ade_t${TIMESTEP}_dps${DPS_WEIGHT}_ftsteps${FT_STEPS}"
+fi
 mkdir -p "$FOLDER"
 
 sbatch --dependency=afterany:${SLURM_JOB_ID} \
@@ -37,20 +53,33 @@ sbatch --dependency=afterany:${SLURM_JOB_ID} \
     --samples-dir eval_samples \
     --n-samples 50_000
 
+WARMUP_ARG=""
+if [ -n "$WARMUP_CACHE_DIR" ]; then
+    WARMUP_ARG="--warmup_cache_dir $WARMUP_CACHE_DIR"
+fi
+
+REG_ARG=""
+if [ "$(echo "$ALPHA_REG > 0" | bc -l)" -eq 1 ]; then
+    REG_ARG="--reg_data --alpha_reg $ALPHA_REG"
+fi
+
 pixi run python -m adm.task_agnostic \
     geom_drugs \
     ensemble \
     --dir $FOLDER \
     --eval_samples 1000 \
     --eval_batch_size 16 \
-    --eval_every 10 \
+    --eval_every 5 \
     --dps_weight $DPS_WEIGHT \
     --feat_timestep $TIMESTEP \
-    --num_iters 10_000 \
-    --samples_per_iter 64 \
+    --num_iters $NUM_ITERS \
+    --samples_per_iter $SAMPLES_PER_ITER \
     --sample_batch_size 16 \
-    --ft_lr 1e-4 \
-    --ft_min_dataset_size 2048 \
+    --ft_lr $FT_LR \
+    --ft_min_dataset_size $FT_MIN_DATASET_SIZE \
     --ft_batch_size 16 \
     --ft_accumulate_steps 4 \
-    --ft_steps 2000
+    --ft_steps $FT_STEPS \
+    $WARMUP_ARG \
+    $REG_ARG \
+    ${SEED:+--seed $SEED}
