@@ -22,18 +22,18 @@ BASE_DIR="${4:-$SCRATCH/adm/geom_ensemble_long}"
 WARMUP_CACHE_DIR="${5:-}"
 ALPHA_REG="${6:-0}"
 SEED="${7:-}"
+FT_MIN_DATASET_SIZE="${8:-2048}"
+N_VENDI="${9:-350}"
 
 NUM_FT_ITERS=500
 SAMPLES_PER_ITER=64
-FT_MIN_DATASET_SIZE=2048
 # ~3x ratio accounts for ~33% validity rate during warmup
 WARMUP_ITERS=$(( FT_MIN_DATASET_SIZE * 3 / SAMPLES_PER_ITER + 10 ))
 NUM_ITERS=$(( NUM_FT_ITERS + WARMUP_ITERS ))
 
+FOLDER="${BASE_DIR}/ade_t${TIMESTEP}_dps${DPS_WEIGHT}_ftsteps${FT_STEPS}_ftmin${FT_MIN_DATASET_SIZE}_nv${N_VENDI}"
 if [ -n "$SEED" ]; then
-    FOLDER="${BASE_DIR}/ade_t${TIMESTEP}_dps${DPS_WEIGHT}_ftsteps${FT_STEPS}_seed${SEED}"
-else
-    FOLDER="${BASE_DIR}/ade_t${TIMESTEP}_dps${DPS_WEIGHT}_ftsteps${FT_STEPS}"
+    FOLDER="${FOLDER}_seed${SEED}"
 fi
 mkdir -p "$FOLDER"
 
@@ -80,6 +80,7 @@ pixi run python -m adm.task_agnostic \
     --ft_batch_size 16 \
     --ft_accumulate_steps 4 \
     --ft_steps $FT_STEPS \
+    --eval_valid_samples $N_VENDI \
     $WARMUP_ARG \
     $REG_ARG \
     ${SEED:+--seed $SEED}

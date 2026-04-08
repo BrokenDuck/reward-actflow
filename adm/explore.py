@@ -53,6 +53,7 @@ class ExploreConfig:
 
     # Sampling and evaluation
     eval_samples: int = 0
+    eval_valid_samples: int = 0
     eval_batch_size: int = 64
     eval_every: int = 10
     video_fps: int = 4
@@ -235,14 +236,25 @@ class ExploreLoop(Generic[D]):
     def eval_model(self, iteration: int) -> dict[str, float]:
         n = self.config.eval_samples
         bs = self.config.eval_batch_size
+        n_valid_target = self.config.eval_valid_samples
 
-        if n <= 0:
+        if n <= 0 and n_valid_target <= 0:
             return dict()
 
+        n = max(n, bs)
         eval_kwargs = self.problem.eval_sampling_kwargs(n)
         sample = self.env.batch_sample(n, bs, **eval_kwargs)
         batch = Batch.from_sample(sample)
         batch.valids = self.problem.validity(batch.samples, batch.kwargs)
+        total_sampled = n
+
+        while n_valid_target > 0 and batch.valids.sum().item() < n_valid_target:
+            extra_kwargs = self.problem.eval_sampling_kwargs(bs)
+            extra_sample = self.env.batch_sample(bs, bs, **extra_kwargs)
+            extra_batch = Batch.from_sample(extra_sample)
+            extra_batch.valids = self.problem.validity(extra_batch.samples, extra_batch.kwargs)
+            batch = Batch.concat([batch, extra_batch])
+            total_sampled += bs
 
         # Save samples
         directory = self.config.folder / "eval" / f"{iteration:04d}"
@@ -251,8 +263,11 @@ class ExploreLoop(Generic[D]):
         torch.save(batch.valids, directory / "valids.pt")
 
         # Compute and save evaluation metrics
-        metrics = self.problem.compute_metrics(batch.samples, batch.kwargs)
+        metrics = self.problem.compute_metrics(
+            batch.samples, batch.kwargs, n_valid=n_valid_target
+        )
         metrics["model_valid"] = batch.valids.float().mean().item()
+        metrics["n_eval_sampled"] = total_sampled
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
 
@@ -533,6 +548,7 @@ def add_global_args(parser):
 
     # Sampling
     parser.add_argument("--eval_samples", type=int, default=0)
+    parser.add_argument("--eval_valid_samples", type=int, default=0)
     parser.add_argument("--eval_batch_size", type=int, default=64)
     parser.add_argument("--eval_every", type=int, default=10)
 

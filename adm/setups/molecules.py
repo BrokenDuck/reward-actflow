@@ -255,9 +255,12 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         graph = self._mols_to_graph(mols)
         return DDGraph(graph), {}
 
-    def compute_metrics(self, samples: DDGraph, kwargs: dict) -> dict[str, float]:
+    def compute_metrics(self, samples: DDGraph, kwargs: dict, n_valid: int = 0) -> dict[str, float]:
         mols = self._graph_to_mols(samples)
         mols = [mol for mol in mols if mol is not None and self._is_mol_valid(mol)]
+
+        if n_valid > 0 and len(mols) > n_valid:
+            mols = mols[:n_valid]
 
         K = molecule_utils.get_tanimoto_K(mols)
         vendi_score = vendi.score_K(K)
@@ -266,7 +269,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         D = 1 - K
         avg_pairwise_dist = D.sum() / (n * (n - 1))
 
-        return { "vendi": float(vendi_score), "avg_pairwise_dist": float(avg_pairwise_dist) }
+        return { "vendi": float(vendi_score), "avg_pairwise_dist": float(avg_pairwise_dist), "n_valid_for_vendi": n }
 
     def compute_sample_metrics(self, samples: DDGraph, kwargs: dict) -> list[dict[str, Any]]:
         # In case these were not loaded from file, we need to relax geometry

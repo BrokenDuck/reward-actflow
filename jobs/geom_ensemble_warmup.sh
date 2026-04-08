@@ -16,9 +16,9 @@ module load eth_proxy
 
 WARMUP_CACHE_DIR=$1
 N_REG_SAMPLES="${2:-10000}"
+FT_MIN_DATASET_SIZE="${3:-2048}"
 
 SAMPLES_PER_ITER=64
-FT_MIN_DATASET_SIZE=2048
 # ~3x ratio accounts for ~33% validity rate during warmup, +10 buffer
 WARMUP_ITERS=$(( FT_MIN_DATASET_SIZE * 3 / SAMPLES_PER_ITER + 10 ))
 
