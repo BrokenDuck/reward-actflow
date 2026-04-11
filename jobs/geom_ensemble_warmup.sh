@@ -43,5 +43,6 @@ pixi run python -m adm.task_agnostic \
     --ft_steps 1 \
     --ft_lr 1e-4 \
     --no_uncertainty \
+    --no_wandb \
     --warmup_cache_dir "$WARMUP_CACHE_DIR" \
     $REG_ARG

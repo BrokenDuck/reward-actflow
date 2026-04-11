@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name="GEOM Ensemble"
+#SBATCH --job-name="GEOM NoUncert"
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=32GB
 #SBATCH --mem-bind=prefer
@@ -23,7 +23,6 @@ WARMUP_CACHE_DIR="${5:-}"
 ALPHA_REG="${6:-0}"
 SEED="${7:-}"
 FT_MIN_DATASET_SIZE="${8:-2048}"
-NEG_SCALE="${9:-0}"
 N_SAMPLES_DIVERSITY=500
 COMPUTE_VENDI=1
 
@@ -33,7 +32,7 @@ SAMPLES_PER_ITER=64
 WARMUP_ITERS=$(( FT_MIN_DATASET_SIZE * 3 / SAMPLES_PER_ITER + 10 ))
 NUM_ITERS=$(( NUM_FT_ITERS + WARMUP_ITERS ))
 
-FOLDER="${BASE_DIR}/ade_t${TIMESTEP}_dps${DPS_WEIGHT}_ftsteps${FT_STEPS}_ftmin${FT_MIN_DATASET_SIZE}_neg${NEG_SCALE}"
+FOLDER="${BASE_DIR}/baseline_no_uncertainty_t${TIMESTEP}_dps${DPS_WEIGHT}_ftsteps${FT_STEPS}_ftmin${FT_MIN_DATASET_SIZE}"
 if [ -n "$SEED" ]; then
     FOLDER="${FOLDER}_seed${SEED}"
 fi
@@ -83,8 +82,8 @@ pixi run python -m adm.task_agnostic \
     --ft_accumulate_steps 4 \
     --ft_steps $FT_STEPS \
     --eval_valid_samples $N_SAMPLES_DIVERSITY \
-    --neg_grad_scale $NEG_SCALE \
     ${COMPUTE_VENDI:+--compute_vendi} \
+    --no_uncertainty \
     $WARMUP_ARG \
     $REG_ARG \
     ${SEED:+--seed $SEED}

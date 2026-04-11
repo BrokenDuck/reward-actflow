@@ -5,7 +5,9 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 from diffusiongym import construct_env, D, Reward
-from diffusiongym.utils import train_base_model
+from diffusiongym.utils import train_base_model, DDDataset, dict_to_device
+from torch.utils.data import DataLoader
+import torch.nn as _nn
 import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
@@ -13,12 +15,14 @@ import logging
 import yaml
 import time
 import csv
+import signal
+import wandb
 
 from .inf_methods.dps import RewardGradient
 from .uncertainty import UncertaintyEstimator, FlowFeatureExtractor, uncertainty_estimators
 from .setups import setups as problem_setups
 from .setups.problem_setup import ProblemSetup
-from .utils import write_video, filter_out_invalids, Batch, serialize_args, setup_logger
+from .utils import write_video, filter_out_invalids, filter_out_valids, Batch, serialize_args, setup_logger
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,7 @@ class ExploreConfig:
     # Flags
     no_uncertainty: bool = False
     no_verifier: bool = False
+    compute_vendi: bool = False
 
     # Warmup caching
     warmup_cache_dir: Optional[Path] = None
@@ -69,6 +74,9 @@ class ExploreConfig:
     reg_data: bool = False
     alpha_reg: float = 1.0
     n_reg_samples: int = 10000
+
+    # Combined pos+neg finetuning with gradient norm scaling
+    neg_grad_scale: float = 0.0
 
     def __post_init__(self):
         # Create experiment directory if it doesn't exist
@@ -131,6 +139,9 @@ class ExploreLoop(Generic[D]):
         self.logger.info(f"base model parameters: {sum(p.numel() for p in self.base_model.parameters() if p.requires_grad):,}")
 
         self._timings = {}
+        self._pretrained_fps = None
+        self._cumulative_centers = None
+        self._fixed_projection = None
 
         # Create file and write headers
         self.timing_heads = ["iteration", "eval", "sampling", "visualize", "finetune", "uncertainty_update", "checkpoint"]
@@ -201,6 +212,162 @@ class ExploreLoop(Generic[D]):
             pbar=pbar,
         )
 
+    def combined_finetune_base_model(self, batches: list[Batch[D]], reg_batch: Batch[D] | None = None, pbar: bool = False):
+        """Fine-tune with combined pos+neg signal using gradient norm scaling.
+
+        Separate dataloaders for valid and invalid data:
+        - Positive update sees a full batch of valid samples (identical to finetune_base_model).
+        - Negative gradient is rescaled so ||grad_neg|| = neg_grad_scale * ||grad_pos||.
+
+        When neg_grad_scale=0 or there are no invalid samples, this falls back
+        to finetune_base_model (identical computational path).
+        """
+        if self.config.no_verifier:
+            self.finetune_base_model(batches, reg_batch=reg_batch, pbar=pbar)
+            return
+
+        valid_batch = filter_out_invalids(batches)
+        invalid_batch = filter_out_valids(batches)
+
+        m = len(valid_batch) if valid_batch is not None else 0
+        k = len(invalid_batch) if invalid_batch is not None else 0
+
+        if m == 0:
+            self.logger.warning("Combined FT: no valid data, skipping")
+            return
+
+        scale = self.config.neg_grad_scale
+        use_neg = scale > 0 and k > 0
+
+        if not use_neg:
+            self.finetune_base_model(batches, reg_batch=reg_batch, pbar=pbar)
+            return
+
+        self.logger.info(
+            f"Combined FT (grad-norm): m={m} k={k}, "
+            f"neg_grad_scale={scale}"
+        )
+
+        device = self.env.base_model.device
+        bs = self.config.ft_batch_size
+
+        pos_data = [valid_batch.latents.to(device)]
+        pos_kw = [valid_batch.kwargs]
+        pos_weights = None
+
+        if reg_batch is not None:
+            pos_data.append(reg_batch.latents.to(device))
+            pos_kw.append(reg_batch.kwargs)
+            pos_weights = [
+                torch.ones(len(valid_batch)),
+                self.config.alpha_reg * torch.ones(len(reg_batch)),
+            ]
+
+        pos_dataset = DDDataset(pos_data, pos_kw, pos_weights)
+        pos_loader = DataLoader(
+            pos_dataset, bs, shuffle=True,
+            collate_fn=pos_dataset.collate, num_workers=0, pin_memory=False,
+        )
+
+        neg_dataset = DDDataset(
+            [invalid_batch.latents.to(device)],
+            [invalid_batch.kwargs],
+            None,
+        )
+        neg_loader = DataLoader(
+            neg_dataset, bs, shuffle=True,
+            collate_fn=neg_dataset.collate, num_workers=0, pin_memory=False,
+        )
+
+        opt = torch.optim.AdamW(
+            self.base_model.parameters(),
+            lr=self.config.ft_lr,
+            weight_decay=self.config.ft_weight_decay,
+        )
+
+        accum = self.config.ft_accumulate_steps
+
+        self.base_model.train()
+        opt.zero_grad()
+        pos_iter = iter(pos_loader)
+        neg_iter = iter(neg_loader)
+
+        accum_grad_pos = {}
+        accum_grad_neg = {}
+
+        for step in range(self.config.ft_steps):
+            # --- positive micro-batch ---
+            try:
+                x1_pos, kw_pos, w_pos = next(pos_iter)
+            except StopIteration:
+                pos_iter = iter(pos_loader)
+                x1_pos, kw_pos, w_pos = next(pos_iter)
+
+            x1_pos = x1_pos.to(device)
+            kw_pos = dict_to_device(kw_pos, device)
+
+            loss_pos = (w_pos.to(device) * self.base_model.train_loss(x1_pos, **kw_pos)).mean() / accum
+            loss_pos.backward()
+
+            for name, p in self.base_model.named_parameters():
+                if p.grad is not None:
+                    if name in accum_grad_pos:
+                        accum_grad_pos[name].add_(p.grad)
+                    else:
+                        accum_grad_pos[name] = p.grad.clone()
+
+            # --- negative micro-batch ---
+            opt.zero_grad()
+
+            try:
+                x1_neg, kw_neg, _ = next(neg_iter)
+            except StopIteration:
+                neg_iter = iter(neg_loader)
+                x1_neg, kw_neg, _ = next(neg_iter)
+
+            x1_neg = x1_neg.to(device)
+            kw_neg = dict_to_device(kw_neg, device)
+
+            loss_neg = self.base_model.train_loss(x1_neg, **kw_neg).mean() / accum
+            loss_neg.backward()
+
+            for name, p in self.base_model.named_parameters():
+                if p.grad is not None:
+                    if name in accum_grad_neg:
+                        accum_grad_neg[name].add_(p.grad)
+                    else:
+                        accum_grad_neg[name] = p.grad.clone()
+
+            opt.zero_grad()
+
+            if (step + 1) % accum != 0:
+                continue
+
+            # --- optimizer step with accumulated gradients ---
+            norm_pos = torch.sqrt(sum(g.pow(2).sum() for g in accum_grad_pos.values()))
+            norm_neg_val = torch.sqrt(sum(g.pow(2).sum() for g in accum_grad_neg.values())) if accum_grad_neg else torch.tensor(0.0, device=device)
+
+            rescale = (scale * norm_pos) / norm_neg_val.clamp(min=1e-8)
+            rescale = rescale.clamp(max=1.0)
+
+            for name, p in self.base_model.named_parameters():
+                has_pos = name in accum_grad_pos
+                has_neg = name in accum_grad_neg
+                if has_pos and has_neg:
+                    p.grad = accum_grad_pos[name] - rescale * accum_grad_neg[name]
+                elif has_pos:
+                    p.grad = accum_grad_pos[name]
+                elif has_neg:
+                    p.grad = -rescale * accum_grad_neg[name]
+
+            _nn.utils.clip_grad_norm_(self.base_model.parameters(), 0.1)
+            opt.step()
+            opt.zero_grad()
+            accum_grad_pos = {}
+            accum_grad_neg = {}
+
+        self.base_model.eval()
+
     def update_uncertainty_estimator(self, batches: list[Batch[D]]):
         """Update the uncertainty estimator with obtained samples.
 
@@ -231,6 +398,78 @@ class ExploreLoop(Generic[D]):
         fig_path = directory / f"{iteration:04d}.png"
         fig.savefig(fig_path, dpi=300)
         plt.close(fig)
+
+    @torch.no_grad()
+    def _generate_or_load_pretrained_fps(self):
+        """Generate fingerprints from the pretrained model (before any fine-tuning).
+
+        Cached in warmup_cache_dir so all runs share the same reference.
+        """
+        if not hasattr(self.problem, "get_morgan_fingerprints"):
+            return
+        if self.config.eval_valid_samples <= 0 and self.config.eval_samples <= 0:
+            return
+
+        cache_dir = self.config.warmup_cache_dir or self.config.folder
+        cache_path = cache_dir / "pretrained_fps.npy"
+
+        if cache_path.exists():
+            self._pretrained_fps = np.load(cache_path)
+            self.logger.info(f"Loaded pretrained fingerprints: {self._pretrained_fps.shape[0]} mols from {cache_path}")
+            return
+
+        n_valid_target = max(self.config.eval_valid_samples, 200)
+        n = max(self.config.eval_samples, n_valid_target)
+        n = max(n, 64)
+        bs = self.config.eval_batch_size
+
+        self.logger.info(f"Generating pretrained fingerprints ({n_valid_target} valid target)...")
+        eval_kwargs = self.problem.eval_sampling_kwargs(n)
+        sample = self.env.batch_sample(n, bs, **eval_kwargs)
+        batch = Batch.from_sample(sample)
+        batch.valids = self.problem.validity(batch.samples, batch.kwargs)
+
+        while n_valid_target > 0 and batch.valids.sum().item() < n_valid_target:
+            extra_kwargs = self.problem.eval_sampling_kwargs(bs)
+            extra_sample = self.env.batch_sample(bs, bs, **extra_kwargs)
+            extra_batch = Batch.from_sample(extra_sample)
+            extra_batch.valids = self.problem.validity(extra_batch.samples, extra_batch.kwargs)
+            batch = Batch.concat([batch, extra_batch])
+
+        self._pretrained_fps = self.problem.get_morgan_fingerprints(
+            batch.samples, batch.kwargs, n_valid=n_valid_target
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, self._pretrained_fps)
+        self.logger.info(f"Saved pretrained fingerprints: {self._pretrained_fps.shape[0]} mols to {cache_path}")
+
+    def _get_fixed_projection(self) -> np.ndarray | None:
+        """Get or create a fixed random projection matrix for stable PCA plots.
+
+        The projection is a (fp_dim, 2) matrix seeded from the pretrained fps
+        so it's deterministic and identical across runs sharing the same cache.
+        """
+        if self._fixed_projection is not None:
+            return self._fixed_projection
+        if self._pretrained_fps is None:
+            return None
+
+        cache_dir = self.config.warmup_cache_dir or self.config.folder
+        proj_path = cache_dir / "fixed_projection.npy"
+
+        if proj_path.exists():
+            self._fixed_projection = np.load(proj_path)
+            self.logger.info(f"Loaded fixed projection from {proj_path}")
+            return self._fixed_projection
+
+        fp_dim = self._pretrained_fps.shape[1]
+        rng = np.random.RandomState(42)
+        raw = rng.randn(fp_dim, 2).astype(np.float32)
+        self._fixed_projection = raw / np.linalg.norm(raw, axis=0, keepdims=True)
+        proj_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(proj_path, self._fixed_projection)
+        self.logger.info(f"Saved fixed projection ({fp_dim}, 2) to {proj_path}")
+        return self._fixed_projection
 
     @torch.no_grad()
     def eval_model(self, iteration: int) -> dict[str, float]:
@@ -264,12 +503,42 @@ class ExploreLoop(Generic[D]):
 
         # Compute and save evaluation metrics
         metrics = self.problem.compute_metrics(
-            batch.samples, batch.kwargs, n_valid=n_valid_target
+            batch.samples, batch.kwargs,
+            n_valid=n_valid_target,
+            compute_vendi=self.config.compute_vendi,
         )
         metrics["model_valid"] = batch.valids.float().mean().item()
         metrics["n_eval_sampled"] = total_sampled
+
+        # Fingerprint-based metrics
+        current_fps = None
+        if self._pretrained_fps is not None and hasattr(self.problem, "get_morgan_fingerprints"):
+            current_fps = self.problem.get_morgan_fingerprints(
+                batch.samples, batch.kwargs, n_valid=n_valid_target
+            )
+            metrics["novelty"] = self.problem.compute_novelty(current_fps, self._pretrained_fps)
+
+            # Cumulative cluster coverage tracking (disabled — kept for future use)
+            # if hasattr(self.problem, "compute_cumulative_cluster_metrics"):
+            #     cluster_metrics, self._cumulative_centers = self.problem.compute_cumulative_cluster_metrics(
+            #         current_fps, self._cumulative_centers, threshold=0.85,
+            #     )
+            #     metrics.update(cluster_metrics)
+
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
+
+        # Fixed random projection PCA plot (stable axes across iterations)
+        if current_fps is not None:
+            proj = self._get_fixed_projection()
+            if proj is not None:
+                fig = self.problem.plot_fingerprint_fixed_projection(
+                    current_fps, self._pretrained_fps, proj
+                )
+                if fig is not None:
+                    fig.savefig(directory / "fingerprint_pca.png", dpi=100, bbox_inches="tight")
+                    wandb.log({"fingerprint_fixed_proj": wandb.Image(fig)}, commit=False)
+                    plt.close(fig)
 
         return metrics
 
@@ -350,6 +619,7 @@ class ExploreLoop(Generic[D]):
         start_iter = 0
 
         reg_batch = self._generate_or_load_reg_data()
+        self._generate_or_load_pretrained_fps()
 
         cached = self._load_warmup_cache()
         if cached is not None:
@@ -359,7 +629,12 @@ class ExploreLoop(Generic[D]):
 
             with self._timer("eval"):
                 metrics = self.eval_model(start_iter)
-            self.logger.info(f"(ft_iter=00000) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+            self.logger.info(f"(iter={start_iter}, ft_iter=00000) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+            wandb.log({
+                "iter": start_iter, "ft_iter": 0,
+                **{f"by_iter/{k}": v for k, v in metrics.items()},
+                **{f"by_ft_iter/{k}": v for k, v in metrics.items()},
+            })
 
         for i in range(start_iter, num_iterations):
             # Determine if we should use uncertainty guidance
@@ -373,10 +648,10 @@ class ExploreLoop(Generic[D]):
 
             ft_iter = i - (ft_start_iter - 1) if ft_start_iter is not None else i - num_iterations
 
-            # Evaluate current model state: at iter 0, at ft_iter=0, then every eval_every ft_iters
+            # Evaluate current model state every eval_every iterations
             with self._timer("eval"):
                 metrics = {}
-                should_eval = (i == 0) or (ft_iter == 0) or (ft_iter > 0 and ft_iter % self.config.eval_every == 0)
+                should_eval = (i == 0) or (i % self.config.eval_every == 0)
                 if should_eval:
                     metrics = self.eval_model(i)
 
@@ -409,12 +684,22 @@ class ExploreLoop(Generic[D]):
                 metrics["uncertainty"] = uncert.mean().item()
                 metrics["biased_valid"] = batch.valids.float().mean().item()
                 metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
-                self.logger.info(f"(ft_iter={ft_iter:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+                self.logger.info(f"(iter={i}, ft_iter={ft_iter:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+                log_dict = {
+                    "iter": i, "ft_iter": ft_iter,
+                    **{f"by_iter/{k}": v for k, v in metrics.items()},
+                }
+                if ft_iter >= 0:
+                    log_dict.update({f"by_ft_iter/{k}": v for k, v in metrics.items()})
+                wandb.log(log_dict)
 
             # Update models with full buffer
             with self._timer("finetune"):
                 if has_enough_data:
-                    self.finetune_base_model(batches, reg_batch=reg_batch, pbar=False)
+                    if self.config.neg_grad_scale > 0:
+                        self.combined_finetune_base_model(batches, reg_batch=reg_batch, pbar=False)
+                    else:
+                        self.finetune_base_model(batches, reg_batch=reg_batch, pbar=False)
 
             with self._timer("uncertainty_update"):
                 if not self.config.no_uncertainty:
@@ -487,8 +772,45 @@ def setup_and_run(args: argparse.Namespace, reward: Reward, mean_weight: float):
     logger = setup_logger(config.folder, args.verbose)
     logger.info("starting...")
 
+    use_wandb = not getattr(args, "no_wandb", False)
+
+    if use_wandb:
+        tags = []
+        if config.no_uncertainty:
+            tags.append("no_uncertainty")
+        if config.no_verifier:
+            tags.append("no_verifier")
+        if config.reg_data:
+            tags.append(f"reg_a{config.alpha_reg}")
+        if config.neg_grad_scale > 0:
+            tags.append(f"neg{config.neg_grad_scale}")
+        wandb_name = config.folder.name + ("_" + "_".join(tags) if tags else "")
+
+        wandb.init(
+            entity="riccardodesanti",
+            project="active_flow_expansion",
+            name=wandb_name,
+            tags=tags,
+            config=serialize_args(args),
+        )
+        wandb.define_metric("iter")
+        wandb.define_metric("ft_iter")
+        wandb.define_metric("by_iter/*", step_metric="iter")
+        wandb.define_metric("by_ft_iter/*", step_metric="ft_iter")
+
+        def _handle_sigterm(signum, frame):
+            wandb.finish(exit_code=1)
+            raise SystemExit(1)
+
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    else:
+        wandb.init(mode="disabled")
+
     loop = ExploreLoop(problem_setup=problem_setup, uncertainty=uncertainty, reward=reward, config=config, logger=logger)
     loop.explore_loop(config.num_iters, config.samples_per_iter)
+
+    if use_wandb:
+        wandb.finish()
 
 
 def build_parser(add_extra_args):
@@ -562,3 +884,6 @@ def add_global_args(parser):
     parser.add_argument("--reg_data", action="store_true")
     parser.add_argument("--alpha_reg", type=float, default=1.0)
     parser.add_argument("--n_reg_samples", type=int, default=10000)
+
+    # Combined pos+neg finetuning
+    parser.add_argument("--neg_grad_scale", type=float, default=0.0)

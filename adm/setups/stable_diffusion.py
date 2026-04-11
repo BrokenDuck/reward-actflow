@@ -174,7 +174,7 @@ class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
     def eval_sampling_kwargs(self, n: int) -> dict[str, Any]:
         return { "prompt": ["An impressionist painting"] * n, "cfg_scale": torch.full((n,), 4.0) }
 
-    def compute_metrics(self, samples: DDTensor, kwargs: dict, n_valid: int = 0) -> dict[str, float]:
+    def compute_metrics(self, samples: DDTensor, kwargs: dict, n_valid: int = 0, compute_vendi: bool = False) -> dict[str, float]:
         img_list = to_pil_images(samples)
         feats = self.clip.embed_images(img_list).cpu()
         return { "vendi": vendi.score_X(feats) }

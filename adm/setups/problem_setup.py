@@ -168,7 +168,7 @@ class ProblemSetup(ABC, Generic[D]):
         """
         return {}
 
-    def compute_metrics(self, samples: D, kwargs: dict, n_valid: int = 0) -> dict[str, float]:
+    def compute_metrics(self, samples: D, kwargs: dict, n_valid: int = 0, compute_vendi: bool = False) -> dict[str, float]:
         """Compute global metrics for the problem setup.
         
         Parameters
@@ -179,6 +179,8 @@ class ProblemSetup(ABC, Generic[D]):
             The keyword arguments used to generate the samples.
         n_valid : int
             If > 0, cap the number of valid samples used for metrics.
+        compute_vendi : bool
+            If True, compute the Vendi diversity score.
 
         Returns
         -------

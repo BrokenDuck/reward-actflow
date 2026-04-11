@@ -3,8 +3,14 @@ from typing import Optional, Any
 import torch
 import torch.nn.functional as F
 import dgl
-from rdkit import Chem, RDLogger
-from rdkit.Chem import Draw, AllChem, Crippen, QED
+import numpy as np
+from rdkit import Chem, DataStructs, RDLogger
+from rdkit.Chem import Draw, AllChem, Crippen, QED, rdFingerprintGenerator
+from rdkit.SimDivFilters import rdSimDivPickers
+from sklearn.decomposition import PCA
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import gaussian_kde
 from flowmol.data_processing.utils import build_edge_idxs
 from flowmol.analysis.molecule_builder import SampledMolecule, bond_type_to_idx
 from diffusiongym import  BaseModel, Environment
@@ -255,21 +261,223 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         graph = self._mols_to_graph(mols)
         return DDGraph(graph), {}
 
-    def compute_metrics(self, samples: DDGraph, kwargs: dict, n_valid: int = 0) -> dict[str, float]:
+    def compute_metrics(self, samples: DDGraph, kwargs: dict, n_valid: int = 0, compute_vendi: bool = False) -> dict[str, float]:
         mols = self._graph_to_mols(samples)
         mols = [mol for mol in mols if mol is not None and self._is_mol_valid(mol)]
 
         if n_valid > 0 and len(mols) > n_valid:
             mols = mols[:n_valid]
 
-        K = molecule_utils.get_tanimoto_K(mols)
-        vendi_score = vendi.score_K(K)
-
         n = len(mols)
-        D = 1 - K
-        avg_pairwise_dist = D.sum() / (n * (n - 1))
+        result: dict[str, float] = {"n_valid_for_metrics": n}
+        if compute_vendi:
+            K = molecule_utils.get_tanimoto_K(mols)
+            result["vendi"] = float(vendi.score_K(K))
 
-        return { "vendi": float(vendi_score), "avg_pairwise_dist": float(avg_pairwise_dist), "n_valid_for_vendi": n }
+        if n >= 2:
+            fpgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+            fps = [fpgen.GetFingerprint(mol) for mol in mols]
+            picks = rdSimDivPickers.LeaderPicker().LazyBitVectorPick(fps, len(fps), 0.85)
+            result["sphere_exclusion_diversity"] = len(picks) / n
+            result["n_clusters"] = float(len(picks))
+
+        return result
+
+    def get_morgan_fingerprints(self, samples: DDGraph, kwargs: dict, n_valid: int = 0) -> np.ndarray:
+        """Extract Morgan fingerprint bit vectors for valid molecules."""
+        mols = self._graph_to_mols(samples)
+        mols = [mol for mol in mols if mol is not None and self._is_mol_valid(mol)]
+        if n_valid > 0 and len(mols) > n_valid:
+            mols = mols[:n_valid]
+
+        fps = [AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=1024) for mol in mols]
+        arr = np.zeros((len(fps), 1024), dtype=np.float32)
+        for i, fp in enumerate(fps):
+            DataStructs.ConvertToNumpyArray(fp, arr[i])
+        return arr
+
+    @staticmethod
+    def compute_novelty(current_fps: np.ndarray, reference_fps: np.ndarray) -> float:
+        """Novelty = 1 - mean nearest-neighbour Tanimoto similarity to reference set."""
+        if len(current_fps) == 0 or len(reference_fps) == 0:
+            return 0.0
+        cur = current_fps.astype(np.int32)
+        ref = reference_fps.astype(np.int32)
+        intersection = cur @ ref.T
+        cur_bits = cur.sum(axis=1, keepdims=True)
+        ref_bits = ref.sum(axis=1, keepdims=True)
+        union = cur_bits + ref_bits.T - intersection
+        tanimoto = np.divide(
+            intersection.astype(float), union.astype(float),
+            out=np.zeros_like(intersection, dtype=float), where=union > 0,
+        )
+        max_sim = tanimoto.max(axis=1)
+        return float(1.0 - max_sim.mean())
+
+    @staticmethod
+    def plot_fingerprint_pca(
+        current_fps: np.ndarray,
+        pretrained_fps: np.ndarray,
+    ) -> Figure | None:
+        """PCA + KDE density plot of current vs pretrained fingerprints.
+
+        PCA is fit on the concatenation of both sets each time so the axes
+        adapt to capture directions where the distributions differ most.
+        """
+        if len(current_fps) < 3 or len(pretrained_fps) < 3:
+            return None
+
+        combined = np.vstack([pretrained_fps, current_fps])
+        reducer = make_pipeline(StandardScaler(), PCA(n_components=2)).fit(combined)
+        emb_pre = reducer.transform(pretrained_fps)
+        emb_cur = reducer.transform(current_fps)
+
+        return MoleculeProblemSetup._kde_contour_plot(emb_pre, emb_cur)
+
+    @staticmethod
+    def plot_fingerprint_fixed_projection(
+        current_fps: np.ndarray,
+        pretrained_fps: np.ndarray,
+        projection: np.ndarray,
+    ) -> Figure | None:
+        """KDE density plot using a fixed random projection (stable across iterations).
+
+        Axis limits are derived from the pretrained embeddings with generous
+        padding so the viewport stays constant across all iterations.
+        """
+        if len(current_fps) < 3 or len(pretrained_fps) < 3:
+            return None
+        emb_pre = pretrained_fps @ projection
+        emb_cur = current_fps @ projection
+
+        margin = 0.5
+        x_range = emb_pre[:, 0].max() - emb_pre[:, 0].min()
+        y_range = emb_pre[:, 1].max() - emb_pre[:, 1].min()
+        xlim = (emb_pre[:, 0].min() - margin * x_range, emb_pre[:, 0].max() + margin * x_range)
+        ylim = (emb_pre[:, 1].min() - margin * y_range, emb_pre[:, 1].max() + margin * y_range)
+        return MoleculeProblemSetup._kde_contour_plot(emb_pre, emb_cur, xlim=xlim, ylim=ylim)
+
+    @staticmethod
+    def _kde_contour_plot(
+        emb_pre: np.ndarray,
+        emb_cur: np.ndarray,
+        xlim: tuple[float, float] | None = None,
+        ylim: tuple[float, float] | None = None,
+    ) -> Figure:
+        if xlim is None or ylim is None:
+            all_emb = np.vstack([emb_pre, emb_cur])
+            x_margin = max((all_emb[:, 0].max() - all_emb[:, 0].min()) * 0.15, 1e-3)
+            y_margin = max((all_emb[:, 1].max() - all_emb[:, 1].min()) * 0.15, 1e-3)
+            xlim = (all_emb[:, 0].min() - x_margin, all_emb[:, 0].max() + x_margin)
+            ylim = (all_emb[:, 1].min() - y_margin, all_emb[:, 1].max() + y_margin)
+
+        gridsize = 150
+        xs = np.linspace(xlim[0], xlim[1], gridsize)
+        ys = np.linspace(ylim[0], ylim[1], gridsize)
+        xx, yy = np.meshgrid(xs, ys)
+        grid_pts = np.vstack([xx.ravel(), yy.ravel()])
+
+        def _kde_level(emb, percentile=0.1):
+            kde = gaussian_kde(emb.T)
+            zz = kde(grid_pts).reshape(xx.shape)
+            densities_at_pts = kde(emb.T)
+            level = float(np.percentile(densities_at_pts, 100 * percentile))
+            return zz, level
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+
+        try:
+            zz_pre, lvl_pre = _kde_level(emb_pre)
+            ax.contourf(xx, yy, zz_pre, levels=[lvl_pre, zz_pre.max() * 10],
+                        colors=["gray"], alpha=0.25)
+            ax.contour(xx, yy, zz_pre, levels=[lvl_pre],
+                       colors=["gray"], linewidths=1.5, alpha=0.6)
+        except np.linalg.LinAlgError:
+            ax.scatter(emb_pre[:, 0], emb_pre[:, 1], c="gray", alpha=0.3, s=10)
+
+        try:
+            zz_cur, lvl_cur = _kde_level(emb_cur)
+            ax.contourf(xx, yy, zz_cur, levels=[lvl_cur, zz_cur.max() * 10],
+                        colors=["#7e57c2"], alpha=0.25)
+            ax.contour(xx, yy, zz_cur, levels=[lvl_cur],
+                       colors=["#7e57c2"], linewidths=1.5, alpha=0.6)
+        except np.linalg.LinAlgError:
+            ax.scatter(emb_cur[:, 0], emb_cur[:, 1], c="purple", alpha=0.3, s=10)
+
+        ax.plot([], [], color="gray", linewidth=6, alpha=0.5, label="Pretrained")
+        ax.plot([], [], color="#7e57c2", linewidth=6, alpha=0.5, label="Current")
+        ax.legend(fontsize=12)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        plt.tight_layout()
+        return fig
+
+    @staticmethod
+    def compute_cumulative_cluster_metrics(
+        current_fps: np.ndarray,
+        cumulative_centers: np.ndarray | None,
+        threshold: float = 0.85,
+    ) -> tuple[dict[str, float], np.ndarray]:
+        """Track cluster expansion across iterations using Tanimoto sphere exclusion.
+
+        Returns metrics dict and the updated cumulative_centers array.
+        """
+        cur_int = current_fps.astype(np.int32)
+
+        cur_bits = cur_int.sum(axis=1, keepdims=True)
+        cur_self_inter = cur_int @ cur_int.T
+        cur_union = cur_bits + cur_bits.T - cur_self_inter
+        cur_tanimoto = np.divide(
+            cur_self_inter.astype(float), cur_union.astype(float),
+            out=np.zeros_like(cur_self_inter, dtype=float), where=cur_union > 0,
+        )
+        n = len(current_fps)
+        picked = [0]
+        for i in range(1, n):
+            if all(cur_tanimoto[i, j] < threshold for j in picked):
+                picked.append(i)
+        current_centers = current_fps[picked]
+
+        if cumulative_centers is None:
+            return {
+                "cumulative_clusters": float(len(current_centers)),
+                "coverage_of_cumulative": 1.0,
+                "new_clusters": float(len(current_centers)),
+                "clusters_lost": 0.0,
+            }, current_centers.copy()
+
+        def _max_tanimoto(query: np.ndarray, reference: np.ndarray) -> np.ndarray:
+            q = query.astype(np.int32)
+            r = reference.astype(np.int32)
+            inter = q @ r.T
+            q_bits = q.sum(axis=1, keepdims=True)
+            r_bits = r.sum(axis=1, keepdims=True)
+            union = q_bits + r_bits.T - inter
+            sim = np.divide(
+                inter.astype(float), union.astype(float),
+                out=np.zeros_like(inter, dtype=float), where=union > 0,
+            )
+            return sim.max(axis=1)
+
+        coverage_sim = _max_tanimoto(cumulative_centers, current_fps)
+        covered = (coverage_sim >= threshold).sum()
+        n_prev = len(cumulative_centers)
+        clusters_lost = n_prev - int(covered)
+
+        novelty_sim = _max_tanimoto(current_centers, cumulative_centers)
+        new_mask = novelty_sim < threshold
+        new_centers = current_centers[new_mask]
+
+        updated = np.vstack([cumulative_centers, new_centers]) if len(new_centers) > 0 else cumulative_centers.copy()
+
+        return {
+            "cumulative_clusters": float(len(updated)),
+            "coverage_of_cumulative": float(covered) / n_prev if n_prev > 0 else 1.0,
+            "new_clusters": float(len(new_centers)),
+            "clusters_lost": float(clusters_lost),
+        }, updated
 
     def compute_sample_metrics(self, samples: DDGraph, kwargs: dict) -> list[dict[str, Any]]:
         # In case these were not loaded from file, we need to relax geometry
