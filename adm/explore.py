@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from diffusiongym import construct_env, D, Reward
 from diffusiongym.utils import train_base_model, DDDataset, dict_to_device
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import torch.nn as _nn
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -15,6 +15,7 @@ import logging
 import yaml
 import time
 import csv
+import os
 import signal
 import wandb
 
@@ -77,6 +78,7 @@ class ExploreConfig:
 
     # Combined pos+neg finetuning with gradient norm scaling
     neg_grad_scale: float = 0.0
+    max_neg_samples: int = 10000
 
     def __post_init__(self):
         # Create experiment directory if it doesn't exist
@@ -140,6 +142,7 @@ class ExploreLoop(Generic[D]):
 
         self._timings = {}
         self._pretrained_fps = None
+        self._pretrained_fps_large = None
         self._cumulative_centers = None
         self._fixed_projection = None
 
@@ -243,8 +246,11 @@ class ExploreLoop(Generic[D]):
             self.finetune_base_model(batches, reg_batch=reg_batch, pbar=pbar)
             return
 
+        max_neg = self.config.max_neg_samples
+        k_used = min(k, max_neg)
+
         self.logger.info(
-            f"Combined FT (grad-norm): m={m} k={k}, "
+            f"Combined FT (grad-norm): m={m} k_total={k} k_used={k_used}, "
             f"neg_grad_scale={scale}"
         )
 
@@ -269,14 +275,19 @@ class ExploreLoop(Generic[D]):
             collate_fn=pos_dataset.collate, num_workers=0, pin_memory=False,
         )
 
-        neg_dataset = DDDataset(
+        neg_dataset_full = DDDataset(
             [invalid_batch.latents.to(device)],
             [invalid_batch.kwargs],
             None,
         )
+        if k > max_neg:
+            subset_idx = torch.randperm(k)[:max_neg].tolist()
+            neg_dataset = Subset(neg_dataset_full, subset_idx)
+        else:
+            neg_dataset = neg_dataset_full
         neg_loader = DataLoader(
             neg_dataset, bs, shuffle=True,
-            collate_fn=neg_dataset.collate, num_workers=0, pin_memory=False,
+            collate_fn=neg_dataset_full.collate, num_workers=0, pin_memory=False,
         )
 
         opt = torch.optim.AdamW(
@@ -360,6 +371,17 @@ class ExploreLoop(Generic[D]):
                 elif has_neg:
                     p.grad = -rescale * accum_grad_neg[name]
 
+            has_nan = any(
+                p.grad is not None and torch.isnan(p.grad).any()
+                for p in self.base_model.parameters()
+            )
+            if has_nan:
+                self.logger.warning(f"NaN gradient detected at step {step}, skipping optimizer step")
+                opt.zero_grad()
+                accum_grad_pos = {}
+                accum_grad_neg = {}
+                continue
+
             _nn.utils.clip_grad_norm_(self.base_model.parameters(), 0.1)
             opt.step()
             opt.zero_grad()
@@ -403,7 +425,10 @@ class ExploreLoop(Generic[D]):
     def _generate_or_load_pretrained_fps(self):
         """Generate fingerprints from the pretrained model (before any fine-tuning).
 
-        Cached in warmup_cache_dir so all runs share the same reference.
+        Two caches:
+        - pretrained_fps.npy: small set (eval_valid_samples) for PCA plots
+        - pretrained_fps_large.npy: large set (10000) for novelty metric
+        Both are cached in warmup_cache_dir so all runs share the same reference.
         """
         if not hasattr(self.problem, "get_morgan_fingerprints"):
             return
@@ -411,37 +436,43 @@ class ExploreLoop(Generic[D]):
             return
 
         cache_dir = self.config.warmup_cache_dir or self.config.folder
-        cache_path = cache_dir / "pretrained_fps.npy"
+        n_pca = max(self.config.eval_valid_samples, 200)
+        n_novelty = 10000
+
+        self._load_or_generate_fps_cache(cache_dir, "pretrained_fps.npy", n_pca, "_pretrained_fps")
+        self._load_or_generate_fps_cache(cache_dir, "pretrained_fps_large.npy", n_novelty, "_pretrained_fps_large")
+
+    @torch.no_grad()
+    def _load_or_generate_fps_cache(self, cache_dir: Path, filename: str, n_valid_target: int, attr_name: str):
+        cache_path = cache_dir / filename
 
         if cache_path.exists():
-            self._pretrained_fps = np.load(cache_path)
-            self.logger.info(f"Loaded pretrained fingerprints: {self._pretrained_fps.shape[0]} mols from {cache_path}")
+            fps = np.load(cache_path)
+            setattr(self, attr_name, fps)
+            self.logger.info(f"Loaded {attr_name}: {fps.shape[0]} mols from {cache_path}")
             return
 
-        n_valid_target = max(self.config.eval_valid_samples, 200)
-        n = max(self.config.eval_samples, n_valid_target)
-        n = max(n, 64)
         bs = self.config.eval_batch_size
+        chunk = max(self.config.eval_samples, 64)
+        all_fps = []
+        n_valid_so_far = 0
 
-        self.logger.info(f"Generating pretrained fingerprints ({n_valid_target} valid target)...")
-        eval_kwargs = self.problem.eval_sampling_kwargs(n)
-        sample = self.env.batch_sample(n, bs, **eval_kwargs)
-        batch = Batch.from_sample(sample)
-        batch.valids = self.problem.validity(batch.samples, batch.kwargs)
+        self.logger.info(f"Generating {attr_name} ({n_valid_target} valid target)...")
+        while n_valid_so_far < n_valid_target:
+            eval_kwargs = self.problem.eval_sampling_kwargs(chunk)
+            sample = self.env.batch_sample(chunk, bs, **eval_kwargs)
+            batch = Batch.from_sample(sample)
+            batch.valids = self.problem.validity(batch.samples, batch.kwargs)
+            chunk_fps = self.problem.get_morgan_fingerprints(batch.samples, batch.kwargs)
+            all_fps.append(chunk_fps)
+            n_valid_so_far += len(chunk_fps)
+            self.logger.info(f"  {attr_name}: {n_valid_so_far}/{n_valid_target} valid mols collected")
 
-        while n_valid_target > 0 and batch.valids.sum().item() < n_valid_target:
-            extra_kwargs = self.problem.eval_sampling_kwargs(bs)
-            extra_sample = self.env.batch_sample(bs, bs, **extra_kwargs)
-            extra_batch = Batch.from_sample(extra_sample)
-            extra_batch.valids = self.problem.validity(extra_batch.samples, extra_batch.kwargs)
-            batch = Batch.concat([batch, extra_batch])
-
-        self._pretrained_fps = self.problem.get_morgan_fingerprints(
-            batch.samples, batch.kwargs, n_valid=n_valid_target
-        )
+        fps = np.vstack(all_fps)[:n_valid_target]
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(cache_path, self._pretrained_fps)
-        self.logger.info(f"Saved pretrained fingerprints: {self._pretrained_fps.shape[0]} mols to {cache_path}")
+        np.save(cache_path, fps)
+        setattr(self, attr_name, fps)
+        self.logger.info(f"Saved {attr_name}: {fps.shape[0]} mols to {cache_path}")
 
     def _get_fixed_projection(self) -> np.ndarray | None:
         """Get or create a fixed random projection matrix for stable PCA plots.
@@ -516,7 +547,8 @@ class ExploreLoop(Generic[D]):
             current_fps = self.problem.get_morgan_fingerprints(
                 batch.samples, batch.kwargs, n_valid=n_valid_target
             )
-            metrics["novelty"] = self.problem.compute_novelty(current_fps, self._pretrained_fps)
+            ref_fps = self._pretrained_fps_large if self._pretrained_fps_large is not None else self._pretrained_fps
+            metrics["novelty"] = self.problem.compute_novelty(current_fps, ref_fps)
 
             # Cumulative cluster coverage tracking (disabled — kept for future use)
             # if hasattr(self.problem, "compute_cumulative_cluster_metrics"):
@@ -648,10 +680,13 @@ class ExploreLoop(Generic[D]):
 
             ft_iter = i - (ft_start_iter - 1) if ft_start_iter is not None else i - num_iterations
 
-            # Evaluate current model state every eval_every iterations
+            # Evaluate current model state every eval_every ft_iters
             with self._timer("eval"):
                 metrics = {}
-                should_eval = (i == 0) or (i % self.config.eval_every == 0)
+                if ft_start_iter is not None:
+                    should_eval = ft_iter > 0 and ft_iter % self.config.eval_every == 0
+                else:
+                    should_eval = (i == 0) or (i % self.config.eval_every == 0)
                 if should_eval:
                     metrics = self.eval_model(i)
 
@@ -784,7 +819,8 @@ def setup_and_run(args: argparse.Namespace, reward: Reward, mean_weight: float):
             tags.append(f"reg_a{config.alpha_reg}")
         if config.neg_grad_scale > 0:
             tags.append(f"neg{config.neg_grad_scale}")
-        wandb_name = config.folder.name + ("_" + "_".join(tags) if tags else "")
+        prefix = f"{args.problem_setup}_" if args.problem_setup != "geom_drugs" else ""
+        wandb_name = prefix + config.folder.name + ("_" + "_".join(tags) if tags else "")
 
         wandb.init(
             entity="riccardodesanti",
@@ -887,3 +923,4 @@ def add_global_args(parser):
 
     # Combined pos+neg finetuning
     parser.add_argument("--neg_grad_scale", type=float, default=0.0)
+    parser.add_argument("--max_neg_samples", type=int, default=10000)

@@ -27,7 +27,7 @@ NEG_SCALE="${9:-0}"
 N_SAMPLES_DIVERSITY=500
 COMPUTE_VENDI=1
 
-NUM_FT_ITERS=500
+NUM_FT_ITERS=5000
 SAMPLES_PER_ITER=64
 # ~3x ratio accounts for ~33% validity rate during warmup
 WARMUP_ITERS=$(( FT_MIN_DATASET_SIZE * 3 / SAMPLES_PER_ITER + 10 ))
@@ -71,7 +71,7 @@ pixi run python -m adm.task_agnostic \
     --dir $FOLDER \
     --eval_samples 1000 \
     --eval_batch_size 16 \
-    --eval_every 5 \
+    --eval_every 50 \
     --dps_weight $DPS_WEIGHT \
     --feat_timestep $TIMESTEP \
     --num_iters $NUM_ITERS \

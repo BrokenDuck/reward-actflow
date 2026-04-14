@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name="GEOM NoUncert"
+#SBATCH --job-name="QM9 NoUncert"
 #SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=32GB
+#SBATCH --mem-per-cpu=8GB
 #SBATCH --mem-bind=prefer
 #SBATCH --gres-flags=enforce-binding
 #SBATCH --gpu-bind=closest
@@ -17,18 +17,17 @@ module load eth_proxy
 TIMESTEP=$1
 FT_STEPS=$2
 FT_LR=1e-4
-BASE_DIR="${3:-$SCRATCH/adm/geom_ensemble_long}"
+BASE_DIR="${3:-$SCRATCH/adm/qm9_ensemble_long}"
 WARMUP_CACHE_DIR="${4:-}"
 ALPHA_REG="${5:-0}"
 SEED="${6:-}"
-FT_MIN_DATASET_SIZE="${7:-2048}"
+FT_MIN_DATASET_SIZE="${7:-4096}"
 N_SAMPLES_DIVERSITY=500
 COMPUTE_VENDI=1
 
-NUM_FT_ITERS=5000
+NUM_FT_ITERS=500
 SAMPLES_PER_ITER=64
-# ~3x ratio accounts for ~33% validity rate during warmup
-WARMUP_ITERS=$(( FT_MIN_DATASET_SIZE * 3 / SAMPLES_PER_ITER + 10 ))
+WARMUP_ITERS=$(( FT_MIN_DATASET_SIZE * 2 / SAMPLES_PER_ITER + 10 ))
 NUM_ITERS=$(( NUM_FT_ITERS + WARMUP_ITERS ))
 
 FOLDER="${BASE_DIR}/baseline_no_uncertainty_t${TIMESTEP}_ftsteps${FT_STEPS}_ftmin${FT_MIN_DATASET_SIZE}"
@@ -64,20 +63,20 @@ if [ "$(echo "$ALPHA_REG > 0" | bc -l)" -eq 1 ]; then
 fi
 
 pixi run python -m adm.task_agnostic \
-    geom_drugs \
+    qm9 \
     ensemble \
     --dir $FOLDER \
     --eval_samples 1000 \
-    --eval_batch_size 16 \
+    --eval_batch_size 512 \
     --eval_every 50 \
     --feat_timestep $TIMESTEP \
     --num_iters $NUM_ITERS \
     --samples_per_iter $SAMPLES_PER_ITER \
-    --sample_batch_size 16 \
+    --sample_batch_size 64 \
     --ft_lr $FT_LR \
     --ft_min_dataset_size $FT_MIN_DATASET_SIZE \
-    --ft_batch_size 16 \
-    --ft_accumulate_steps 4 \
+    --ft_batch_size 64 \
+    --ft_accumulate_steps 1 \
     --ft_steps $FT_STEPS \
     --eval_valid_samples $N_SAMPLES_DIVERSITY \
     ${COMPUTE_VENDI:+--compute_vendi} \

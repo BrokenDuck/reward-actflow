@@ -16,20 +16,53 @@ module load eth_proxy
 
 TIMESTEP=$1
 DPS_WEIGHT=$2
+FT_STEPS=$3
+FT_LR=1e-4
+BASE_DIR="${4:-$SCRATCH/adm/qm9_ensemble_long}"
+WARMUP_CACHE_DIR="${5:-}"
+ALPHA_REG="${6:-0}"
+SEED="${7:-}"
+FT_MIN_DATASET_SIZE="${8:-4096}"
+NEG_SCALE="${9:-0}"
+N_SAMPLES_DIVERSITY=500
+COMPUTE_VENDI=1
 
-FOLDER="$SCRATCH/adm/qm9_ensemble_long/apt_${TIMESTEP}_${DPS_WEIGHT}"
+NUM_FT_ITERS=5000
+SAMPLES_PER_ITER=64
+WARMUP_ITERS=$(( FT_MIN_DATASET_SIZE * 2 / SAMPLES_PER_ITER + 10 ))
+NUM_ITERS=$(( NUM_FT_ITERS + WARMUP_ITERS ))
 
-sbatch --dependency=afterany:${SLURM_JOB_ID} jobs/sample_many_valids.sh \
+FOLDER="${BASE_DIR}/ade_t${TIMESTEP}_dps${DPS_WEIGHT}_ftsteps${FT_STEPS}_ftmin${FT_MIN_DATASET_SIZE}_neg${NEG_SCALE}"
+if [ -n "$SEED" ]; then
+    FOLDER="${FOLDER}_seed${SEED}"
+fi
+mkdir -p "$FOLDER"
+
+sbatch --dependency=afterany:${SLURM_JOB_ID} \
+    --output=$FOLDER/slurm_sample_valids_%j.out \
+    jobs/sample_many_valids.sh \
     --folder $FOLDER \
-    --ckpt base_model.pt \
+    --ckpt last.pt \
     --samples-dir eval_samples_valid \
-    --n-samples 10_000 \
+    --n-samples 10_000
 
-sbatch --dependency=afterany:${SLURM_JOB_ID} jobs/sample_many.sh \
+sbatch --dependency=afterany:${SLURM_JOB_ID} \
+    --output=$FOLDER/slurm_sample_%j.out \
+    jobs/sample_many.sh \
     --folder $FOLDER \
-    --ckpt base_model.pt \
+    --ckpt last.pt \
     --samples-dir eval_samples \
-    --n-samples 50_000 \
+    --n-samples 50_000
+
+WARMUP_ARG=""
+if [ -n "$WARMUP_CACHE_DIR" ]; then
+    WARMUP_ARG="--warmup_cache_dir $WARMUP_CACHE_DIR"
+fi
+
+REG_ARG=""
+if [ "$(echo "$ALPHA_REG > 0" | bc -l)" -eq 1 ]; then
+    REG_ARG="--reg_data --alpha_reg $ALPHA_REG"
+fi
 
 pixi run python -m adm.task_agnostic \
     qm9 \
@@ -37,15 +70,20 @@ pixi run python -m adm.task_agnostic \
     --dir $FOLDER \
     --eval_samples 1000 \
     --eval_batch_size 512 \
-    --eval_every 10 \
+    --eval_every 50 \
     --dps_weight $DPS_WEIGHT \
     --feat_timestep $TIMESTEP \
-    --num_iters 1000 \
-    --samples_per_iter 64 \
+    --num_iters $NUM_ITERS \
+    --samples_per_iter $SAMPLES_PER_ITER \
     --sample_batch_size 64 \
-    --ft_lr 1e-4 \
-    --ft_min_dataset_size 4096 \
+    --ft_lr $FT_LR \
+    --ft_min_dataset_size $FT_MIN_DATASET_SIZE \
     --ft_batch_size 64 \
     --ft_accumulate_steps 1 \
-    --ft_steps 500 \
-    --num_iters 10_000
+    --ft_steps $FT_STEPS \
+    --eval_valid_samples $N_SAMPLES_DIVERSITY \
+    --neg_grad_scale $NEG_SCALE \
+    ${COMPUTE_VENDI:+--compute_vendi} \
+    $WARMUP_ARG \
+    $REG_ARG \
+    ${SEED:+--seed $SEED}
