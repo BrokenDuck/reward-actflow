@@ -78,7 +78,7 @@ class ExploreConfig:
 
     # Combined pos+neg finetuning with gradient norm scaling
     neg_grad_scale: float = 0.0
-    max_neg_samples: int = 10000
+    max_neg_samples: int = 5000
 
     def __post_init__(self):
         # Create experiment directory if it doesn't exist
@@ -142,7 +142,6 @@ class ExploreLoop(Generic[D]):
 
         self._timings = {}
         self._pretrained_fps = None
-        self._pretrained_fps_large = None
         self._cumulative_centers = None
         self._fixed_projection = None
 
@@ -425,10 +424,8 @@ class ExploreLoop(Generic[D]):
     def _generate_or_load_pretrained_fps(self):
         """Generate fingerprints from the pretrained model (before any fine-tuning).
 
-        Two caches:
-        - pretrained_fps.npy: small set (eval_valid_samples) for PCA plots
-        - pretrained_fps_large.npy: large set (10000) for novelty metric
-        Both are cached in warmup_cache_dir so all runs share the same reference.
+        Cached in warmup_cache_dir so all runs share the same reference.
+        Used for FID computation and PCA plots.
         """
         if not hasattr(self.problem, "get_morgan_fingerprints"):
             return
@@ -436,11 +433,9 @@ class ExploreLoop(Generic[D]):
             return
 
         cache_dir = self.config.warmup_cache_dir or self.config.folder
-        n_pca = max(self.config.eval_valid_samples, 200)
-        n_novelty = 10000
+        n = max(self.config.eval_valid_samples, 200)
 
-        self._load_or_generate_fps_cache(cache_dir, "pretrained_fps.npy", n_pca, "_pretrained_fps")
-        self._load_or_generate_fps_cache(cache_dir, "pretrained_fps_large.npy", n_novelty, "_pretrained_fps_large")
+        self._load_or_generate_fps_cache(cache_dir, "pretrained_fps.npy", n, "_pretrained_fps")
 
     @torch.no_grad()
     def _load_or_generate_fps_cache(self, cache_dir: Path, filename: str, n_valid_target: int, attr_name: str):
@@ -547,8 +542,7 @@ class ExploreLoop(Generic[D]):
             current_fps = self.problem.get_morgan_fingerprints(
                 batch.samples, batch.kwargs, n_valid=n_valid_target
             )
-            ref_fps = self._pretrained_fps_large if self._pretrained_fps_large is not None else self._pretrained_fps
-            metrics["novelty"] = self.problem.compute_novelty(current_fps, ref_fps)
+            metrics["fid"] = self.problem.compute_fid(current_fps, self._pretrained_fps)
 
             # Cumulative cluster coverage tracking (disabled — kept for future use)
             # if hasattr(self.problem, "compute_cumulative_cluster_metrics"):
@@ -748,7 +742,9 @@ class ExploreLoop(Generic[D]):
                 state_dict = self.base_model.state_dict()
                 torch.save(state_dict, ckpt_dir / "last.pt")
 
-                if self.config.ckpt_every > 0 and i % self.config.ckpt_every == 0:
+                if should_eval:
+                    torch.save(state_dict, ckpt_dir / f"ckpt_{i}.pt")
+                elif self.config.ckpt_every > 0 and i % self.config.ckpt_every == 0:
                     torch.save(state_dict, ckpt_dir / f"ckpt_{i}.pt")
 
             # Write timings to CSV
@@ -923,4 +919,4 @@ def add_global_args(parser):
 
     # Combined pos+neg finetuning
     parser.add_argument("--neg_grad_scale", type=float, default=0.0)
-    parser.add_argument("--max_neg_samples", type=int, default=10000)
+    parser.add_argument("--max_neg_samples", type=int, default=5000)

@@ -315,6 +315,30 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         return float(1.0 - max_sim.mean())
 
     @staticmethod
+    def compute_fid(current_fps: np.ndarray, reference_fps: np.ndarray) -> float:
+        """Fréchet Inception Distance in Morgan fingerprint space.
+
+        Compares the multivariate Gaussian fit (mean, covariance) of
+        current_fps vs reference_fps using the Fréchet distance.
+        """
+        from scipy.linalg import sqrtm
+
+        if len(current_fps) < 2 or len(reference_fps) < 2:
+            return float("nan")
+
+        mu1 = current_fps.mean(axis=0)
+        mu2 = reference_fps.mean(axis=0)
+        sigma1 = np.cov(current_fps, rowvar=False)
+        sigma2 = np.cov(reference_fps, rowvar=False)
+
+        diff = mu1 - mu2
+        covmean = sqrtm(sigma1 @ sigma2)
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+
+        return float(diff @ diff + np.trace(sigma1 + sigma2 - 2 * covmean))
+
+    @staticmethod
     def plot_fingerprint_pca(
         current_fps: np.ndarray,
         pretrained_fps: np.ndarray,
