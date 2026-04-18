@@ -554,17 +554,17 @@ class ExploreLoop(Generic[D]):
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
 
-        # Fixed random projection PCA plot (stable axes across iterations)
-        if current_fps is not None:
-            proj = self._get_fixed_projection()
-            if proj is not None:
-                fig = self.problem.plot_fingerprint_fixed_projection(
-                    current_fps, self._pretrained_fps, proj
-                )
-                if fig is not None:
-                    fig.savefig(directory / "fingerprint_pca.png", dpi=100, bbox_inches="tight")
-                    wandb.log({"fingerprint_fixed_proj": wandb.Image(fig)}, commit=False)
-                    plt.close(fig)
+        # Fixed random projection PCA plot (disabled — kept for future use)
+        # if current_fps is not None:
+        #     proj = self._get_fixed_projection()
+        #     if proj is not None:
+        #         fig = self.problem.plot_fingerprint_fixed_projection(
+        #             current_fps, self._pretrained_fps, proj
+        #         )
+        #         if fig is not None:
+        #             fig.savefig(directory / "fingerprint_pca.png", dpi=100, bbox_inches="tight")
+        #             wandb.log({"fingerprint_fixed_proj": wandb.Image(fig)}, commit=False)
+        #             plt.close(fig)
 
         return metrics
 

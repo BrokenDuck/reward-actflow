@@ -48,6 +48,9 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         else:
             raise ValueError(f"Unknown dataset: {dataset}")
 
+        self._dataset = dataset
+        self._cluster_threshold = 0.85
+
         self.atom_type_map = self.base_model.model.atom_type_map
         self.atom_type_to_idx = { atom_type: i for i, atom_type in enumerate(self.atom_type_map) }
 
@@ -277,7 +280,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         if n >= 2:
             fpgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
             fps = [fpgen.GetFingerprint(mol) for mol in mols]
-            picks = rdSimDivPickers.LeaderPicker().LazyBitVectorPick(fps, len(fps), 0.85)
+            picks = rdSimDivPickers.LeaderPicker().LazyBitVectorPick(fps, len(fps), self._cluster_threshold)
             result["sphere_exclusion_diversity"] = len(picks) / n
             result["n_clusters"] = float(len(picks))
 

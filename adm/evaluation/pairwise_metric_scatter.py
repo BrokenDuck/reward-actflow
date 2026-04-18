@@ -118,6 +118,45 @@ def plot_pareto(collections: list[SampleCollection], metrics: list[str], output_
             print(f"  Saved {fname}")
 
 
+def plot_sa_pareto(collections: list[SampleCollection], metrics: list[str], output_dir: Path):
+    """Pareto front: Synthesizability (10 - SA score) on x vs all metrics on y."""
+    y_metrics = [m for m in metrics if m != "sa_score"]
+    n_rows = len(y_metrics)
+
+    fig, ax = plt.subplots(n_rows, 2, figsize=(10, 5 * n_rows), sharey="row")
+    if n_rows == 1:
+        ax = ax[np.newaxis, :]
+
+    for i, y_metric in enumerate(y_metrics):
+        for j, y_mode in enumerate(["min", "max"]):
+            for coll in collections:
+                df = coll.sample_metrics
+                sa = df["sa_score"].to_numpy()
+                synth = 10.0 - sa
+                y_vals = df[y_metric].to_numpy()
+                points = np.column_stack([synth, y_vals])
+                mask = ~np.isnan(points).any(axis=1)
+                points = points[mask]
+                if len(points) == 0:
+                    continue
+
+                pareto_front = get_pareto_front(points, x_mode="max", y_mode=y_mode)
+                ax[i][j].plot(pareto_front[:, 0], pareto_front[:, 1],
+                              marker="o", color=coll.color, label=coll.label)
+                ax[i][j].set_xlabel("Synthesizability (10 − SA score) ↑")
+                ax[i][j].set_ylabel(f"{y_metric} ({y_mode})")
+
+                if i == 0 and j == 1:
+                    ax[i][j].legend()
+
+    fig.suptitle("Pareto fronts: Synthesizability vs Properties", fontsize=14)
+    plt.tight_layout()
+    fname = output_dir / "pareto.png"
+    fig.savefig(fname, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {fname}")
+
+
 def plot_mode_retrieval(collections: list[SampleCollection], metrics: list[str], output_dir: Path):
     """Mode retrieval: n vs cumulative min/max of each metric."""
     n_metrics = len(metrics)
@@ -171,7 +210,7 @@ def plot_mode_retrieval(collections: list[SampleCollection], metrics: list[str],
         axes[row][1].set_title(f"{metric} (Expected Cumulative Max)")
 
     plt.tight_layout()
-    fname = output_dir / "mode_retrieval.png"
+    fname = output_dir / "top1_rewards.png"
     fig.savefig(fname, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {fname}")
@@ -387,61 +426,66 @@ def main():
 
     args.output.mkdir(parents=True, exist_ok=True)
 
-    if not args.skip_pareto:
-        print("Generating pareto front plots...")
-        if args.x_metric:
-            # Only generate for the specified x_metric
-            x_metrics_to_plot = [args.x_metric]
-        else:
-            x_metrics_to_plot = metrics
+    print("Generating SA-score pareto front plot...")
+    plot_sa_pareto(collections, metrics, args.output)
 
-        for x_metric in x_metrics_to_plot:
-            for x_mode in ["min", "max"]:
-                fig, ax = plt.subplots(len(metrics), 2, figsize=(10, 5 * len(metrics)), sharey="row")
-                if len(metrics) == 1:
-                    ax = ax[np.newaxis, :]
+    print("Generating top-1 reward plots...")
+    plot_mode_retrieval(collections, metrics, args.output)
 
-                for i, y_metric in enumerate(metrics):
-                    for j, y_mode in enumerate(["min", "max"]):
-                        for coll in collections:
-                            df = coll.sample_metrics
-                            points = np.column_stack([df[x_metric].to_numpy(), df[y_metric].to_numpy()])
-                            mask = ~np.isnan(points).any(axis=1)
-                            points = points[mask]
-                            if len(points) == 0:
-                                continue
+    # if not args.skip_pareto:
+    #     print("Generating pareto front plots...")
+    #     if args.x_metric:
+    #         x_metrics_to_plot = [args.x_metric]
+    #     else:
+    #         x_metrics_to_plot = metrics
+    #
+    #     for x_metric in x_metrics_to_plot:
+    #         for x_mode in ["min", "max"]:
+    #             fig, ax = plt.subplots(len(metrics), 2, figsize=(10, 5 * len(metrics)), sharey="row")
+    #             if len(metrics) == 1:
+    #                 ax = ax[np.newaxis, :]
+    #
+    #             for i, y_metric in enumerate(metrics):
+    #                 for j, y_mode in enumerate(["min", "max"]):
+    #                     for coll in collections:
+    #                         df = coll.sample_metrics
+    #                         points = np.column_stack([df[x_metric].to_numpy(), df[y_metric].to_numpy()])
+    #                         mask = ~np.isnan(points).any(axis=1)
+    #                         points = points[mask]
+    #                         if len(points) == 0:
+    #                             continue
+    #
+    #                         pareto_front = get_pareto_front(points, x_mode=x_mode, y_mode=y_mode)
+    #                         ax[i][j].plot(pareto_front[:, 0], pareto_front[:, 1],
+    #                                       marker="o", color=coll.color, label=coll.label)
+    #                         ax[i][j].set_xlabel(f"{x_metric} ({x_mode})")
+    #                         ax[i][j].set_ylabel(f"{y_metric} ({y_mode})")
+    #
+    #                         if i == 0 and j == 1:
+    #                             ax[i][j].legend()
+    #
+    #             fig.suptitle(f"Pareto fronts: x = {x_metric} ({x_mode})", fontsize=14)
+    #             plt.tight_layout()
+    #             fname = args.output / f"pareto_{x_metric}_{x_mode}.png"
+    #             fig.savefig(fname, dpi=150, bbox_inches="tight")
+    #             plt.close(fig)
+    #             print(f"  Saved {fname}")
 
-                            pareto_front = get_pareto_front(points, x_mode=x_mode, y_mode=y_mode)
-                            ax[i][j].plot(pareto_front[:, 0], pareto_front[:, 1],
-                                          marker="o", color=coll.color, label=coll.label)
-                            ax[i][j].set_xlabel(f"{x_metric} ({x_mode})")
-                            ax[i][j].set_ylabel(f"{y_metric} ({y_mode})")
+    # if not args.skip_mode_retrieval:
+    #     print("Generating mode retrieval plots...")
+    #     plot_mode_retrieval(collections, metrics, args.output)
 
-                            if i == 0 and j == 1:
-                                ax[i][j].legend()
+    # if not args.skip_property_profiles:
+    #     print("Generating property profile plots...")
+    #     plot_property_profiles(collections, metrics, args.output)
 
-                fig.suptitle(f"Pareto fronts: x = {x_metric} ({x_mode})", fontsize=14)
-                plt.tight_layout()
-                fname = args.output / f"pareto_{x_metric}_{x_mode}.png"
-                fig.savefig(fname, dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                print(f"  Saved {fname}")
-
-    if not args.skip_mode_retrieval:
-        print("Generating mode retrieval plots...")
-        plot_mode_retrieval(collections, metrics, args.output)
-
-    if not args.skip_property_profiles:
-        print("Generating property profile plots...")
-        plot_property_profiles(collections, metrics, args.output)
-
-    if not args.skip_best_of_n:
-        print("Loading samples for best-of-n diversity plots...")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for coll in collections:
-            coll.load_samples(device)
-        print("Generating best-of-n diversity plots...")
-        plot_best_of_n_diversity(collections, metrics, args.output)
+    # if not args.skip_best_of_n:
+    #     print("Loading samples for best-of-n diversity plots...")
+    #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #     for coll in collections:
+    #         coll.load_samples(device)
+    #     print("Generating best-of-n diversity plots...")
+    #     plot_best_of_n_diversity(collections, metrics, args.output)
 
     print("Done.")
 
