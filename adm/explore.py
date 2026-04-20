@@ -513,6 +513,20 @@ class ExploreLoop(Generic[D]):
         batch.valids = self.problem.validity(batch.samples, batch.kwargs)
         total_sampled = n
 
+        model_valid = batch.valids.float().mean().item()
+
+        # Skip expensive diversity metrics when validity is too low
+        MIN_VALID_FOR_DIVERSITY = 0.05
+        if model_valid < MIN_VALID_FOR_DIVERSITY:
+            directory = self.config.folder / "eval" / f"{iteration:04d}"
+            directory.mkdir(parents=True, exist_ok=True)
+            self.problem.save_samples(batch.samples, batch.kwargs, directory)
+            torch.save(batch.valids, directory / "valids.pt")
+            metrics = {"model_valid": model_valid, "n_eval_sampled": total_sampled}
+            with open(directory / "metrics.yaml", "w") as f:
+                yaml.dump(metrics, f)
+            return metrics
+
         while n_valid_target > 0 and batch.valids.sum().item() < n_valid_target:
             extra_kwargs = self.problem.eval_sampling_kwargs(bs)
             extra_sample = self.env.batch_sample(bs, bs, **extra_kwargs)
