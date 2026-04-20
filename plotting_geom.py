@@ -10,7 +10,7 @@ shared      Plot combined validity/novelty/diversity curves, bar charts, and Par
 File-system layout
 ------------------
 data/
-  ade/
+  act_flow/
     seed_42/
       eval/
         0000/metrics.yaml
@@ -19,9 +19,9 @@ data/
     seed_43/
       eval/
         ...
-  no_uncertainty/
+  baseline_no_filter/
     seed_42/eval/...
-  no_unc_no_ver/
+  baseline_filter/
     seed_42/eval/...
   shared_plots/            ← output directory
 
@@ -29,12 +29,12 @@ Examples
 --------
 # Combined curves + bar charts + Pareto plot (aggregated over seeds)
 python plotting.py shared \\
-    --ade ./data/ade \\
-    --no_uncertainty ./data/no_uncertainty \\
-    --no_unc_no_ver ./data/no_unc_no_ver
+    --act_flow ./data/act_flow \\
+    --baseline_no_filter ./data/baseline_no_filter \\
+    --baseline_filter ./data/baseline_filter
 
 # Only our method
-python plotting.py shared --ade ./data/ade
+python plotting.py shared --act_flow ./data/act_flow
 """
 
 import argparse
@@ -48,19 +48,19 @@ from tueplots import figsizes
 
 COLOR_PRE = (0.35, 0.60, 0.85)              # light blue
 COLOR_OURS = (0.35, 0.00, 0.55)             # dark violet
-COLOR_NO_UNC = (0.93, 0.55, 0.14)           # orange
-COLOR_NO_UNC_NO_VER = (0.05, 0.42, 0.40)    # dark teal
+COLOR_REC_NO_FILTER = (0.93, 0.55, 0.14)    # orange
+COLOR_REC_FILTER = (0.05, 0.42, 0.40)       # dark teal
 
 STYLE = {
-    "ADE":              dict(marker="s", markersize=4, linewidth=2.0, linestyle="-"),
-    "No Uncertainty":   dict(marker="D", markersize=3, linewidth=1.2, linestyle="-"),
-    "No Unc.+Ver.":     dict(marker="o", markersize=3, linewidth=1.2, linestyle="-"),
+    "ActFlow":          dict(marker="s", markersize=4, linewidth=2.0, linestyle="-"),
+    "Rec (no filter)":  dict(marker="D", markersize=3, linewidth=1.2, linestyle="-"),
+    "Rec (filter)":     dict(marker="o", markersize=3, linewidth=1.2, linestyle="-"),
     "Pre-trained":      dict(marker="*", markersize=6, linewidth=1.2, linestyle="--"),
 }
 
 SHORT_LEGEND = {
-    "Pre-trained": "PRE", "ADE": "ADE",
-    "No Uncertainty": "No-Unc", "No Unc.+Ver.": "No-U.V.",
+    "Pre-trained": "Pre", "ActFlow": "ActFlow",
+    "Rec (no filter)": "Rec-NF", "Rec (filter)": "Rec-F",
 }
 
 CI_ALPHA = 0.2
@@ -101,6 +101,12 @@ def _load_single_eval_history(run_dir: Path) -> list[dict]:
     if not rows:
         raise FileNotFoundError(f"No eval/*/metrics.yaml files in {run_dir}")
     rows.sort(key=lambda r: r["iteration"])
+
+    # The first eval is the pre-trained model (before any fine-tuning),
+    # so remap it to iteration 0 regardless of its actual folder name.
+    if rows:
+        rows[0]["iteration"] = 0
+
     return rows
 
 
@@ -162,27 +168,27 @@ def _ci95_scalar(arr: np.ndarray) -> float:
 
 
 def _get_pre_stats(multi_runs):
-    """Get mean and CI for pre-trained (iter 0) validity and novelty across all seeds."""
-    all_val, all_nov = [], []
+    """Get mean and CI for pre-trained (iter 0) metrics across all seeds."""
+    collected: dict[str, list[float]] = {}
+    keys = {"model_valid": 100, "fid": 1, "n_clusters": 1, "vendi": 1}
     for all_histories, _, _ in multi_runs:
         for hist in all_histories:
             first = hist[0]
             if int(first["iteration"]) == 0:
-                v = _resolve_key(first, "model_valid")
-                n = _resolve_key(first, "novelty")
-                if v is not None:
-                    all_val.append(v * 100)
-                if n is not None:
-                    all_nov.append(n * 100)
+                for key, scale in keys.items():
+                    val = _resolve_key(first, key)
+                    if val is not None:
+                        collected.setdefault(key, []).append(val * scale)
 
-    if not all_val:
+    if "model_valid" not in collected:
         return None
-    arr_val = np.array(all_val)
-    result = {"val_mean": arr_val.mean(), "val_ci": _ci95_scalar(arr_val)}
-    if all_nov:
-        arr_nov = np.array(all_nov)
-        result["nov_mean"] = arr_nov.mean()
-        result["nov_ci"] = _ci95_scalar(arr_nov)
+    result = {}
+    name_map = {"model_valid": "val", "fid": "fid", "n_clusters": "clust", "vendi": "vendi"}
+    for key, prefix in name_map.items():
+        if key in collected:
+            arr = np.array(collected[key])
+            result[f"{prefix}_mean"] = arr.mean()
+            result[f"{prefix}_ci"] = _ci95_scalar(arr)
     return result
 
 
@@ -197,7 +203,7 @@ def plot_validity_curve(multi_runs, out_dir: Path):
         if pre is not None:
             s = _style("Pre-trained")
             ax.axhline(pre["val_mean"], color=COLOR_PRE, linestyle=s["linestyle"],
-                       linewidth=s["linewidth"], label="Pre-trained")
+                       linewidth=s["linewidth"], label="Pre")
             if pre["val_ci"] > 0:
                 ax.axhspan(pre["val_mean"] - pre["val_ci"],
                            pre["val_mean"] + pre["val_ci"],
@@ -207,7 +213,7 @@ def plot_validity_curve(multi_runs, out_dir: Path):
             iters, means, ci = aggregate_metric(all_histories, "model_valid")
             means_pct, ci_pct = means * 100, ci * 100
             s = _style(label)
-            ax.plot(iters, means_pct, color=color, label=label, **s)
+            ax.plot(iters, means_pct, color=color, label=_short(label), **s)
             ax.fill_between(iters, means_pct - ci_pct, means_pct + ci_pct,
                             color=color, alpha=CI_ALPHA)
 
@@ -215,47 +221,104 @@ def plot_validity_curve(multi_runs, out_dir: Path):
         ax.set_ylabel("Validity (%)")
         ax.grid(axis="y", linestyle="--", color="silver", linewidth=0.8)
         ax.legend(fontsize="small", framealpha=1.0)
-        fig.savefig(out_dir / "mol_validity.png", dpi=150)
+        fig.savefig(out_dir / "geom_validity.png", dpi=150)
         plt.close(fig)
-    print(f"Saved {out_dir / 'mol_validity.png'}")
+    print(f"Saved {out_dir / 'geom_validity.png'}")
 
 
-def plot_novelty_curve(multi_runs, out_dir: Path):
+def plot_fid_curve(multi_runs, out_dir: Path):
     pre = _get_pre_stats(multi_runs)
 
     with plt.rc_context(figsizes.icml2024_half(nrows=1, ncols=1)):
         fig, ax = plt.subplots()
 
-        if pre is not None and "nov_mean" in pre:
+        if pre is not None and "fid_mean" in pre:
             s = _style("Pre-trained")
-            ax.axhline(pre["nov_mean"], color=COLOR_PRE, linestyle=s["linestyle"],
-                       linewidth=s["linewidth"], label="PRE")
-            if pre.get("nov_ci", 0) > 0:
-                ax.axhspan(pre["nov_mean"] - pre["nov_ci"],
-                           pre["nov_mean"] + pre["nov_ci"],
+            ax.axhline(pre["fid_mean"], color=COLOR_PRE, linestyle=s["linestyle"],
+                       linewidth=s["linewidth"], label="Pre")
+            if pre.get("fid_ci", 0) > 0:
+                ax.axhspan(pre["fid_mean"] - pre["fid_ci"],
+                           pre["fid_mean"] + pre["fid_ci"],
                            color=COLOR_PRE, alpha=CI_ALPHA)
 
         for all_histories, label, color in multi_runs:
-            iters, means, ci = aggregate_metric(all_histories, "novelty")
-            means_pct, ci_pct = means * 100, ci * 100
+            iters, means, ci = aggregate_metric(all_histories, "fid")
             s = _style(label)
-            ax.plot(iters, means_pct, color=color, label=_short(label), **s)
-            ax.fill_between(iters, means_pct - ci_pct, means_pct + ci_pct,
+            ax.plot(iters, means, color=color, label=_short(label), **s)
+            ax.fill_between(iters, means - ci, means + ci,
                             color=color, alpha=CI_ALPHA)
 
         ax.set_xlabel("Iteration")
-        ax.set_ylabel("Novelty (%)")
-        ax.set_ylim(-5, 105)
+        ax.set_ylabel("FID")
         ax.grid(axis="y", linestyle="--", color="silver", linewidth=0.8)
-        ax.legend(fontsize="small", loc="lower right",
-                  bbox_to_anchor=(1.0, 0.15), framealpha=1.0)
-        fig.savefig(out_dir / "mol_novelty.png", dpi=150)
+        fig.savefig(out_dir / "geom_fid.png", dpi=150)
         plt.close(fig)
-    print(f"Saved {out_dir / 'mol_novelty.png'}")
+    print(f"Saved {out_dir / 'geom_fid.png'}")
+
+
+def plot_clusters_curve(multi_runs, out_dir: Path):
+    pre = _get_pre_stats(multi_runs)
+
+    with plt.rc_context(figsizes.icml2024_half(nrows=1, ncols=1)):
+        fig, ax = plt.subplots()
+
+        if pre is not None and "clust_mean" in pre:
+            s = _style("Pre-trained")
+            ax.axhline(pre["clust_mean"], color=COLOR_PRE, linestyle=s["linestyle"],
+                       linewidth=s["linewidth"], label="Pre")
+            if pre.get("clust_ci", 0) > 0:
+                ax.axhspan(pre["clust_mean"] - pre["clust_ci"],
+                           pre["clust_mean"] + pre["clust_ci"],
+                           color=COLOR_PRE, alpha=CI_ALPHA)
+
+        for all_histories, label, color in multi_runs:
+            iters, means, ci = aggregate_metric(all_histories, "n_clusters")
+            s = _style(label)
+            ax.plot(iters, means, color=color, label=_short(label), **s)
+            ax.fill_between(iters, means - ci, means + ci,
+                            color=color, alpha=CI_ALPHA)
+
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Number of Clusters")
+        ax.grid(axis="y", linestyle="--", color="silver", linewidth=0.8)
+        fig.savefig(out_dir / "geom_clusters.png", dpi=150)
+        plt.close(fig)
+    print(f"Saved {out_dir / 'geom_clusters.png'}")
+
+
+def plot_vendi_curve(multi_runs, out_dir: Path):
+    pre = _get_pre_stats(multi_runs)
+
+    with plt.rc_context(figsizes.icml2024_half(nrows=1, ncols=1)):
+        fig, ax = plt.subplots()
+
+        if pre is not None and "vendi_mean" in pre:
+            s = _style("Pre-trained")
+            ax.axhline(pre["vendi_mean"], color=COLOR_PRE, linestyle=s["linestyle"],
+                       linewidth=s["linewidth"], label="Pre")
+            if pre.get("vendi_ci", 0) > 0:
+                ax.axhspan(pre["vendi_mean"] - pre["vendi_ci"],
+                           pre["vendi_mean"] + pre["vendi_ci"],
+                           color=COLOR_PRE, alpha=CI_ALPHA)
+
+        for all_histories, label, color in multi_runs:
+            iters, means, ci = aggregate_metric(all_histories, "vendi")
+            s = _style(label)
+            ax.plot(iters, means, color=color, label=_short(label), **s)
+            ax.fill_between(iters, means - ci, means + ci,
+                            color=color, alpha=CI_ALPHA)
+
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Vendi")
+        ax.grid(axis="y", linestyle="--", color="silver", linewidth=0.8)
+        fig.savefig(out_dir / "geom_vendi.png", dpi=150)
+        plt.close(fig)
+    print(f"Saved {out_dir / 'geom_vendi.png'}")
 
 
 def _plot_generic_curve(multi_runs, metric: str, ylabel: str, filename: str,
-                        out_dir: Path, scale: float = 1.0, ylim: tuple | None = None):
+                        out_dir: Path, scale: float = 1.0, ylim: tuple | None = None,
+                        legend_kwargs: dict | None = None, show_legend: bool = True):
     """Generic metric-over-iterations curve plotter."""
     with plt.rc_context(figsizes.icml2024_half(nrows=1, ncols=1)):
         fig, ax = plt.subplots()
@@ -281,8 +344,12 @@ def _plot_generic_curve(multi_runs, metric: str, ylabel: str, filename: str,
         if ylim is not None:
             ax.set_ylim(*ylim)
         ax.grid(axis="y", linestyle="--", color="silver", linewidth=0.8)
-        ax.legend(fontsize="small", loc="best", framealpha=1.0)
-        fig.savefig(out_dir / filename, dpi=150)
+        if show_legend:
+            leg_kw = dict(fontsize="small", loc="best", framealpha=1.0)
+            if legend_kwargs is not None:
+                leg_kw.update(legend_kwargs)
+            ax.legend(**leg_kw)
+        fig.savefig(out_dir / filename, dpi=150, bbox_inches="tight")
         plt.close(fig)
     print(f"Saved {out_dir / filename}")
 
@@ -296,27 +363,27 @@ def plot_pareto(multi_runs, out_dir: Path):
         points = []
 
         pre = _get_pre_stats(multi_runs)
-        if pre is not None and "nov_mean" in pre:
+        if pre is not None and "clust_mean" in pre:
             s = _style("Pre-trained")
-            points.append((pre["nov_mean"], pre["val_mean"],
-                           pre.get("nov_ci", 0), pre["val_ci"],
-                           "PRE", s["marker"], s["markersize"] ** 2 * 3, COLOR_PRE))
+            points.append((pre["clust_mean"], pre["val_mean"],
+                           pre.get("clust_ci", 0), pre["val_ci"],
+                           "Pre", s["marker"], s["markersize"] ** 2 * 3, COLOR_PRE))
 
         for all_histories, label, color in multi_runs:
-            final_vals, final_novs = [], []
+            final_vals, final_clusts = [], []
             for hist in all_histories:
                 last = hist[-1]
                 v = _resolve_key(last, "model_valid")
-                n = _resolve_key(last, "novelty")
-                if v is not None and n is not None:
+                c = _resolve_key(last, "n_clusters")
+                if v is not None and c is not None:
                     final_vals.append(v * 100)
-                    final_novs.append(n * 100)
+                    final_clusts.append(c)
             if not final_vals:
                 continue
-            arr_v, arr_n = np.array(final_vals), np.array(final_novs)
+            arr_v, arr_c = np.array(final_vals), np.array(final_clusts)
             s = _style(label)
-            points.append((arr_n.mean(), arr_v.mean(),
-                           _ci95_scalar(arr_n), _ci95_scalar(arr_v),
+            points.append((arr_c.mean(), arr_v.mean(),
+                           _ci95_scalar(arr_c), _ci95_scalar(arr_v),
                            _short(label), s["marker"], s["markersize"] ** 2 * 4, color))
 
         if not points:
@@ -325,10 +392,10 @@ def plot_pareto(multi_runs, out_dir: Path):
             return
 
         LABEL_OFFSETS = {
-            "PRE": (8, 6), "No-Unc": (8, -10),
-            "No-U.V.": (8, -10), "ADE": (-8, -12),
+            "Pre": (6, -10), "Rec-NF": (6, 6),
+            "Rec-F": (6, -12), "ActFlow": (-4, -14),
         }
-        LABEL_HA = {"PRE": "left", "ADE": "right"}
+        LABEL_HA = {"Pre": "left", "Rec-NF": "left", "Rec-F": "left", "ActFlow": "center"}
 
         for xm, ym, xci, yci, name, mk, sz, col in points:
             ax.errorbar(xm, ym, xerr=xci, yerr=yci,
@@ -343,17 +410,17 @@ def plot_pareto(multi_runs, out_dir: Path):
 
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
-        x_margin = max((max(xs) - min(xs)) * 0.25, 5)
+        x_margin = max((max(xs) - min(xs)) * 0.25, 2)
         y_margin = max((max(ys) - min(ys)) * 0.25, 3)
-        ax.set_xlim(max(min(xs) - x_margin, -5), min(max(xs) + x_margin, 105))
+        ax.set_xlim(min(xs) - x_margin, max(xs) + x_margin)
         ax.set_ylim(max(min(ys) - y_margin, 0), min(max(ys) + y_margin, 105))
 
-        ax.set_xlabel("Novelty (%)")
+        ax.set_xlabel("Number of Clusters")
         ax.set_ylabel("Validity (%)")
         ax.grid(axis="both", linestyle="--", color="silver", linewidth=0.8)
-        fig.savefig(out_dir / "mol_pareto.png", dpi=150)
+        fig.savefig(out_dir / "geom_pareto.png", dpi=150)
         plt.close(fig)
-    print(f"Saved {out_dir / 'mol_pareto.png'}")
+    print(f"Saved {out_dir / 'geom_pareto.png'}")
 
 
 # ── Bar chart plots (final-iteration comparison) ─────────────────────────────
@@ -411,18 +478,30 @@ def _build_final_bars(multi_runs, metric: str):
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
+def _trim_histories(histories: list[list[dict]], max_iter: int) -> list[list[dict]]:
+    """Keep only rows with iteration <= max_iter."""
+    return [[row for row in hist if int(row["iteration"]) <= max_iter]
+            for hist in histories]
+
+
 def cmd_shared(args):
     multi_runs = []
 
-    if args.ade:
-        histories = load_multi_seed(args.ade)
-        multi_runs.append((histories, "ADE", COLOR_OURS))
-    if args.no_uncertainty:
-        histories = load_multi_seed(args.no_uncertainty)
-        multi_runs.append((histories, "No Uncertainty", COLOR_NO_UNC))
-    if args.no_unc_no_ver:
-        histories = load_multi_seed(args.no_unc_no_ver)
-        multi_runs.append((histories, "No Unc.+Ver.", COLOR_NO_UNC_NO_VER))
+    if args.act_flow:
+        histories = load_multi_seed(args.act_flow)
+        if args.max_iter is not None:
+            histories = _trim_histories(histories, args.max_iter)
+        multi_runs.append((histories, "ActFlow", COLOR_OURS))
+    if args.baseline_no_filter:
+        histories = load_multi_seed(args.baseline_no_filter)
+        if args.max_iter is not None:
+            histories = _trim_histories(histories, args.max_iter)
+        multi_runs.append((histories, "Rec (filter)", COLOR_REC_FILTER))
+    if args.baseline_filter:
+        histories = load_multi_seed(args.baseline_filter)
+        if args.max_iter is not None:
+            histories = _trim_histories(histories, args.max_iter)
+        multi_runs.append((histories, "Rec (no filter)", COLOR_REC_NO_FILTER))
 
     if not multi_runs:
         print("No runs provided.")
@@ -433,23 +512,21 @@ def cmd_shared(args):
 
     # ── Iteration curves ──
     plot_validity_curve(multi_runs, out_dir)
-    plot_novelty_curve(multi_runs, out_dir)
+    plot_fid_curve(multi_runs, out_dir)
     _plot_generic_curve(multi_runs, "sphere_exclusion_diversity",
-                        "Sphere-Exclusion Diversity", "mol_diversity.png", out_dir)
-    _plot_generic_curve(multi_runs, "n_clusters",
-                        "Cluster Count", "mol_clusters.png", out_dir)
-    _plot_generic_curve(multi_runs, "vendi",
-                        "Vendi Score", "mol_vendi.png", out_dir)
+                        "Sphere-Exclusion Diversity", "geom_diversity.png", out_dir)
+    plot_clusters_curve(multi_runs, out_dir)
+    plot_vendi_curve(multi_runs, out_dir)
 
     # ── Pareto plot ──
     plot_pareto(multi_runs, out_dir)
 
     # ── Bar charts (final iteration) ──
     for metric, ylabel, filename in [
-        ("sphere_exclusion_diversity", "Diversity", "mol_diversity_bar.png"),
-        ("n_clusters", "Clusters", "mol_clusters_bar.png"),
-        ("vendi", "Vendi Score", "mol_vendi_bar.png"),
-        ("novelty", "Novelty", "mol_novelty_bar.png"),
+        ("sphere_exclusion_diversity", "Diversity", "geom_diversity_bar.png"),
+        ("n_clusters", "Clusters", "geom_clusters_bar.png"),
+        ("vendi", "Vendi", "geom_vendi_bar.png"),
+        ("fid", "FID", "geom_fid_bar.png"),
     ]:
         bars = _build_final_bars(multi_runs, metric)
         if bars is not None:
@@ -465,12 +542,14 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_sh = sub.add_parser("shared", help="Plot combined curves + Pareto + bar charts")
-    p_sh.add_argument("--ade", type=Path, default=None,
-                      help="Parent dir with seed_* subdirs for ADE (ours)")
-    p_sh.add_argument("--no_uncertainty", type=Path, default=None,
-                      help="Parent dir with seed_* subdirs for baseline (no uncertainty)")
-    p_sh.add_argument("--no_unc_no_ver", type=Path, default=None,
-                      help="Parent dir with seed_* subdirs for baseline (no unc. + no ver.)")
+    p_sh.add_argument("--act_flow", type=Path, default=None,
+                      help="Parent dir with seed_* subdirs for ActFlow (ours)")
+    p_sh.add_argument("--baseline_no_filter", type=Path, default=None,
+                      help="Parent dir with seed_* subdirs for no_uncertainty (→ Rec-F)")
+    p_sh.add_argument("--baseline_filter", type=Path, default=None,
+                      help="Parent dir with seed_* subdirs for no_unc_no_ver (→ Rec-NF)")
+    p_sh.add_argument("--max_iter", type=int, default=None,
+                      help="Only plot up to this iteration (inclusive)")
     p_sh.add_argument("--out", type=Path, default=Path("data/shared_plots"))
     p_sh.set_defaults(func=cmd_shared)
 
