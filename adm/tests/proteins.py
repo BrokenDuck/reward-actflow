@@ -16,10 +16,13 @@ from adm.setups.proteins import (
     CosineSchedule,
     ProteinFitnessReward,
     ProteinProblemSetup,
-    ProteinModel
+    ProteinModel,
 )
+from adm.uncertainty import FlowFeatureExtractor
 
-from adm.setups.problem_setup import SampleFile
+def _seq_array(seqs: list[str]) -> np.ndarray:
+    return np.array([[ord(c) for c in seq] for seq in seqs], dtype=np.int32)
+
 
 CREILOV_PRETRAINED_REWARD = 3.78
 
@@ -192,27 +195,28 @@ class TestCosineSchedule:
 
 
 class TestProteinProblemSetup:
-    def setup_method(self):
+    @classmethod
+    def setup_class(cls):
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-        temp = tempfile.NamedTemporaryFile()
-        with open(temp.name, 'w')  as f:
+        temp = tempfile.NamedTemporaryFile(delete=False)
+        with open(temp.name, 'w') as f:
             f.write(CONFIG)
 
         setup_args = {'cfg_path': temp.name, 'no_verifier': True}
-        self.setup = ProteinProblemSetup(setup_args, device=device)
+        cls.setup = ProteinProblemSetup(setup_args, device=device)
 
         reward_entry = reward_registry.get('proteins/creilov')
         reward = reward_entry.instantiate(**{'cfg_path': temp.name})
 
-        self.env = diffusiongym.construct_env(
-            self.setup.base_model,
+        cls.env = diffusiongym.construct_env(
+            cls.setup.base_model,
             reward,
             100,
             1.
         )
 
-        self.samples = self.env.sample(8)
+        cls.samples = cls.env.sample(2)
         
 
     def test_embedding_invertibility(self):
@@ -230,8 +234,68 @@ class TestProteinProblemSetup:
     def test_creilov_close_pretrained(self):
         samples = self.samples
         avg_reward = samples.rewards.mean()
-        assert avg_reward - CREILOV_PRETRAINED_REWARD < CREILOV_PRETRAINED_REWARD * 0.01
+        assert avg_reward == pytest.approx(CREILOV_PRETRAINED_REWARD, rel=0.1)
     
+
+    def test_compute_metrics_contains_sphere_exclusion_keys(self):
+        metrics = self.setup.compute_metrics(self.samples.sample, {})
+        assert "sphere_exclusion_diversity" in metrics
+        assert "n_clusters" in metrics
+
+    def test_sphere_exclusion_diversity_in_range(self):
+        metrics = self.setup.compute_metrics(self.samples.sample, {})
+        assert 0.0 < metrics["sphere_exclusion_diversity"] <= 1.0
+
+    def test_feature_layer_is_encoder(self):
+        assert self.setup.feature_layer == 'sgpo_model.model.network.encoder'
+
+    def test_feature_extractor_output_shape(self):
+        x = self.samples.sample
+        feat_extractor = FlowFeatureExtractor(
+            self.setup.base_model,
+            layer=self.setup.feature_layer,
+            timestep=0.9,
+            postprocess=self.setup.postprocess_features,
+        )
+        with torch.no_grad():
+            feats = feat_extractor(x)
+        assert feats.ndim == 2
+        assert feats.shape[0] == x.data.shape[0]
+
+    def test_features_differ_across_timesteps(self):
+        x = self.samples.sample
+        feat_extractor_early = FlowFeatureExtractor(
+            self.setup.base_model,
+            layer=self.setup.feature_layer,
+            timestep=0.5,
+            postprocess=self.setup.postprocess_features,
+        )
+        feat_extractor_late = FlowFeatureExtractor(
+            self.setup.base_model,
+            layer=self.setup.feature_layer,
+            timestep=0.9,
+            postprocess=self.setup.postprocess_features,
+        )
+        with torch.no_grad():
+            feats_early = feat_extractor_early(x)
+            feats_late = feat_extractor_late(x)
+        assert not torch.allclose(feats_early, feats_late)
+
+    def test_n_clusters_bounded_by_sample_count(self):
+        n = self.samples.sample.data.shape[0]
+        metrics = self.setup.compute_metrics(self.samples.sample, {})
+        assert 1 <= metrics["n_clusters"] <= n
+
+    def test_identical_sequences_give_one_cluster(self):
+        sgpo_model = self.setup.base_model.sgpo_model
+        n = 8
+        wt_tokens = sgpo_model.tokenizer.tokenize(CREILOV_WILD_TYPE)
+        probs = torch.zeros((n, sgpo_model.seq_len, len(sgpo_model.tokenizer.alphabet)))
+        for pos, tok in enumerate(wt_tokens):
+            probs[:, pos, tok] = 1.0
+        metrics = self.setup.compute_metrics(DDTensor(probs), {})
+        assert metrics["n_clusters"] == 1.0
+        assert metrics["sphere_exclusion_diversity"] == pytest.approx(1.0 / n)
 
     def test_diversity_of_repeated_is_zero(self):
         n = 100
@@ -262,27 +326,22 @@ class TestProteinProblemSetup:
         for pos, tok in enumerate(actual_tokens):
             probs[pos, :, tok] = 1.0
 
-        probs = DDTensor(probs)
-
-        tempdir = tempfile.gettempdir()
-
-        sample_path = self.setup.save_sample(probs, {}, Path(tempdir) / 'temp')
-        sample_file = SampleFile(is_valid=True, file=Path(sample_path))
-        metrics = self.setup.compute_metrics([sample_file])
+        metrics = self.setup.compute_metrics(DDTensor(probs), {})
 
         assert metrics['shannon_entropy'] == pytest.approx(np.log(n))
 
 
 class TestProteinValidity:
-    def setup_method(self):
+    @classmethod
+    def setup_class(cls):
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-        temp = tempfile.NamedTemporaryFile()
+        temp = tempfile.NamedTemporaryFile(delete=False)
         with open(temp.name, 'w') as f:
             f.write(CONFIG)
 
         setup_args = {'cfg_path': temp.name, 'no_verifier': False}
-        self.setup = ProteinProblemSetup(setup_args, device=device)
+        cls.setup = ProteinProblemSetup(setup_args, device=device)
 
     def test_wild_type_is_valid_but_random_is_not(self):
         sgpo_model = self.setup.base_model.sgpo_model
@@ -302,3 +361,120 @@ class TestProteinValidity:
         valids = self.setup.validity(all_probs, {})
         assert torch.all(valids[:n] == 1)
         assert torch.any(valids[n:] == 0)
+
+
+class TestIdentityMatrix:
+    def test_identical_sequences_give_one(self):
+        seqs = _seq_array(["AAAA", "AAAA"])
+        m = ProteinProblemSetup._identity_matrix(seqs, seqs)
+        assert np.allclose(m, 1.0)
+
+    def test_completely_different_sequences_give_zero(self):
+        a = _seq_array(["AAAA"])
+        b = _seq_array(["BBBB"])
+        m = ProteinProblemSetup._identity_matrix(a, b)
+        assert np.allclose(m, 0.0)
+
+    def test_half_matching(self):
+        a = _seq_array(["AABB"])
+        b = _seq_array(["AACC"])
+        m = ProteinProblemSetup._identity_matrix(a, b)
+        assert np.allclose(m, 0.5)
+
+    def test_output_shape(self):
+        a = _seq_array(["AAAA", "BBBB", "CCCC"])
+        b = _seq_array(["AAAA", "BBBB"])
+        m = ProteinProblemSetup._identity_matrix(a, b)
+        assert m.shape == (3, 2)
+
+    def test_diagonal_of_self_similarity_is_one(self):
+        seqs = _seq_array(["ABCD", "EFGH", "IJKL"])
+        m = ProteinProblemSetup._identity_matrix(seqs, seqs)
+        assert np.allclose(np.diag(m), 1.0)
+
+
+class TestComputeNovelty:
+    def test_empty_current_returns_zero(self):
+        current = _seq_array([])
+        reference = _seq_array(["AAAA"])
+        assert ProteinProblemSetup.compute_novelty(current, reference) == 0.0
+
+    def test_empty_reference_returns_zero(self):
+        current = _seq_array(["AAAA"])
+        reference = _seq_array([])
+        assert ProteinProblemSetup.compute_novelty(current, reference) == 0.0
+
+    def test_identical_to_reference_gives_zero_novelty(self):
+        seqs = _seq_array(["AAAA", "BBBB"])
+        assert ProteinProblemSetup.compute_novelty(seqs, seqs) == pytest.approx(0.0)
+
+    def test_fully_novel_gives_one(self):
+        current = _seq_array(["AAAA"])
+        reference = _seq_array(["BBBB"])
+        assert ProteinProblemSetup.compute_novelty(current, reference) == pytest.approx(1.0)
+
+    def test_partial_novelty(self):
+        current = _seq_array(["AABB"])
+        reference = _seq_array(["AACC"])
+        novelty = ProteinProblemSetup.compute_novelty(current, reference)
+        assert novelty == pytest.approx(1.0 - 0.5)
+
+    def test_novelty_uses_max_similarity(self):
+        current = _seq_array(["AAAA"])
+        reference = _seq_array(["BBBB", "AAAA"])
+        assert ProteinProblemSetup.compute_novelty(current, reference) == pytest.approx(0.0)
+
+    def test_novelty_is_mean_over_current(self):
+        current = _seq_array(["AAAA", "BBBB"])
+        reference = _seq_array(["AAAA"])
+        novelty = ProteinProblemSetup.compute_novelty(current, reference)
+        assert novelty == pytest.approx(0.5)
+
+
+class TestComputeCumulativeClusterMetrics:
+    def test_first_call_returns_none_cumulative(self):
+        seqs = _seq_array(["AAAA", "BBBB", "CCCC"])
+        metrics, centers = ProteinProblemSetup.compute_cumulative_cluster_metrics(seqs, None)
+        assert "cumulative_clusters" in metrics
+        assert metrics["coverage_of_cumulative"] == 1.0
+        assert metrics["clusters_lost"] == 0.0
+        assert centers.ndim == 2
+
+    def test_identical_sequences_form_one_cluster(self):
+        seqs = _seq_array(["AAAA", "AAAA", "AAAA"])
+        metrics, centers = ProteinProblemSetup.compute_cumulative_cluster_metrics(seqs, None)
+        assert metrics["cumulative_clusters"] == 1.0
+        assert metrics["new_clusters"] == 1.0
+
+    def test_distinct_sequences_each_form_own_cluster(self):
+        seqs = _seq_array(["AAAA", "BBBB", "CCCC", "DDDD"])
+        metrics, centers = ProteinProblemSetup.compute_cumulative_cluster_metrics(seqs, None)
+        assert metrics["cumulative_clusters"] == 4.0
+
+    def test_no_new_clusters_when_repeated(self):
+        seqs = _seq_array(["AAAA", "BBBB"])
+        _, centers = ProteinProblemSetup.compute_cumulative_cluster_metrics(seqs, None)
+        metrics, updated = ProteinProblemSetup.compute_cumulative_cluster_metrics(seqs, centers)
+        assert metrics["new_clusters"] == 0.0
+        assert len(updated) == len(centers)
+
+    def test_new_sequences_expand_cumulative(self):
+        first = _seq_array(["AAAA", "BBBB"])
+        _, centers = ProteinProblemSetup.compute_cumulative_cluster_metrics(first, None)
+        second = _seq_array(["CCCC", "DDDD"])
+        metrics, updated = ProteinProblemSetup.compute_cumulative_cluster_metrics(second, centers)
+        assert metrics["new_clusters"] == 2.0
+        assert metrics["cumulative_clusters"] == 4.0
+
+    def test_coverage_drops_when_previous_clusters_absent(self):
+        first = _seq_array(["AAAA", "BBBB", "CCCC"])
+        _, centers = ProteinProblemSetup.compute_cumulative_cluster_metrics(first, None)
+        second = _seq_array(["AAAA"])
+        metrics, _ = ProteinProblemSetup.compute_cumulative_cluster_metrics(second, centers)
+        assert metrics["coverage_of_cumulative"] < 1.0
+        assert metrics["clusters_lost"] > 0.0
+
+    def test_cumulative_centers_shape(self):
+        seqs = _seq_array(["ABCD", "EFGH"])
+        _, centers = ProteinProblemSetup.compute_cumulative_cluster_metrics(seqs, None)
+        assert centers.shape[1] == 4

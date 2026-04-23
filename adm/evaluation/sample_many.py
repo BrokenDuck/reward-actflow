@@ -1,10 +1,12 @@
 import torch
 import argparse
 import yaml
+import json
 from pathlib import Path
-from diffusiongym import DummyReward, construct_env
+from diffusiongym import DummyReward, construct_env, reward_registry
 from tqdm import trange
 
+from adm.inf_methods.dps import RewardGradient
 from adm.setups import setups as problem_setups
 from adm.utils import Batch, setup_logger
 
@@ -25,8 +27,18 @@ def main(args):
     logger.info(f"Loading problem setup: {exp_args['problem_setup']}")
 
     problem_setup = problem_setups[exp_args["problem_setup"]](exp_args, device=device)
-    reward = DummyReward()
-    env = construct_env(problem_setup.base_model, reward, exp_args["num_steps"], 0)
+
+    if args.dps:
+        reward_name = args.reward or exp_args.get("reward")
+        if reward_name is None:
+            raise ValueError("DPS requires a reward: set --reward or ensure 'reward' is in args.yaml")
+        reward_kwargs = args.reward_kwargs or exp_args.get("reward_kwargs", {})
+        reward = reward_registry.get(reward_name).instantiate(**reward_kwargs)
+        env = construct_env(problem_setup.base_model, reward, exp_args["num_steps"], args.dps_weight)
+        env.control_policy = RewardGradient(env)
+    else:
+        reward = DummyReward()
+        env = construct_env(problem_setup.base_model, reward, exp_args["num_steps"], 0)
 
     if args.ckpt is not None:
         logger.info(f"Loading model checkpoint from {args.ckpt}")
@@ -54,5 +66,9 @@ if __name__ == "__main__":
     parser.add_argument("--samples_dir", type=Path, default=Path("eval_samples"))
     parser.add_argument("--ckpt", type=Path, default=None)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--dps", action="store_true", default=False)
+    parser.add_argument("--dps_weight", type=float, default=100.0)
+    parser.add_argument("--reward", type=str, default=None)
+    parser.add_argument("--reward_kwargs", type=json.loads, default=None)
     args = parser.parse_args()
     main(args)

@@ -32,6 +32,10 @@ def main(args):
     config = TaskDirectedConfig.construct_from_args(args)
     problem_setup = problem_setups[args.problem_setup](vars(args), device=device)
 
+    if args.base_model_path is not None:
+        state_dict = torch.load(args.base_model_path, map_location=device)
+        problem_setup.base_model.load_state_dict(state_dict)
+
     # Construct feature extractor for uncertainty quantification
     feat_extractor = FlowFeatureExtractor(
         problem_setup.base_model,
@@ -106,6 +110,9 @@ class TaskDirectedConfig:
     eval_samples: int = 0
     eval_batch_size: int = 64
     eval_every: int = 10
+    eval_top_p: float = 0.05
+    eval_dps: bool = False
+    eval_dps_weight: float = 100.0
     video_fps: int = 4
 
     # Flags
@@ -295,6 +302,8 @@ class TaskDirected(Generic[D]):
         # Compute and save evaluation metrics
         metrics = self.problem.compute_metrics(batch.samples, batch.kwargs)
         metrics["model_valid"] = batch.valids.float().mean().item()
+        metrics["model_reward"] = batch.rewards[batch.valids].mean().item()
+        metrics["model_reward_all"] = batch.rewards.mean().item()
         with open(directory / "metrics.yaml", "w") as f:
             yaml.dump(metrics, f)
 
@@ -392,6 +401,7 @@ def build_parser():
 
 def add_global_args(parser):
     parser.add_argument("--dir", type=Path, required=True)
+    parser.add_argument("--base_model_path", type=Path, default=None)
     parser.add_argument("--reward", type=str, choices=reward_registry.list(), required=True)
     parser.add_argument(
         "--reward_kwargs",

@@ -1,12 +1,15 @@
 """Compute sample metrics separately from the training run, for all eval zip files in an experiment
 directory. This saves on GPU-time during the run."""
 
+import math
+import json
 import torch
 import argparse
 import yaml
 from tqdm import trange
 from pathlib import Path
 from diffusiongym.utils import index_dict
+from diffusiongym import reward_registry
 import polars as pl
 
 from adm.setups import setups as problem_setups
@@ -37,10 +40,28 @@ def main(args):
     valids = torch.load(valids_file) if valids_file.is_file() else torch.ones(len(samples), dtype=torch.bool)
 
     if args.do_global_metrics:
-        logger.info(f"Computing global metrics...")
-        global_metrics = problem_setup.compute_metrics(samples, kwargs)
-        with open(eval_dir / "global_metrics.yaml", "w") as f:
-            yaml.dump(global_metrics, f)
+        logger.info("Computing global metrics...")
+        reward_name = exp_args.get("reward") or args.reward
+        if reward_name is None:
+            raise ValueError("No reward found in args.yaml and --reward not specified")
+        reward_kwargs = exp_args.get("reward_kwargs") or args.reward_kwargs or {}
+        reward = reward_registry.get(reward_name).instantiate(**reward_kwargs)
+        rewards, _ = reward(samples.to(device), samples.to(device))
+        rewards = rewards.cpu()
+
+        metrics = problem_setup.compute_metrics(samples, kwargs)
+        metrics["model_valid"] = valids.float().mean().item()
+        valid_rewards = rewards[valids]
+        metrics["model_reward"] = valid_rewards.mean().item() if valids.any() else float("nan")
+        metrics["model_reward_max"] = valid_rewards.max().item() if valids.any() else float("nan")
+        metrics["model_reward_all"] = rewards.mean().item()
+        if valids.any():
+            k = max(1, math.ceil(len(valid_rewards) * args.top_p))
+            metrics[f"model_reward_top{int(args.top_p * 100)}p"] = valid_rewards.topk(k).values.mean().item()
+        else:
+            metrics[f"model_reward_top{int(args.top_p * 100)}p"] = float("nan")
+        with open(eval_dir / "metrics.yaml", "w") as f:
+            yaml.dump(metrics, f)
 
     if args.do_sample_metrics:
         logger.info(f"Computing sample metrics...")
@@ -94,5 +115,8 @@ if __name__ == "__main__":
     parser.add_argument("sample_dir", type=Path)
     parser.add_argument("--do_global_metrics", action="store_true", default=False)
     parser.add_argument("--do_sample_metrics", action="store_true", default=False)
+    parser.add_argument("--top_p", type=float, default=0.05)
+    parser.add_argument("--reward", type=str, default=None)
+    parser.add_argument("--reward_kwargs", type=json.loads, default=None)
     args = parser.parse_args()
     main(args)

@@ -38,6 +38,7 @@ HAMMING_PENALTY_CUTOFF = 70
 HAMMING_PENALTY_RATE = 0.99
 
 DEFAULT_PLDDT_THRESHOLD = 65.
+SPHERE_EXCLUSION_THRESHOLD = 0.35
 
 
 def shim():
@@ -227,8 +228,9 @@ class ProteinFitnessReward(Reward[DDTensor]):
 
         self.oracle_ensemble = self._load_oracle_ensemble(CREILOV_WILD_TYPE, CREILOV_ALPHABET, resolved_path)
 
-    def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        tokens = sample.data.argmax(dim=-1)
+    def __call__(self, sample: DDTensor | None, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        source = sample if sample is not None else latent
+        tokens = source.data.argmax(dim=-1)
         sequences = [self.tokenizer.untokenize(s) for s in tokens]
         fitness_scores = self._oracle_predict(sequences)
         reward = torch.tensor(fitness_scores, dtype=torch.float32)
@@ -309,7 +311,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         self.lengthscale = args['lengthscale_vendi'] if 'lengthscale_vendi' in args else None
 
         self._base_model = ProteinModel(cfg_path, device=device)
-        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device) if 'no_verifier' not in args or not args['no_verifier'] else None
+        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device)
 
 
     @classmethod
@@ -330,9 +332,6 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
 
 
     def validity(self, samples: DDTensor, kwargs: dict[str, Any]) -> torch.Tensor:
-        if self.esmfold is None:
-            return torch.ones((len(samples),)).bool()
-
         strings = self.base_model.probs_to_sequence(samples)
 
         bs = kwargs['batch_size'] if 'batch_size' in kwargs else 32
@@ -353,9 +352,8 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
 
 
     @property
-    def feature_layer(self) -> str: # TODO maybe this is good? it's already supposed to be an ESM embedding...
-        """The name of the layer from which to extract features for the GP."""
-        return 'input'
+    def feature_layer(self) -> str:
+        return 'sgpo_model.model.network.encoder'
 
 
     def postprocess_latents(self, batch: Batch[DDTensor]) -> DDTensor:
@@ -363,8 +361,8 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
 
 
     def postprocess_features(self, latents: DDTensor, feats: Any) -> torch.Tensor:
-        data: torch.Tensor = feats.data
-        return data.mean(dim=-1)
+        hidden: torch.Tensor = feats[0]  # [batch, seq_len, hidden_size]
+        return hidden.mean(dim=1)  # [batch, hidden_size]
 
 
     def visualize_sample(self, env: Environment[DDTensor], uncertainty: UncertaintyEstimator[DDTensor], batch: Batch[DDTensor]) -> Figure:
@@ -408,6 +406,69 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         return {}
     
 
+    def get_sequence_array(self, samples: DDTensor, kwargs: dict) -> np.ndarray:
+        """Extract sequences as integer arrays of shape (n, seq_len)."""
+        probs = samples.data.float()
+        tokens = probs.argmax(dim=-1)
+        sequences = [self.base_model.sgpo_model.tokenizer.untokenize(s) for s in tokens]
+        return np.array([[ord(c) for c in seq] for seq in sequences], dtype=np.int32)
+
+    @staticmethod
+    def _identity_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        L = a.shape[1]
+        return (a[:, None, :] == b[None, :, :]).sum(axis=-1) / L
+
+    @staticmethod
+    def compute_novelty(current_seqs: np.ndarray, reference_seqs: np.ndarray) -> float:
+        """Novelty = 1 - mean max sequence identity to reference set."""
+        if len(current_seqs) == 0 or len(reference_seqs) == 0:
+            return 0.0
+        identity = ProteinProblemSetup._identity_matrix(current_seqs, reference_seqs)
+        return float(1.0 - identity.max(axis=1).mean())
+
+    @staticmethod
+    def compute_cumulative_cluster_metrics(
+        current_seqs: np.ndarray,
+        cumulative_centers: np.ndarray | None,
+        threshold: float = SPHERE_EXCLUSION_THRESHOLD,
+    ) -> tuple[dict[str, float], np.ndarray]:
+        """Track cluster expansion across iterations using sequence identity sphere exclusion."""
+        self_identity = ProteinProblemSetup._identity_matrix(current_seqs, current_seqs)
+        n = len(current_seqs)
+        picked = [0]
+        for i in range(1, n):
+            if all(self_identity[i, j] < threshold for j in picked):
+                picked.append(i)
+        current_centers = current_seqs[picked]
+
+        if cumulative_centers is None:
+            return {
+                "cumulative_clusters": float(len(current_centers)),
+                "coverage_of_cumulative": 1.0,
+                "new_clusters": float(len(current_centers)),
+                "clusters_lost": 0.0,
+            }, current_centers.copy()
+
+        def _max_identity(query: np.ndarray, reference: np.ndarray) -> np.ndarray:
+            return ProteinProblemSetup._identity_matrix(query, reference).max(axis=1)
+
+        coverage_sim = _max_identity(cumulative_centers, current_seqs)
+        covered = (coverage_sim >= threshold).sum()
+        n_prev = len(cumulative_centers)
+        clusters_lost = n_prev - int(covered)
+
+        novelty_sim = _max_identity(current_centers, cumulative_centers)
+        new_centers = current_centers[novelty_sim < threshold]
+
+        updated = np.vstack([cumulative_centers, new_centers]) if len(new_centers) > 0 else cumulative_centers.copy()
+
+        return {
+            "cumulative_clusters": float(len(updated)),
+            "coverage_of_cumulative": float(covered) / n_prev if n_prev > 0 else 1.0,
+            "new_clusters": float(len(new_centers)),
+            "clusters_lost": float(clusters_lost),
+        }, updated
+
     def compute_metrics(self, samples: DDTensor, kwargs: dict) -> dict[str, float]:
         probs = samples.data.float()
         esm_embeds = self.base_model.probs_to_embedding(DDTensor(probs)).data
@@ -439,8 +500,21 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         else:
             shannon = 0.0
 
-        return {"vendi": float(vendi_score_val), "shannon_entropy": shannon}
-    
+        result: dict[str, float] = {"vendi": float(vendi_score_val), "shannon_entropy": shannon}
+
+        if len(sequences) >= 2:
+            seq_array = np.array([[ord(c) for c in seq] for seq in sequences], dtype=np.int32)
+            self_identity = self._identity_matrix(seq_array, seq_array)
+            n = len(seq_array)
+            picked = [0]
+            for i in range(1, n):
+                if all(self_identity[i, j] < SPHERE_EXCLUSION_THRESHOLD for j in picked):
+                    picked.append(i)
+            result["sphere_exclusion_diversity"] = len(picked) / n
+            result["n_clusters"] = float(len(picked))
+
+        return result
+
 
     def compute_sample_metrics(self, samples: DDTensor, kwargs: dict) -> list[dict[str, float]]:
         return [{} for _ in range(len(samples.data))]

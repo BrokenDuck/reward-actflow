@@ -39,7 +39,7 @@ class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
             y = labels[idx]
 
             model.train()
-            opt = torch.optim.Adam(model.parameters(), lr=1e-3) 
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             losses = torch.zeros(num_steps)
 
@@ -54,7 +54,7 @@ class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
                 losses[i] = loss.item()
 
                 if i > w:
-                    recent_min = losses[i-w+1:i+1].min() 
+                    recent_min = losses[i-w+1:i+1].min()
                     overall_min = losses[:i-w+1].min()
                     if overall_min <= recent_min:
                         break
