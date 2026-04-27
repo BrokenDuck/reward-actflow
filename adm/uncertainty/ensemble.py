@@ -32,16 +32,11 @@ class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
         k = int(0.9 * n)
         w = 30
         num_steps = 1000
-        mini_batch = 256
-
-        # feats and labels stay on CPU; only mini-batches are moved to device per step
-        feats_cpu = feats.cpu()
-        labels_cpu = labels.cpu()
 
         for model in self.models:
             idx = torch.randperm(n)[:k]
-            x_cpu = feats_cpu[idx]
-            y_cpu = labels_cpu[idx]
+            x = feats[idx].to(self.device)
+            y = labels[idx].to(self.device)
 
             model.train()
             opt = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -51,9 +46,8 @@ class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
             for i in range(num_steps):
                 model.train()
                 opt.zero_grad()
-                mb = torch.randperm(len(x_cpu))[:mini_batch]
-                pred = model(x_cpu[mb].to(self.device))
-                loss = criterion(pred, y_cpu[mb].to(self.device).unsqueeze(-1))
+                pred = model(x)
+                loss = criterion(pred, y.unsqueeze(-1))
                 loss.backward()
                 opt.step()
 
