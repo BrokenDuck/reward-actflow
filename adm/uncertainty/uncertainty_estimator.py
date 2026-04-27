@@ -105,7 +105,7 @@ class UncertaintyEstimator(Reward[D]):
         self,
         feat_extractor: FlowFeatureExtractor[D],
         feat_dim: int,
-        beta: float = 1.0,
+        mean_weight: float = 0.0,
         device: Optional[torch.device | str] = None,
         args: dict[str, Any] = {},
     ):
@@ -114,7 +114,7 @@ class UncertaintyEstimator(Reward[D]):
 
         self.feat_extractor = feat_extractor
         self.feat_dim = feat_dim
-        self.beta = beta
+        self.mean_weight = mean_weight
         self.device = device
         self.args = args
 
@@ -194,17 +194,18 @@ class UncertaintyEstimator(Reward[D]):
         kwargs : list[dict[str, Any]]
             Keyword arguments used to obtain the latents.
         """
+        feats_list = []
         with torch.no_grad():
-            feats = [self._get_feats(x, **kw) for x, kw in zip(latents, kwargs)]
+            for x, kw in zip(latents, kwargs):
+                feats_list.append(self._get_feats(x, **kw).cpu())
 
-        feats_tensor = torch.cat(feats, dim=0)
+        feats_tensor = torch.cat(feats_list, dim=0)
         labels_tensor = torch.cat(labels, dim=0)
 
         labels_tensor = (labels_tensor - labels_tensor.mean()) / (labels_tensor.std() + 1e-8)
-        labels_tensor = labels_tensor.to(self.device)
 
         self._update_estimator(feats_tensor, labels_tensor)
 
     def __call__(self, sample: D | None, latent: D, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         mean, uncertainty = self.mean_and_uncertainty(latent, **kwargs)
-        return (1 - self.beta) * mean + self.beta * uncertainty, torch.ones(len(latent), dtype=torch.bool)
+        return self.mean_weight * mean + (1 - self.mean_weight) * uncertainty, torch.ones(len(latent), dtype=torch.bool)

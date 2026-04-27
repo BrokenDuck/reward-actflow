@@ -39,6 +39,18 @@ class Batch(Generic[D]):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def to(self, device: torch.device | str) -> "Batch[D]":
+        return Batch(
+            samples=self.samples.to(device),
+            latents=self.latents.to(device),
+            rewards=self.rewards.to(device),
+            valids=self.valids.to(device),
+            kwargs={k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in self.kwargs.items()},
+        )
+
+    def cpu(self) -> "Batch[D]":
+        return self.to("cpu")
+
     def __getitem__(self, idx: int) -> "Batch[D]":
         return Batch(
             samples=self.samples[idx],
@@ -52,17 +64,23 @@ class Batch(Generic[D]):
     def concat(batches: list["Batch[T]"]) -> "Batch[T]":
         data_type = type(batches[0].samples)
 
-        all_kwargs = []
-        for batch in batches:
-            for i in range(len(batch)):
-                all_kwargs.append(index_dict(batch.kwargs, i))
+        keys = batches[0].kwargs.keys()
+        all_kwargs = {}
+        for key in keys:
+            values = [b.kwargs[key] for b in batches]
+            if isinstance(values[0], torch.Tensor):
+                all_kwargs[key] = torch.cat(values, dim=0)
+            elif isinstance(values[0], list):
+                all_kwargs[key] = [item for v in values for item in v]
+            else:
+                all_kwargs[key] = default_collate(values)
 
         return Batch(
             samples=data_type.collate([b.samples for b in batches]),
             latents=data_type.collate([b.latents for b in batches]),
             rewards=torch.cat([b.rewards for b in batches], dim=0),
             valids=torch.cat([b.valids for b in batches], dim=0),
-            kwargs=default_collate(all_kwargs),  # type: ignore
+            kwargs=all_kwargs,
         )
 
 

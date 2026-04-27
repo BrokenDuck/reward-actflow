@@ -32,7 +32,7 @@ def main(args):
     if args.ckpt is not None:
         logger.info(f"Loading model checkpoint from {args.ckpt}")
 
-        ckpt_path = exp_dir / args.ckpt
+        ckpt_path = exp_dir / "checkpoints" / args.ckpt
         state_dict = torch.load(ckpt_path, map_location=device)
         env.base_model.load_state_dict(state_dict)
 
@@ -71,7 +71,7 @@ def main(args):
             if not batch.valids[i]:
                 continue
 
-            batches.append(batch[i])
+            batches.append(batch[i].cpu())
             is_valid_sampled[index] = True
 
         n_valids = batch.valids.int().sum().item()

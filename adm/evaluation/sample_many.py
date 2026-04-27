@@ -42,7 +42,7 @@ def main(args):
 
     if args.ckpt is not None:
         logger.info(f"Loading model checkpoint from {args.ckpt}")
-        ckpt_path = exp_dir / args.ckpt
+        ckpt_path = exp_dir / "checkpoints" / args.ckpt
         state_dict = torch.load(ckpt_path, map_location=device)
         env.base_model.load_state_dict(state_dict)
 
@@ -52,7 +52,7 @@ def main(args):
         samples = env.sample(current_n, pbar=False)
         batch = Batch.from_sample(samples)
         batch.valids = problem_setup.validity(batch.samples, batch.kwargs)
-        batches.append(batch)
+        batches.append(batch.cpu())
 
     batch = Batch.concat(batches)
     problem_setup.save_samples(batch.samples, batch.kwargs, folder)

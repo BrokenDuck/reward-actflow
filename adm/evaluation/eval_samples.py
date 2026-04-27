@@ -92,18 +92,17 @@ def main(args):
         df = pl.read_csv(sample_metrics_file)
 
         # Add rows for all invalid samples that are null for all metrics
-        if valids is not None:
-            n_samples = len(valids)
-            full_range = pl.DataFrame({ "sample_id": pl.arange(0, n_samples, eager=True) })
-            missing = full_range.join(df.select("sample_id"), on="sample_id", how="anti")
-            missing = missing.with_columns([pl.lit(False).alias("is_valid")])
+        n_samples = len(valids)
+        full_range = pl.DataFrame({"sample_id": pl.arange(0, n_samples, eager=True)})
+        missing = full_range.join(df.select("sample_id"), on="sample_id", how="anti")
+        missing = missing.with_columns([pl.Series("is_valid", valids[missing["sample_id"].to_numpy()].numpy())])
 
-            for col in df.columns:
-                if col not in missing.columns:
-                    missing = missing.with_columns(pl.lit(None).cast(df.schema[col]).alias(col))
+        for col in df.columns:
+            if col not in missing.columns:
+                missing = missing.with_columns(pl.lit(None).cast(df.schema[col]).alias(col))
 
-            missing = missing.select(df.columns)
-            df = pl.concat([df, missing])
+        missing = missing.select(df.columns)
+        df = pl.concat([df, missing])
 
         df = df.sort("sample_id")
         df.write_csv(sample_metrics_file)

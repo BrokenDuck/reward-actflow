@@ -29,7 +29,7 @@ class GPUncertaintyEstimator(UncertaintyEstimator[D]):
         self.likelihood.eval()
 
     def _update_estimator(self, feats: torch.Tensor, labels: torch.Tensor):
-        self.model.set_train_data(feats, labels, strict=False)
+        self.model.set_train_data(feats.to(self.device), labels.to(self.device), strict=False)
 
     def _mean_and_uncertainty(self, feats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         with gpytorch.settings.fast_pred_var(), gpytorch.settings.max_root_decomposition_size(500):

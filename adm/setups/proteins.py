@@ -39,6 +39,7 @@ HAMMING_PENALTY_RATE = 0.99
 
 DEFAULT_PLDDT_THRESHOLD = 65.
 SPHERE_EXCLUSION_THRESHOLD = 0.35
+REFERENCE_EVAL_DIR = Path("/cluster/scratch/kprotopapas/base_model/eval/base")
 
 
 def shim():
@@ -312,6 +313,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
 
         self._base_model = ProteinModel(cfg_path, device=device)
         self.esmfold = esm.pretrained.esmfold_v1().eval().to(device)
+        self._reference_embeddings: torch.Tensor | None = None
 
 
     @classmethod
@@ -469,11 +471,44 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
             "clusters_lost": float(clusters_lost),
         }, updated
 
+    def _load_reference_embeddings(self) -> torch.Tensor:
+        samples = torch.load(REFERENCE_EVAL_DIR / "samples.pt", map_location="cpu")
+        valids = torch.load(REFERENCE_EVAL_DIR / "valids.pt", map_location="cpu")
+        valid_probs = samples[valids].float()
+        embeddings = self.base_model.probs_to_embedding(DDTensor(valid_probs)).data
+        return embeddings.mean(dim=1)
+
+    @staticmethod
+    def compute_fid(current_embs: np.ndarray, reference_embs: np.ndarray) -> float:
+        from scipy.linalg import sqrtm
+
+        if len(current_embs) < 2 or len(reference_embs) < 2:
+            return float("nan")
+
+        mu1 = current_embs.mean(axis=0)
+        mu2 = reference_embs.mean(axis=0)
+        sigma1 = np.cov(current_embs, rowvar=False)
+        sigma2 = np.cov(reference_embs, rowvar=False)
+
+        diff = mu1 - mu2
+        covmean = sqrtm(sigma1 @ sigma2)
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+
+        return float(diff @ diff + np.trace(sigma1 + sigma2 - 2 * covmean))
+
     def compute_metrics(self, samples: DDTensor, kwargs: dict) -> dict[str, float]:
         probs = samples.data.float()
         esm_embeds = self.base_model.probs_to_embedding(DDTensor(probs)).data
 
         X = esm_embeds.mean(dim=1)
+
+        if self._reference_embeddings is None:
+            self._reference_embeddings = self._load_reference_embeddings()
+        n = len(X)
+        idx = torch.randperm(len(self._reference_embeddings))[:n]
+        fid = self.compute_fid(X.cpu().numpy(), self._reference_embeddings[idx].numpy())
+
         kernel = gpytorch.kernels.RBFKernel()
         if self.lengthscale is not None:
             kernel.lengthscale = self.lengthscale
@@ -500,7 +535,9 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         else:
             shannon = 0.0
 
-        result: dict[str, float] = {"vendi": float(vendi_score_val), "shannon_entropy": shannon}
+        p = probs.clamp(min=1e-10)
+        token_entropy = -(p * p.log()).sum(dim=-1).mean()
+        result: dict[str, float] = {"vendi": float(vendi_score_val), "shannon_entropy": shannon, "fid": fid, "avg_token_entropy": float(token_entropy)}
 
         if len(sequences) >= 2:
             seq_array = np.array([[ord(c) for c in seq] for seq in sequences], dtype=np.int32)

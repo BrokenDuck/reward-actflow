@@ -223,7 +223,6 @@ __marimo__/
 # custom
 experiments/
 slurm-*
-jobs/
 *.ipynb
 runs
 *.png

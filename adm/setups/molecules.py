@@ -127,9 +127,11 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         # Mean pooling
         return graph_sums / graph_counts.unsqueeze(1)
 
-    def _graph_to_mols(self, graph: dgl.DGLGraph) -> list[Chem.Mol | None]:
+    def _graph_to_mols(self, samples: DDGraph) -> list[Chem.Mol | None]:
+        samples.graph.edata["ue_mask"] = samples.ue_mask
+
         mols = []
-        for g in dgl.unbatch(graph):
+        for g in dgl.unbatch(samples.graph):
             mol = SampledMolecule(g.cpu(), self.atom_type_map).rdkit_mol
             mols.append(mol)
 
@@ -175,7 +177,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         uncertainty: UncertaintyEstimator[DDGraph],
         batch: Batch[DDGraph],
     ) -> Figure:
-        mols = self._graph_to_mols(batch.samples.graph)
+        mols = self._graph_to_mols(batch.samples)
 
         fig = plt.figure(figsize=(12, 8))
         cols = 8
@@ -222,7 +224,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
 
     def save_samples(self, samples: DDGraph, kwargs: dict, dir: Path) -> bool:
         samples = self._postprocess_graph(samples)
-        mols = self._graph_to_mols(samples.graph)
+        mols = self._graph_to_mols(samples)
         mols = [mol for mol in mols if mol is not None and self._is_mol_valid(mol)]
 
         sdf_path = dir / "samples.sdf.gz"
@@ -231,7 +233,8 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
             for mol in mols:
                 try:
                     w.write(mol)
-                except Exception:
+                except Exception as e:
+                    print(f"Failed to write molecule: {e}")
                     pass
             w.close()
 
@@ -253,8 +256,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         return DDGraph(graph), {}
 
     def compute_metrics(self, samples: DDGraph, kwargs: dict) -> dict[str, float]:
-        samples = self._postprocess_graph(samples)
-        mols = self._graph_to_mols(samples.graph)
+        mols = self._graph_to_mols(samples)
         mols = [mol for mol in mols if mol is not None and self._is_mol_valid(mol)]
 
         K = molecule_utils.get_tanimoto_K(mols)
@@ -269,19 +271,18 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
     def compute_sample_metrics(self, samples: DDGraph, kwargs: dict) -> list[dict[str, Any]]:
         # In case these were not loaded from file, we need to relax geometry
         samples = self._postprocess_graph(samples)
-        mols = self._graph_to_mols(samples.graph)
+        mols = self._graph_to_mols(samples)
 
         valid_indices = [i for i, mol in enumerate(mols) if mol is not None and self._is_mol_valid(mol)]
         valid_mols = [mols[i] for i in valid_indices]
         res = parallel_xtb(valid_mols)
 
-        metrics: list[dict[str, Any]] = [{ "is_valid": False } for _ in mols]
+        metrics: list[dict[str, Any]] = [{ "is_valid": True } for _ in mols]
         metric_names = ["energy", "homo", "lumo", "homo_lumo_gap", "dipole_moment", "polarizability", "heat_capacity"]
         for mol, idx, xtb_res in zip(valid_mols, valid_indices, res):
             if xtb_res is None:
                 continue
 
-            metrics[idx] = { "is_valid": True }
             for name in metric_names:
                 metrics[idx][name] = getattr(xtb_res, name)
             metrics[idx]["qed"] = QED.qed(mol)

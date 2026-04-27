@@ -214,7 +214,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/48/b7/6190994c06fb2cee1ff25c4326312a5c38c20e721424c332195f65af5190/datasets-2.11.0-py3-none-any.whl
       - pypi: https://data.dgl.ai/wheels/torch-2.3/cu121/dgl-2.4.0%2Bcu121-cp311-cp311-manylinux1_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/e7/7a/f08f610cea8a3395ad3b4f586db23bedb43c68db6c3261145a15e7b63126/diffusers-0.33.1-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/e8/b4/87da310372335602fa84d28e8a7febad05f5f9d56a0f24497ce5e1309ef9/diffusiongym-2.0.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/be/e3/a84bf2e561beed15813080d693b4b27573262433fced9c1d1fea59e60553/dill-0.3.6-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/33/6b/e0547afaf41bf2c42e52430072fa5658766e3d65bd4b03a563d1b6336f57/distlib-0.4.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/2a/09/f8d8f8f31e4483c10a906437b4ce31bdf3d6d417b73fe33f1a8b59e34228/einops-0.8.2-py3-none-any.whl
@@ -340,6 +339,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/37/81/6acd6601f61e31cfb8729d3da6d5df966f80f374b78eff83760714487338/yapf-0.43.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/46/00/71b90ed48e895667ecfb1eaab27c1523ee2fa217433ed77a73b13205ca4b/yarl-1.22.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://download.pytorch.org/whl/zipp-3.19.2-py3-none-any.whl
+      - pypi: ../diffusiongym
       - pypi: ./
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -440,7 +440,7 @@ packages:
 - pypi: ./
   name: adm
   version: 0.1.0
-  sha256: 2dab1abdff36d20aa9b4704cceab200b87259a9418e1b9f48df59ef737a674c7
+  sha256: b14432e3edceeef42978200661a76da4a836f3005c99c9acd3dfd9bcb7bc3ca1
   requires_dist:
   - imageio[ffmpeg]>=2.37.2,<3
   - vendi-score[images,molecules]>=0.0.3,<0.0.4
@@ -989,32 +989,33 @@ packages:
   - jinja2 ; extra == 'training'
   - peft>=0.6.0 ; extra == 'training'
   requires_python: '>=3.8.0'
-- pypi: https://files.pythonhosted.org/packages/e8/b4/87da310372335602fa84d28e8a7febad05f5f9d56a0f24497ce5e1309ef9/diffusiongym-2.0.1-py3-none-any.whl
+- pypi: ../diffusiongym
   name: diffusiongym
   version: 2.0.1
-  sha256: 07d878986fd8ac11a67fe19d9872efdc1763e3311dd8e8a21124a2cc49761110
+  sha256: 5b6805e3e30eef3fb7238fb6b7f0527889ceb138cbfceb02d611de2c01837fd1
   requires_dist:
-  - datasets==2.11.0
-  - dgl==2.4
-  - diffusers==0.33.1
-  - meeko==0.6.1
   - numpy>=1.24,<2
-  - open-clip-torch>=2.26,<3
-  - pandas>=2,<3
   - polars>=1.34.0,<2
-  - prody>=2.4,<3
-  - pyarrow==11.0.0
-  - pydantic>=1.10,<3
-  - pyyaml>=6,<7
-  - rdkit-stubs>=0.6,<0.9
-  - rdkit>=2023.9.4,<2025
   - torch==2.3.1
-  - torchdata>=0.7,<0.9
-  - torchvision==0.18.1
   - tqdm>=4.66,<5
-  - transformers>=4.36
   - typing-extensions>=4.9,<5
+  - dgl==2.4
+  - meeko==0.6.1
+  - pandas>=2,<3
+  - pydantic>=1.10,<3
+  - prody>=2.4,<3
+  - rdkit>=2023.9.4,<2025
+  - rdkit-stubs>=0.6,<0.9
+  - torchdata>=0.7,<0.9
+  - pyyaml>=6,<7
+  - diffusers==0.33.1
+  - transformers>=4.36
+  - datasets==2.11.0
+  - pyarrow==11.0.0
+  - open-clip-torch>=2.26,<3
+  - torchvision==0.18.1
   requires_python: '>=3.8,<3.12'
+  editable: true
 - pypi: https://files.pythonhosted.org/packages/be/e3/a84bf2e561beed15813080d693b4b27573262433fced9c1d1fea59e60553/dill-0.3.6-py3-none-any.whl
   name: dill
   version: 0.3.6
