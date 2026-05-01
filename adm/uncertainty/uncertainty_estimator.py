@@ -200,7 +200,7 @@ class UncertaintyEstimator(Reward[D]):
                 feats_list.append(self._get_feats(x, **kw).cpu())
 
         feats_tensor = torch.cat(feats_list, dim=0)
-        labels_tensor = torch.cat(labels, dim=0)
+        labels_tensor = torch.cat([l.cpu() for l in labels], dim=0)
 
         labels_tensor = (labels_tensor - labels_tensor.mean()) / (labels_tensor.std() + 1e-8)
 

@@ -1,4 +1,4 @@
-from typing import Generic, Literal
+from typing import Generic, Literal, Optional
 from dataclasses import dataclass
 from contextlib import contextmanager
 
@@ -58,13 +58,17 @@ class ExploreConfig:
     eval_every: int = 10
     video_fps: int = 4
 
+    # Shared offline buffer
+    buffer_dir: Optional[Path] = None
+
     # Flags
     no_uncertainty: bool = False
     no_verifier: bool = False
 
     def __post_init__(self):
-        # Create experiment directory if it doesn't exist
         self.folder.mkdir(parents=True, exist_ok=True)
+        if self.buffer_dir is not None:
+            (self.buffer_dir / self.folder.name).mkdir(parents=True, exist_ok=True)
 
         # Validation
         if not (0 <= self.feat_timestep <= 1):
@@ -144,6 +148,43 @@ class ExploreLoop(Generic[D]):
             csv.writer(f).writerow(row)
 
         self._timings = {}
+
+    def _buffer_run_dir(self) -> Path:
+        return self.config.buffer_dir / self.config.folder.name
+
+    def _write_to_buffer(self, batch: Batch, idx: int, run_valid_count: int):
+        run_dir = self._buffer_run_dir()
+        torch.save(
+            {"samples": batch.samples, "latents": batch.latents, "valids": batch.valids, "kwargs": batch.kwargs},
+            run_dir / f"batch_{idx:06d}.pt",
+        )
+        (run_dir / "count.txt").write_text(str(run_valid_count))
+
+    def _total_buffer_valid_count(self) -> int:
+        total = 0
+        for f in self.config.buffer_dir.glob("*/count.txt"):
+            try:
+                total += int(f.read_text())
+            except Exception:
+                pass
+        return total
+
+    def _load_buffer(self, max_valid: int | None = None) -> list[Batch]:
+        batches = []
+        valid_count = 0
+        for f in sorted(self.config.buffer_dir.glob("*/batch_*.pt")):
+            if max_valid is not None and valid_count >= max_valid:
+                break
+            data = torch.load(f, map_location="cpu")
+            batches.append(Batch(
+                samples=data["samples"],
+                latents=data["latents"],
+                rewards=torch.zeros(len(data["valids"])),
+                valids=data["valids"],
+                kwargs=data["kwargs"],
+            ))
+            valid_count += int(data["valids"].sum().item())
+        return batches
 
     def finetune_base_model(self, batches: list[Batch[D]], pbar: bool = False):
         """Fine-tune the base model with obtained valid samples.
@@ -255,21 +296,39 @@ class ExploreLoop(Generic[D]):
 
     def explore_loop(self, num_iterations: int, samples_per_iter: int):
         metrics = dict()
-        batches: list[Batch[D]] = []
-        total_valid_samples = 0
+        use_buffer = self.config.buffer_dir is not None
+
+        offline_batches: list[Batch[D]] = []
+        guided_batches: list[Batch[D]] = []
+        offline_valid_count = 0
+        guided_valid_count = 0
+
+        saved_offline_buffer = False
+        shared_offline_batches: list[Batch[D]] = []
+        shared_offline_loaded = False
 
         for i in range(num_iterations):
-            # Evaluate current model state
             with self._timer("eval"):
                 metrics = {}
                 if i % self.config.eval_every == 0:
                     metrics = self.eval_model(i)
 
-            # Determine if we should use uncertainty guidance
-            has_enough_data = total_valid_samples > self.config.ft_min_dataset_size
-            use_guidance = has_enough_data and not self.config.no_uncertainty
+            offline_done = False
+            if use_buffer:
+                total_offline_shared = self._total_buffer_valid_count()
+                offline_done = total_offline_shared >= self.config.ft_min_dataset_size // 2
+                use_guidance = offline_done and not self.config.no_uncertainty
+                has_enough_data = offline_done and guided_valid_count >= self.config.ft_min_dataset_size // 2
+            else:
+                total_valid = offline_valid_count + guided_valid_count
+                use_guidance = total_valid > self.config.ft_min_dataset_size / 2 and not self.config.no_uncertainty
+                has_enough_data = total_valid > self.config.ft_min_dataset_size
 
-            # Collect new samples
+            if not use_buffer and has_enough_data and not saved_offline_buffer:
+                all_batches = Batch.concat(offline_batches + guided_batches)
+                self.problem.save_samples(all_batches.samples, all_batches.kwargs, self.config.folder)
+                saved_offline_buffer = True
+
             with self._timer("sampling"):
                 if use_guidance:
                     self.env.control_policy = RewardGradient(self.env, self.uncertainty)
@@ -278,16 +337,28 @@ class ExploreLoop(Generic[D]):
                 batch = Batch.from_sample(sample)
                 batch.latents = self.problem.postprocess_latents(batch)
                 batch.valids = self.problem.validity(batch.samples, batch.kwargs)
-                total_valid_samples += batch.valids.int().sum().item()
 
                 self.env.control_policy = None
 
-            # Store data (CPU to avoid accumulating GPU tensors over iterations)
             batch.latents = batch.latents.to("cpu")
             batch.samples = batch.samples.to("cpu")
-            batches.append(batch)
+            n_valid = batch.valids.int().sum().item()
 
-            # Logging and visualization
+            if not use_guidance:
+                offline_batches.append(batch)
+                offline_valid_count += n_valid
+                if use_buffer:
+                    self._write_to_buffer(batch, i, offline_valid_count)
+            else:
+                guided_batches.append(batch)
+                guided_valid_count += n_valid
+
+            if use_buffer and offline_done and not shared_offline_loaded:
+                shared_offline_batches = self._load_buffer(max_valid=self.config.ft_min_dataset_size // 2)
+                shared_offline_loaded = True
+
+            all_local_batches = offline_batches + guided_batches
+
             with self._timer("visualize"):
                 self.visualize_iter(batch, i)
 
@@ -302,16 +373,19 @@ class ExploreLoop(Generic[D]):
                 metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
                 self.logger.info(f"(iter={i:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
 
-            # Update models with full buffer
             with self._timer("finetune"):
                 if has_enough_data:
-                    self.finetune_base_model(batches, pbar=False)
+                    ft_batches = shared_offline_batches + guided_batches if use_buffer else all_local_batches
+                    self.finetune_base_model(ft_batches, pbar=False)
 
             with self._timer("uncertainty_update"):
                 if not self.config.no_uncertainty:
-                    self.update_uncertainty_estimator(batches)
+                    if use_buffer:
+                        uncertainty_batches = shared_offline_batches + guided_batches if shared_offline_loaded else offline_batches
+                    else:
+                        uncertainty_batches = all_local_batches
+                    self.update_uncertainty_estimator(uncertainty_batches)
 
-            # Save checkpoint
             with self._timer("checkpoint"):
                 ckpt_dir = self.config.folder / "checkpoints"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -322,7 +396,6 @@ class ExploreLoop(Generic[D]):
                 if self.config.ckpt_every > 0 and i % self.config.ckpt_every == 0:
                     torch.save(state_dict, ckpt_dir / f"ckpt_{i}.pt")
 
-            # Write timings to CSV
             self._flush_timings(i)
 
         write_video(
@@ -413,6 +486,7 @@ def build_parser(add_extra_args):
 
 def add_global_args(parser):
     parser.add_argument("--dir", type=Path, required=True)
+    parser.add_argument("--buffer_dir", type=Path, default=None)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
 

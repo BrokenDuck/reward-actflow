@@ -7,6 +7,7 @@ from torch import Tensor, device
 import torch
 from omegaconf import OmegaConf
 import esm
+import esm.esmfold.v1.esmfold as _esmfold_module  # needed for compute_tm stub
 import numpy as np
 from vendi_score import vendi
 import gpytorch
@@ -40,6 +41,10 @@ HAMMING_PENALTY_RATE = 0.99
 DEFAULT_PLDDT_THRESHOLD = 65.
 SPHERE_EXCLUSION_THRESHOLD = 0.35
 REFERENCE_EVAL_DIR = Path("/cluster/scratch/kprotopapas/base_model/eval/base")
+
+# We only use mean_plddt from ESMFold, never pTM. Stub out compute_tm so the
+# forward pass doesn't crash in fp16 (ptm_head logits contain NaN in fp16).
+_esmfold_module.compute_tm = lambda logits, *args, **kwargs: logits.new_zeros(())
 
 
 def shim():
@@ -310,9 +315,12 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         cfg_path: str = args['cfg_path']
         self.threshold = args['threshold'] if 'threshold' in args else DEFAULT_PLDDT_THRESHOLD
         self.lengthscale = args['lengthscale_vendi'] if 'lengthscale_vendi' in args else None
+        self.validity_batch_size = args['validity_batch_size'] if 'validity_batch_size' in args else 32
 
         self._base_model = ProteinModel(cfg_path, device=device)
-        self.esmfold = esm.pretrained.esmfold_v1().eval().to(device)
+        esmfold_chunk_size = args.get('esmfold_chunk_size', None)
+        self.esmfold = esm.pretrained.esmfold_v1().eval().half().to(device)
+        self.esmfold.set_chunk_size(esmfold_chunk_size)
         self._reference_embeddings: torch.Tensor | None = None
 
 
@@ -322,6 +330,8 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         parser.add_argument('--cfg_path', type=str, default=default_path, help='Path for diffusion model config file')
         parser.add_argument('--threshold', type=float, default=DEFAULT_PLDDT_THRESHOLD, help='Validity threshold for pLDDT')
         parser.add_argument('--lengthscale_vendi', type=float, default=2.)
+        parser.add_argument('--validity_batch_size', type=int, default=32, help='Batch size for ESMFold validity checks')
+        parser.add_argument('--esmfold_chunk_size', type=int, default=None, help='Chunk size for ESMFold attention (smaller = less VRAM, slower)')
 
     @property
     def base_model(self) -> ProteinModel:
@@ -336,7 +346,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
     def validity(self, samples: DDTensor, kwargs: dict[str, Any]) -> torch.Tensor:
         strings = self.base_model.probs_to_sequence(samples)
 
-        bs = kwargs['batch_size'] if 'batch_size' in kwargs else 32
+        bs = kwargs.get('batch_size', self.validity_batch_size)
         
         str_list = list(strings)
         plddts = []
