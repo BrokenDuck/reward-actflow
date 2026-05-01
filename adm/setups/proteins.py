@@ -42,11 +42,6 @@ DEFAULT_PLDDT_THRESHOLD = 65.
 SPHERE_EXCLUSION_THRESHOLD = 0.35
 REFERENCE_EVAL_DIR = Path("/cluster/scratch/kprotopapas/base_model/eval/base")
 
-# We only use mean_plddt from ESMFold, never pTM. Stub out compute_tm so the
-# forward pass doesn't crash in fp16 (ptm_head logits contain NaN in fp16).
-_esmfold_module.compute_tm = lambda logits, *args, **kwargs: logits.new_zeros(())
-
-
 def shim():
     import importlib
     try:
@@ -319,8 +314,13 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
 
         self._base_model = ProteinModel(cfg_path, device=device)
         esmfold_chunk_size = args.get('esmfold_chunk_size', None)
-        self.esmfold = esm.pretrained.esmfold_v1().eval().half().to(device)
-        self.esmfold.set_chunk_size(esmfold_chunk_size)
+
+        if esmfold_chunk_size is not None:
+            self.esmfold = esm.pretrained.esmfold_v1().eval().half().to(device)
+            # We only use mean_plddt from ESMFold, never pTM. Stub out compute_tm so the
+            # forward pass doesn't crash in fp16 (ptm_head logits contain NaN in fp16).
+            _esmfold_module.compute_tm = lambda logits, *args, **kwargs: logits.new_zeros(())
+            self.esmfold.set_chunk_size(esmfold_chunk_size)
         self._reference_embeddings: torch.Tensor | None = None
 
 
