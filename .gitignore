@@ -237,3 +237,4 @@ wandb
 configs
 .claude
 *.txt
+scripts

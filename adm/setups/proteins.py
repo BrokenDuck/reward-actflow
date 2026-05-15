@@ -314,12 +314,15 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
 
         self._base_model = ProteinModel(cfg_path, device=device)
         esmfold_chunk_size = args.get('esmfold_chunk_size', None)
+        esmfold_fp16 = args.get('esmfold_fp16', False)
 
-        if esmfold_chunk_size is not None:
-            self.esmfold = esm.pretrained.esmfold_v1().eval().half().to(device)
-            # We only use mean_plddt from ESMFold, never pTM. Stub out compute_tm so the
-            # forward pass doesn't crash in fp16 (ptm_head logits contain NaN in fp16).
+        self.esmfold = esm.pretrained.esmfold_v1().eval()
+        if esmfold_fp16:
+            self.esmfold = self.esmfold.half()
             _esmfold_module.compute_tm = lambda logits, *args, **kwargs: logits.new_zeros(())
+        self.esmfold = self.esmfold.to(device)
+        if esmfold_chunk_size is not None:
+            print("using chunked esmfold")
             self.esmfold.set_chunk_size(esmfold_chunk_size)
         self._reference_embeddings: torch.Tensor | None = None
 
@@ -332,6 +335,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
         parser.add_argument('--lengthscale_vendi', type=float, default=2.)
         parser.add_argument('--validity_batch_size', type=int, default=32, help='Batch size for ESMFold validity checks')
         parser.add_argument('--esmfold_chunk_size', type=int, default=None, help='Chunk size for ESMFold attention (smaller = less VRAM, slower)')
+        parser.add_argument('--esmfold_fp16', action='store_true', default=False, help='Run ESMFold in fp16 (less VRAM, stubs out pTM head)')
 
     @property
     def base_model(self) -> ProteinModel:
@@ -355,7 +359,7 @@ class ProteinProblemSetup(ProblemSetup[DDTensor]):
                 sublist = str_list[i: min(len(str_list), i + bs)]
                 results = self.esmfold.infer(sublist)        
                 plddt = results['mean_plddt']
-                plddts.append(plddt.squeeze())
+                plddts.append(plddt.reshape(-1))
 
         plddt = torch.cat(plddts)
 

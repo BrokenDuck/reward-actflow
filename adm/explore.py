@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from diffusiongym import construct_env, D, Reward
 from diffusiongym.utils import train_base_model
+from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
@@ -64,6 +65,7 @@ class ExploreConfig:
     # Flags
     no_uncertainty: bool = False
     no_verifier: bool = False
+    verbose: bool = False
 
     def __post_init__(self):
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -186,6 +188,48 @@ class ExploreLoop(Generic[D]):
             valid_count += int(data["valids"].sum().item())
         return batches
 
+    def _save_loop_state(
+        self,
+        iteration: int,
+        offline_batches: list,
+        guided_batches: list,
+        offline_valid_count: int,
+        guided_valid_count: int,
+        saved_offline_buffer: bool,
+    ):
+        def batch_to_dict(b: Batch) -> dict:
+            return {"samples": b.samples, "latents": b.latents, "rewards": b.rewards, "valids": b.valids, "kwargs": b.kwargs}
+
+        torch.save(
+            {
+                "iteration": iteration,
+                "offline_valid_count": offline_valid_count,
+                "guided_valid_count": guided_valid_count,
+                "saved_offline_buffer": saved_offline_buffer,
+                "offline_batches": [batch_to_dict(b) for b in offline_batches],
+                "guided_batches": [batch_to_dict(b) for b in guided_batches],
+            },
+            self.config.folder / "loop_state.pt",
+        )
+
+    def _load_loop_state(self) -> dict | None:
+        path = self.config.folder / "loop_state.pt"
+        if not path.exists():
+            return None
+        state = torch.load(path, map_location="cpu")
+
+        def dict_to_batch(d: dict) -> Batch:
+            return Batch(samples=d["samples"], latents=d["latents"], rewards=d["rewards"], valids=d["valids"], kwargs=d["kwargs"])
+
+        return {
+            "iteration": state["iteration"],
+            "offline_valid_count": state["offline_valid_count"],
+            "guided_valid_count": state["guided_valid_count"],
+            "saved_offline_buffer": state["saved_offline_buffer"],
+            "offline_batches": [dict_to_batch(d) for d in state["offline_batches"]],
+            "guided_batches": [dict_to_batch(d) for d in state["guided_batches"]],
+        }
+
     def finetune_base_model(self, batches: list[Batch[D]], pbar: bool = False):
         """Fine-tune the base model with obtained valid samples.
 
@@ -262,16 +306,21 @@ class ExploreLoop(Generic[D]):
         if n <= 0 and n_valid_target <= 0:
             return dict()
 
+        verbose = self.config.verbose
         n = max(n, bs)
         eval_kwargs = self.problem.eval_sampling_kwargs(n)
-        sample = self.env.batch_sample(n, bs, **eval_kwargs)
+        sample = self.env.batch_sample(n, bs, pbar=verbose, **eval_kwargs)
         batch = Batch.from_sample(sample)
+        del sample
+        torch.cuda.empty_cache()
         batch.valids = self.problem.validity(batch.samples, batch.kwargs)
 
         while n_valid_target > 0 and batch.valids.sum().item() < n_valid_target:
             extra_kwargs = self.problem.eval_sampling_kwargs(bs)
-            extra_sample = self.env.batch_sample(bs, bs, **extra_kwargs)
+            extra_sample = self.env.batch_sample(bs, bs, pbar=verbose, **extra_kwargs)
             extra_batch = Batch.from_sample(extra_sample)
+            del extra_sample
+            torch.cuda.empty_cache()
             extra_batch.valids = self.problem.validity(extra_batch.samples, extra_batch.kwargs)
             batch = Batch.concat([batch, extra_batch])
 
@@ -307,10 +356,39 @@ class ExploreLoop(Generic[D]):
         shared_offline_batches: list[Batch[D]] = []
         shared_offline_loaded = False
 
-        for i in range(num_iterations):
+        start_iter = 0
+        resume_state = self._load_loop_state()
+        if resume_state is not None:
+            offline_batches = resume_state["offline_batches"]
+            guided_batches = resume_state["guided_batches"]
+            offline_valid_count = resume_state["offline_valid_count"]
+            guided_valid_count = resume_state["guided_valid_count"]
+            saved_offline_buffer = resume_state["saved_offline_buffer"]
+            start_iter = resume_state["iteration"] + 1
+
+            ckpt_path = self.config.folder / "checkpoints" / "last.pt"
+            if ckpt_path.exists():
+                device = next(self.base_model.parameters()).device
+                self.base_model.load_state_dict(torch.load(ckpt_path, map_location=device))
+
+            all_batches = offline_batches + guided_batches
+            if all_batches and not self.config.no_uncertainty:
+                self.update_uncertainty_estimator(all_batches)
+
+            self.logger.info(f"Resuming from iteration {start_iter}")
+
+        verbose = self.config.verbose
+        iter_range = tqdm(range(start_iter, num_iterations), desc=f"iter {start_iter}/? | idle") if verbose else range(start_iter, num_iterations)
+
+        for i in iter_range:
+            def step(label: str):
+                if verbose:
+                    iter_range.set_description(f"iter {i}/{num_iterations} | {label}")
+
             with self._timer("eval"):
                 metrics = {}
                 if i % self.config.eval_every == 0:
+                    step("eval")
                     metrics = self.eval_model(i)
 
             offline_done = False
@@ -327,21 +405,23 @@ class ExploreLoop(Generic[D]):
             if not use_buffer and has_enough_data and not saved_offline_buffer:
                 all_batches = Batch.concat(offline_batches + guided_batches)
                 self.problem.save_samples(all_batches.samples, all_batches.kwargs, self.config.folder)
+                torch.save(all_batches.valids, self.config.folder / "valids.pt")
                 saved_offline_buffer = True
 
             with self._timer("sampling"):
+                step("sampling")
                 if use_guidance:
                     self.env.control_policy = RewardGradient(self.env, self.uncertainty)
 
-                sample = self.env.batch_sample(samples_per_iter, self.config.sample_batch_size)
+                sample = self.env.batch_sample(samples_per_iter, self.config.sample_batch_size, pbar=verbose)
                 batch = Batch.from_sample(sample)
                 batch.latents = self.problem.postprocess_latents(batch)
+                step("validity")
                 batch.valids = self.problem.validity(batch.samples, batch.kwargs)
 
                 self.env.control_policy = None
 
-            batch.latents = batch.latents.to("cpu")
-            batch.samples = batch.samples.to("cpu")
+            batch = batch.cpu()
             n_valid = batch.valids.int().sum().item()
 
             if not use_guidance:
@@ -360,6 +440,7 @@ class ExploreLoop(Generic[D]):
             all_local_batches = offline_batches + guided_batches
 
             with self._timer("visualize"):
+                step("visualize")
                 self.visualize_iter(batch, i)
 
                 with torch.no_grad():
@@ -375,11 +456,13 @@ class ExploreLoop(Generic[D]):
 
             with self._timer("finetune"):
                 if has_enough_data:
+                    step("finetune")
                     ft_batches = shared_offline_batches + guided_batches if use_buffer else all_local_batches
-                    self.finetune_base_model(ft_batches, pbar=False)
+                    self.finetune_base_model(ft_batches, pbar=verbose)
 
             with self._timer("uncertainty_update"):
                 if not self.config.no_uncertainty:
+                    step("uncertainty update")
                     if use_buffer:
                         uncertainty_batches = shared_offline_batches + guided_batches if shared_offline_loaded else offline_batches
                     else:
@@ -387,6 +470,7 @@ class ExploreLoop(Generic[D]):
                     self.update_uncertainty_estimator(uncertainty_batches)
 
             with self._timer("checkpoint"):
+                step("checkpoint")
                 ckpt_dir = self.config.folder / "checkpoints"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -395,6 +479,8 @@ class ExploreLoop(Generic[D]):
 
                 if self.config.ckpt_every > 0 and i % self.config.ckpt_every == 0:
                     torch.save(state_dict, ckpt_dir / f"ckpt_{i}.pt")
+
+                self._save_loop_state(i, offline_batches, guided_batches, offline_valid_count, guided_valid_count, saved_offline_buffer)
 
             self._flush_timings(i)
 

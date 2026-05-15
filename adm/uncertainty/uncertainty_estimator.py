@@ -181,6 +181,7 @@ class UncertaintyEstimator(Reward[D]):
         latents: list[D],
         labels: list[torch.Tensor],
         kwargs: list[dict[str, Any]],
+        feat_batch_size: int = 128,
     ):
         """Update data which is used to update the uncertainty estimator.
 
@@ -193,11 +194,14 @@ class UncertaintyEstimator(Reward[D]):
             or reward values in the task-directed case.
         kwargs : list[dict[str, Any]]
             Keyword arguments used to obtain the latents.
+        feat_batch_size : int, default=128
+            Number of latents to extract features from at once.
         """
         feats_list = []
         with torch.no_grad():
             for x, kw in zip(latents, kwargs):
-                feats_list.append(self._get_feats(x, **kw).cpu())
+                for i in range(0, len(x), feat_batch_size):
+                    feats_list.append(self._get_feats(x[i:i + feat_batch_size], **kw).cpu())
 
         feats_tensor = torch.cat(feats_list, dim=0)
         labels_tensor = torch.cat([l.cpu() for l in labels], dim=0)
