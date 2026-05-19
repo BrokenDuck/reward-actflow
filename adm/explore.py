@@ -5,7 +5,9 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 from diffusiongym import construct_env, D, Reward
-from diffusiongym.utils import train_base_model
+from diffusiongym.utils import train_base_model, DDDataset, dict_to_device
+from torch.utils.data import DataLoader, Subset
+import torch.nn as _nn
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -19,7 +21,7 @@ from .inf_methods.dps import RewardGradient
 from .uncertainty import UncertaintyEstimator, FlowFeatureExtractor, uncertainty_estimators
 from .setups import setups as problem_setups
 from .setups.problem_setup import ProblemSetup
-from .utils import write_video, filter_out_invalids, Batch, serialize_args, setup_logger
+from .utils import write_video, filter_out_invalids, filter_out_valids, Batch, serialize_args, setup_logger
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,10 @@ class ExploreConfig:
     no_uncertainty: bool = False
     no_verifier: bool = False
     verbose: bool = False
+
+    # Negative sample finetuning
+    neg_grad_scale: float = 0.0
+    max_neg_samples: int = 5000
 
     def __post_init__(self):
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -266,6 +272,157 @@ class ExploreLoop(Generic[D]):
             pbar=pbar,
         )
 
+    def combined_finetune_base_model(self, batches: list[Batch[D]], pbar: bool = False):
+        """Fine-tune with combined pos+neg signal using gradient norm scaling.
+
+        - Positive update sees a full batch of valid samples.
+        - Negative gradient is rescaled so ||grad_neg|| = neg_grad_scale * ||grad_pos||.
+
+        Falls back to finetune_base_model when neg_grad_scale=0 or there are no invalid samples.
+        """
+        if self.config.no_verifier:
+            self.finetune_base_model(batches, pbar=pbar)
+            return
+
+        valid_batch = filter_out_invalids(batches)
+        invalid_batch = filter_out_valids(batches)
+
+        m = len(valid_batch)
+        k = len(invalid_batch) if invalid_batch is not None else 0
+
+        if m == 0:
+            self.logger.warning("Combined FT: no valid data, skipping")
+            return
+
+        scale = self.config.neg_grad_scale
+        use_neg = scale > 0 and k > 0
+
+        if not use_neg:
+            self.finetune_base_model(batches, pbar=pbar)
+            return
+
+        max_neg = self.config.max_neg_samples
+        k_used = min(k, max_neg)
+
+        self.logger.info(
+            f"Combined FT (grad-norm): m={m} k_total={k} k_used={k_used}, neg_grad_scale={scale}"
+        )
+
+        device = self.env.base_model.device
+        bs = self.config.ft_batch_size
+
+        pos_dataset = DDDataset([valid_batch.latents.to(device)], [valid_batch.kwargs], None)
+        pos_loader = DataLoader(
+            pos_dataset, bs, shuffle=True,
+            collate_fn=pos_dataset.collate, num_workers=0, pin_memory=False,
+        )
+
+        neg_dataset_full = DDDataset([invalid_batch.latents.to(device)], [invalid_batch.kwargs], None)
+        if k > max_neg:
+            subset_idx = torch.randperm(k)[:max_neg].tolist()
+            neg_dataset = Subset(neg_dataset_full, subset_idx)
+        else:
+            neg_dataset = neg_dataset_full
+        neg_loader = DataLoader(
+            neg_dataset, bs, shuffle=True,
+            collate_fn=neg_dataset_full.collate, num_workers=0, pin_memory=False,
+        )
+
+        opt = torch.optim.AdamW(
+            self.base_model.parameters(),
+            lr=self.config.ft_lr,
+            weight_decay=self.config.ft_weight_decay,
+        )
+        accum = self.config.ft_accumulate_steps
+
+        self.base_model.train()
+        opt.zero_grad()
+        pos_iter = iter(pos_loader)
+        neg_iter = iter(neg_loader)
+        accum_grad_pos = {}
+        accum_grad_neg = {}
+
+        for step in range(self.config.ft_steps):
+            try:
+                x1_pos, kw_pos, _ = next(pos_iter)
+            except StopIteration:
+                pos_iter = iter(pos_loader)
+                x1_pos, kw_pos, _ = next(pos_iter)
+
+            x1_pos = x1_pos.to(device)
+            kw_pos = dict_to_device(kw_pos, device)
+
+            loss_pos = self.base_model.train_loss(x1_pos, **kw_pos).mean() / accum
+            loss_pos.backward()
+
+            for name, p in self.base_model.named_parameters():
+                if p.grad is not None:
+                    if name in accum_grad_pos:
+                        accum_grad_pos[name].add_(p.grad)
+                    else:
+                        accum_grad_pos[name] = p.grad.clone()
+
+            opt.zero_grad()
+
+            try:
+                x1_neg, kw_neg, _ = next(neg_iter)
+            except StopIteration:
+                neg_iter = iter(neg_loader)
+                x1_neg, kw_neg, _ = next(neg_iter)
+
+            x1_neg = x1_neg.to(device)
+            kw_neg = dict_to_device(kw_neg, device)
+
+            loss_neg = self.base_model.train_loss(x1_neg, **kw_neg).mean() / accum
+            loss_neg.backward()
+
+            for name, p in self.base_model.named_parameters():
+                if p.grad is not None:
+                    if name in accum_grad_neg:
+                        accum_grad_neg[name].add_(p.grad)
+                    else:
+                        accum_grad_neg[name] = p.grad.clone()
+
+            opt.zero_grad()
+
+            if (step + 1) % accum != 0:
+                continue
+
+            norm_pos = torch.sqrt(sum(g.pow(2).sum() for g in accum_grad_pos.values()))
+            norm_neg_val = torch.sqrt(sum(g.pow(2).sum() for g in accum_grad_neg.values())) if accum_grad_neg else torch.tensor(0.0, device=device)
+
+            rescale = (scale * norm_pos) / norm_neg_val.clamp(min=1e-8)
+            rescale = rescale.clamp(max=1.0)
+
+            for name, p in self.base_model.named_parameters():
+                has_pos = name in accum_grad_pos
+                has_neg = name in accum_grad_neg
+                if has_pos and has_neg:
+                    p.grad = accum_grad_pos[name] - rescale * accum_grad_neg[name]
+                elif has_pos:
+                    p.grad = accum_grad_pos[name]
+                elif has_neg:
+                    p.grad = -rescale * accum_grad_neg[name]
+
+            has_nan = any(
+                p.grad is not None and torch.isnan(p.grad).any()
+                for p in self.base_model.parameters()
+            )
+            if has_nan:
+                self.logger.warning(f"NaN gradient detected at step {step}, skipping optimizer step")
+                opt.zero_grad()
+                accum_grad_pos = {}
+                accum_grad_neg = {}
+                continue
+
+            _nn.utils.clip_grad_norm_(self.base_model.parameters(), 0.1)
+            opt.step()
+            opt.zero_grad()
+            accum_grad_pos = {}
+            accum_grad_neg = {}
+
+        self.base_model.eval()
+
     def update_uncertainty_estimator(self, batches: list[Batch[D]]):
         """Update the uncertainty estimator with obtained samples.
 
@@ -458,7 +615,7 @@ class ExploreLoop(Generic[D]):
                 if has_enough_data:
                     step("finetune")
                     ft_batches = shared_offline_batches + guided_batches if use_buffer else all_local_batches
-                    self.finetune_base_model(ft_batches, pbar=verbose)
+                    self.combined_finetune_base_model(ft_batches, pbar=verbose)
 
             with self._timer("uncertainty_update"):
                 if not self.config.no_uncertainty:
@@ -602,6 +759,10 @@ def add_global_args(parser):
     parser.add_argument("--eval_valid_samples", type=int, default=0)
     parser.add_argument("--eval_batch_size", type=int, default=64)
     parser.add_argument("--eval_every", type=int, default=10)
+
+    # Negative sample finetuning
+    parser.add_argument("--neg_grad_scale", type=float, default=0.0)
+    parser.add_argument("--max_neg_samples", type=int, default=5000)
 
     # Logging
     parser.add_argument("--video_fps", type=int, default=4)
