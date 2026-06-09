@@ -31,7 +31,7 @@ pixi run python -m adm.task_agnostic toy --dir experiments/toy
 ```bash
 pixi run python -m adm.task_agnostic <problem_setup> <uncertainty_estimator> --dir <experiment_dir> <other_args>
 ```
-For `<problem_setup>`, currently supported options are `toy`, `qm9`, `geom_drugs`, and `stable_diffusion`. For `<uncertainty_estimator>`, currently supported options are `gp` (Gaussian process) and `ensemble` (ensemble of 5 MLPs with 3 hidden layers, 100 activations each). They all define their own arguments as well, which you can see by running:
+For `<problem_setup>`, currently supported options are `toy`, `qm9`, `geom_drugs`, `stable_diffusion`, and `proteins` (this branch). For `<uncertainty_estimator>`, currently supported options are `gp` (Gaussian process) and `ensemble` (ensemble of 5 MLPs with 3 hidden layers, 100 activations each). They all define their own arguments as well, which you can see by running:
 ```bash
 pixi run python -m adm.task_agnostic <problem_setup> <uncertainty_estimator> --help
 ```
@@ -103,6 +103,31 @@ Then to evaluate the samples, you can run:
 pixi run python -m adm.evaluation.eval_samples <experiment_dir> <sample_dir> [--do_global_metrics] [--do_sample_metrics]
 ```
 This will evaluate the samples using the specified global and sample metrics for the problem setup. You can specify which to do using the flags `--do_global_metrics` and `--do_sample_metrics`. For example, for the QM9 problem setup, it computes the Vendi diversity over all samples and GFN2-xTB properties.
+
+### Proteins
+
+The `proteins` problem setup models protein sequence generation using a continuous diffusion model over ESM token embeddings. Validity is assessed by folding each candidate sequence with ESMFold and thresholding on mean pLDDT. The following arguments are specific to this setup.
+
+#### Problem Setup
+
+ * `--cfg_path`: Path to the SGPO diffusion model config YAML. Defaults to the bundled `sample_config.yaml` from the `sgpo` package.
+ * `--threshold`: Minimum mean pLDDT score (0–100) required for a sequence to be considered valid. Default: `65.0`. **Recommended**: Lower this if too few samples pass validity; raise it if you want stricter structural confidence.
+ * `--validity_batch_size`: Number of sequences to fold per ESMFold call. Lower values reduce VRAM usage at the cost of runtime. Default: `32`.
+ * `--esmfold_chunk_size`: Enables chunked attention in ESMFold. Smaller values reduce peak VRAM usage but slow down folding. Omit to disable chunking.
+ * `--esmfold_fp16`: Run ESMFold in half-precision (fp16). Reduces VRAM usage significantly, but stubs out the pTM head (pTM scores will be zero). Use when VRAM is the bottleneck and pTM is not needed for validity.
+ * `--lengthscale_vendi`: RBF kernel lengthscale used when computing the Vendi diversity score over ESM embeddings. Default: `2.0`.
+
+#### Rewards (Task-Directed only)
+
+Two rewards are available for the proteins problem setup, passed via `--reward`:
+
+ * `proteins/creilov`: Predicts CreiLOV luciferase fitness using an ensemble of oracle models trained on the CreiLOV dataset. Sequences are penalised exponentially for Hamming distances above `70` from the wild type. Use `--reward_opt max` to maximise fitness.
+ * `proteins/fitness`: Same as `proteins/creilov` but accepts a custom `oracle_path` via `--reward_kwargs`, e.g. `--reward_kwargs '{"oracle_path": "/path/to/oracle"}'`.
+
+Example task-directed run maximising CreiLOV fitness:
+```bash
+pixi run python -m adm.task_directed proteins gp --dir experiments/proteins --reward proteins/creilov --reward_opt max
+```
 
 ## Running on Different Problem Setups
 
