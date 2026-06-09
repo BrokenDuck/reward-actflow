@@ -61,7 +61,7 @@ fi
 cd $MAIN_DIR
 if  [ ! -d "sgpo" ]
 then
-    git clone git@github.com:Komod0D/SGPO.git sgpo
+    git clone https://github.com/Komod0D/SGPO.git sgpo
     cd sgpo/sgpo
     mkdir -p checkpoints/continuous_ESM/CreiLOV
     cd checkpoints/continuous_ESM/CreiLOV

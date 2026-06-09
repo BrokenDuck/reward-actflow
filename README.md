@@ -4,42 +4,42 @@ Towards efficient mid-training and test-time discovery beyond the data via self-
 
 ## Installation
 
-First you need to install [pixi](https://pixi.prefix.dev/latest/):
+First you need to install [uv](https://docs.astral.sh/uv/getting-started/installation/):
 ```bash
-wget -qO- https://pixi.sh/install.sh | sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
-Then you can install the dependencies for this project:
+Then create a virtual environment and install the core dependencies:
 ```bash
-pixi install
+uv venv
+uv pip install -e .
 ```
-If you want to start a shell with this environment, you can run:
+Finally, run the install script to set up the remaining dependencies (bioinformatics tools, openfold, and the SGPO protein diffusion model). It takes a scratch directory as argument:
 ```bash
-pixi shell
+bash install.sh <install_dir>
 ```
-However, for batchjobs, you need to use `pixi run` to execute commands in the environment, e.g.:
+To activate the environment for an interactive session:
 ```bash
-pixi run python -m adm.task_agnostic toy --dir experiments/toy
+source .venv/bin/activate
 ```
-**Recommended**: Always use `pixi run`, because it makes sure you are using the latest installed packages.
 
-**Recommended**: Use a scratch disk for the experiments, e.g., by setting `--dir /cluster/scratch/<username>/adm/toy` for the toy experiment, because the experiment directories can get quite large.
+**Recommended**: Use a scratch disk for the experiments, e.g., by setting `--dir /cluster/scratch/<username>/adm/proteins` for the proteins experiment, because the experiment directories can get quite large.
 
 ## Command Line Interface
 
 ### Task-Agnostic Expansion
 
 ```bash
-pixi run python -m adm.task_agnostic <problem_setup> <uncertainty_estimator> --dir <experiment_dir> <other_args>
+uv run python -m adm.task_agnostic <problem_setup> <uncertainty_estimator> --dir <experiment_dir> <other_args>
 ```
 For `<problem_setup>`, currently supported options are `toy`, `qm9`, `geom_drugs`, `stable_diffusion`, and `proteins` (this branch). For `<uncertainty_estimator>`, currently supported options are `gp` (Gaussian process) and `ensemble` (ensemble of 5 MLPs with 3 hidden layers, 100 activations each). They all define their own arguments as well, which you can see by running:
 ```bash
-pixi run python -m adm.task_agnostic <problem_setup> <uncertainty_estimator> --help
+uv run python -m adm.task_agnostic <problem_setup> <uncertainty_estimator> --help
 ```
 
 ### Task-Directed Expansion
 
 ```bash
-pixi run python -m adm.task_directed <problem_setup> <uncertainty_estimator> --dir <experiment_dir> --reward <task> --reward_opt <"min" | "max"> <other_args>
+uv run python -m adm.task_directed <problem_setup> <uncertainty_estimator> --dir <experiment_dir> --reward <task> --reward_opt <"min" | "max"> <other_args>
 ```
 This command supports the same problem setups as the Task Agnostic Expansion, but also requires a `--reward` argument to specify the task. Also you can set the `--reward_opt` to control whether you minimize or maximize the reward.
 
@@ -90,17 +90,17 @@ Here we use an ensemble defined over the input space of score network activation
 
 To evaluate the final model, you can run (make sure to set `--ckpt base_model.pt` to use the expanded model instead of the pre-trained model):
 ```bash
-pixi run python -m adm.evaluation.sample_many <experiment_dir> <other_args>
+uv run python -m adm.evaluation.sample_many <experiment_dir> <other_args>
 ```
 This script will generate many samples from the generative model. Alternatively, you can run:
 ```bash
-pixi run python -m adm.evaluation.sample_many_valids <experiment_dir> <other_args>
+uv run python -m adm.evaluation.sample_many_valids <experiment_dir> <other_args>
 ```
 This script will keep sampling until the number of specified valid samples are sampled (instead of sampling both invalid and valid ones). This is important for metrics such as Vendi diversity that need a constant number of samples.
 
 Then to evaluate the samples, you can run:
 ```bash
-pixi run python -m adm.evaluation.eval_samples <experiment_dir> <sample_dir> [--do_global_metrics] [--do_sample_metrics]
+uv run python -m adm.evaluation.eval_samples <experiment_dir> <sample_dir> [--do_global_metrics] [--do_sample_metrics]
 ```
 This will evaluate the samples using the specified global and sample metrics for the problem setup. You can specify which to do using the flags `--do_global_metrics` and `--do_sample_metrics`. For example, for the QM9 problem setup, it computes the Vendi diversity over all samples and GFN2-xTB properties.
 
@@ -126,7 +126,7 @@ Two rewards are available for the proteins problem setup, passed via `--reward`:
 
 Example task-directed run maximising CreiLOV fitness:
 ```bash
-pixi run python -m adm.task_directed proteins gp --dir experiments/proteins --reward proteins/creilov --reward_opt max
+uv run python -m adm.task_directed proteins gp --dir experiments/proteins --reward proteins/creilov --reward_opt max
 ```
 
 ## Running on Different Problem Setups

@@ -5,9 +5,8 @@ awscli
 biopython
 botorch
 deepspeed==0.6.5
-diffusiongym @ git+https://github.com/Komod0D/diffusiongym.git
+diffusiongym @ git+https://github.com/kprotopapas/diffusiongym.git
 dm-tree==0.1.6
-flowgym @ git+https://github.com/Komod0D/flowgym.git
 hmmer
 hydra-core
 imageio[ffmpeg]
