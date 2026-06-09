@@ -24,10 +24,6 @@ pixi run python -m adm.task_agnostic toy --dir experiments/toy
 
 **Recommended**: Use a scratch disk for the experiments, e.g., by setting `--dir /cluster/scratch/<username>/adm/toy` for the toy experiment, because the experiment directories can get quite large.
 
-## Defining New Problem Setups
-
-To define a new problem setup to run task-agnostic or task-directed expansion on, you only need to inherit the `ProblemSetup[D]` in `adm/setups/problem_setup.py` and implement the abstract methods. You can then run expansion on your problem setup by using the command line interface described below, and passing the name of your problem setup as an argument. This requires some knowledge of the [diffusiongym package](https://github.com/cristianpjensen/diffusiongym), so it is recommended to start with reading [the documentation](https://cristianpjensen.github.io/diffusiongym/) and looking at the existing problem setups for examples.
-
 ## Command Line Interface
 
 ### Task-Agnostic Expansion
@@ -107,3 +103,11 @@ Then to evaluate the samples, you can run:
 pixi run python -m adm.evaluation.eval_samples <experiment_dir> <sample_dir> [--do_global_metrics] [--do_sample_metrics]
 ```
 This will evaluate the samples using the specified global and sample metrics for the problem setup. You can specify which to do using the flags `--do_global_metrics` and `--do_sample_metrics`. For example, for the QM9 problem setup, it computes the Vendi diversity over all samples and GFN2-xTB properties.
+
+## Running on Different Problem Setups
+
+This repository abstracts away the interface with the specific problem at hand (e.g. protein sequence generation, unconditional molecular sequence & structure generation) into a `ProblemSetup` (see `adm/setups/problem_setup.py`). A `ProblemSetup` allows the user to define the base flow model, validity function, problem-relevant metrics, pre/post-processing functions and other important logic all in a centralised package. We have defined different problem setups in this repository corresponding to different applications (e.g. molecules/proteins). In order to separate dependencies each is defined in its own respective branch. To use each one, first check out the relevant branch and then use the CLI defined [above](#command-line-interface). To define your own Problem Setup for your own application see the section [below](#defining-new-problem-setups).
+
+## Defining New Problem Setups
+
+To define a new problem setup to run task-agnostic or task-directed expansion on, you only need to inherit the `ProblemSetup[D]` in `adm/setups/problem_setup.py` and implement the abstract methods. You can then run expansion on your problem setup by using the command line interface described below, and passing the name of your problem setup as an argument. This requires some knowledge of the [diffusiongym package](https://github.com/cristianpjensen/diffusiongym), so it is recommended to start with reading [the documentation](https://cristianpjensen.github.io/diffusiongym/) and looking at the existing problem setups for examples.
