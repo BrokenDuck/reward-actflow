@@ -2,6 +2,8 @@
 
 Towards efficient mid-training and test-time discovery beyond the data via self-expansion.
 
+<p align="center"><img src="local_to_global_border.png" width="700"/></p>
+
 ## Installation
 
 First you need to install [uv](https://docs.astral.sh/uv/getting-started/installation/):
