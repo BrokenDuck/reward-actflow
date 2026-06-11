@@ -1,4 +1,4 @@
-# Active Diffusion Models
+# Active Flow Expansion
 
 Towards efficient mid-training and test-time discovery beyond the data via self-expansion.
 
