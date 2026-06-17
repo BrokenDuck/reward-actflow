@@ -1,6 +1,6 @@
 # Active Flow Expansion (ActFlow)
 
-Towards efficient mid-training and test-time discovery beyond the data via self-expansion.
+Towards efficient continued pre-training beyond the data via self-expansion.
 
 <p align="center"><img src="local_to_global_border.png" width="700"/></p>
 
