@@ -38,13 +38,6 @@ For `<problem_setup>`, currently supported options are `toy`, `qm9`, `geom_drugs
 pixi run python -m adm.task_agnostic <problem_setup> <uncertainty_estimator> --help
 ```
 
-### Task-Directed Expansion
-
-```bash
-pixi run python -m adm.task_directed <problem_setup> <uncertainty_estimator> --dir <experiment_dir> --reward <task> --reward_opt <"min" | "max"> <other_args>
-```
-This command supports the same problem setups as the Task Agnostic Expansion, but also requires a `--reward` argument to specify the task. Also you can set the `--reward_opt` to control whether you minimize or maximize the reward.
-
 ### Arguments for Expansion
 
 #### Baselines
