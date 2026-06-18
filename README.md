@@ -1,6 +1,6 @@
 # Active Flow Expansion (ActFlow)
 
-Towards efficient continued pre-training beyond the data via self-expansion.
+Towards efficient continued pre-training beyond the data via self-expansion. Molecular, peptide, and protein sequence design, are covered within different repo branches.
 
 <p align="center"><img src="local_to_global_border.png" width="700"/></p>
 
