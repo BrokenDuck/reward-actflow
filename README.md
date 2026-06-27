@@ -16,7 +16,7 @@ on those high-uncertainty regions. Validity is assessed by parsing each
 generated SMILES string as a well-formed peptide.
 
 The peptide code lives under `src/` and is partially built upon
-[TR2-D2 (Tang et al., 2025)](https://arxiv.org/abs/2509.25171) and 
+[TR2-D2 (Tang et al., 2025)](https://github.com/sophtang/TR2-D2) and 
 [MDLM (Sahoo et al., 2023)](https://github.com/kuleshov-group/mdlm).
 
 ## Installation
