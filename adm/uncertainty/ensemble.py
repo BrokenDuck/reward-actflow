@@ -35,8 +35,8 @@ class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
 
         for model in self.models:
             idx = torch.randperm(n)[:k]
-            x = feats[idx]
-            y = labels[idx]
+            x = feats[idx].to(self.device)
+            y = labels[idx].to(self.device)
 
             model.train()
             opt = torch.optim.Adam(model.parameters(), lr=1e-3) 

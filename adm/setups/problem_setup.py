@@ -97,7 +97,9 @@ class ProblemSetup(ABC, Generic[D]):
         raise NotImplementedError
 
     @abstractmethod
-    def visualize_sample(self, env: Environment[D], uncertainty: UncertaintyEstimator[D], batch: Batch[D]) -> Figure:
+    def visualize_sample(
+        self, env: Environment[D], uncertainty: UncertaintyEstimator[D], batch: Batch[D]
+    ) -> Figure:
         """Produce a matplotlib figure for visualizing the sample in the problem setup.
 
         Parameters
@@ -125,7 +127,7 @@ class ProblemSetup(ABC, Generic[D]):
             The directory where to save the samples, without extension.
 
         Returns
-        -------            
+        -------
         bool
             Whether the samples were saved successfully or not.
 
@@ -148,7 +150,7 @@ class ProblemSetup(ABC, Generic[D]):
 
         Returns
         -------
-        tuple[D, dict] 
+        tuple[D, dict]
             A tuple of the loaded samples and their corresponding keyword arguments.
         """
         raise NotImplementedError
@@ -170,7 +172,7 @@ class ProblemSetup(ABC, Generic[D]):
 
     def compute_metrics(self, samples: D, kwargs: dict) -> dict[str, float]:
         """Compute global metrics for the problem setup.
-        
+
         Parameters
         ----------
         samples : D
@@ -185,7 +187,9 @@ class ProblemSetup(ABC, Generic[D]):
         """
         return dict()
 
-    def compute_sample_metrics(self, samples: D, kwargs: dict) -> list[dict[str, float]]:
+    def compute_sample_metrics(
+        self, samples: D, kwargs: dict
+    ) -> list[dict[str, float]]:
         """Compute relevant metrics on individual samples.
 
         Parameters

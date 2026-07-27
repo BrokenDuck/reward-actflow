@@ -181,6 +181,7 @@ class UncertaintyEstimator(Reward[D]):
         latents: list[D],
         labels: list[torch.Tensor],
         kwargs: list[dict[str, Any]],
+        feat_batch_size: int = 128,
     ):
         """Update data which is used to update the uncertainty estimator.
 
@@ -193,11 +194,23 @@ class UncertaintyEstimator(Reward[D]):
             or reward values in the task-directed case.
         kwargs : list[dict[str, Any]]
             Keyword arguments used to obtain the latents.
+        feat_batch_size : int
+            Process features in chunks of this size to avoid OOM on large buffers.
         """
         with torch.no_grad():
-            feats = [self._get_feats(x, **kw) for x, kw in zip(latents, kwargs)]
+            feats_chunks = []
+            for x, kw in zip(latents, kwargs):
+                n = len(x)
+                if n <= feat_batch_size:
+                    feats_chunks.append(self._get_feats(x, **kw).cpu())
+                else:
+                    for start in range(0, n, feat_batch_size):
+                        end = min(start + feat_batch_size, n)
+                        x_chunk = x[start:end]
+                        kw_chunk = {k: v[start:end] if isinstance(v, torch.Tensor) else v for k, v in kw.items()}
+                        feats_chunks.append(self._get_feats(x_chunk, **kw_chunk).cpu())
 
-        feats_tensor = torch.cat(feats, dim=0)
+        feats_tensor = torch.cat(feats_chunks, dim=0).to(self.device)
         labels_tensor = torch.cat(labels, dim=0)
 
         labels_tensor = (labels_tensor - labels_tensor.mean()) / (labels_tensor.std() + 1e-8)
@@ -207,4 +220,5 @@ class UncertaintyEstimator(Reward[D]):
 
     def __call__(self, sample: D | None, latent: D, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         mean, uncertainty = self.mean_and_uncertainty(latent, **kwargs)
-        return self.mean_weight * mean + uncertainty, torch.ones(len(latent), dtype=torch.bool)
+        reward = self.mean_weight * mean + (1 - self.mean_weight) * uncertainty
+        return reward, torch.ones(len(latent), dtype=torch.bool)

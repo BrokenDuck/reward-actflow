@@ -11,7 +11,7 @@ import json
 
 from adm.setups import setups as problem_setups
 from adm.setups.problem_setup import ProblemSetup
-from adm.utils import Batch, filter_out_invalids, serialize_args
+from adm.utils import Batch, filter_out_invalids, serialize_args, setup_logger
 
 
 def main(args):
@@ -62,7 +62,7 @@ def orw_cfm(
 ):
     if exp_dir is not None:
         exp_dir.mkdir(parents=True, exist_ok=True)
-        setup_logging(exp_dir)
+        setup_logger(exp_dir)
 
     if log_every is None:
         log_every = max(1, num_iterations // 100)
@@ -126,34 +126,6 @@ def orw_cfm(
 
         if exp_dir is not None:
             torch.save(env.base_model.state_dict(), exp_dir / "last.pt")
-
-
-def setup_logging(log_dir: Optional[Path] = None) -> None:
-    formatter = logging.Formatter(
-        "[%(asctime)s] (%(levelname)s) %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    handlers = []
-
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setFormatter(formatter)
-    handlers.append(ch)
-
-    # File handler
-    if log_dir is not None:
-        fh = logging.FileHandler(log_dir / "log.txt")
-        fh.setFormatter(formatter)
-        handlers.append(fh)
-
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-
-    # Clear existing handlers (important for notebooks / re-runs)
-    root.handlers.clear()
-    for h in handlers:
-        root.addHandler(h)
 
 
 if __name__ == "__main__":

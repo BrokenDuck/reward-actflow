@@ -95,6 +95,19 @@ def filter_out_invalids(batches: list[Batch[D]]) -> Batch[D]:
     return Batch.concat(valid_batches)
 
 
+def filter_out_valids(batches: list[Batch[D]]) -> "Batch[D] | None":
+    invalid_batches: list[Batch[D]] = []
+
+    for batch in batches:
+        for i in range(len(batch)):
+            if not batch.valids[i]:
+                invalid_batches.append(batch[i])
+
+    if len(invalid_batches) == 0:
+        return None
+    return Batch.concat(invalid_batches)
+
+
 def write_video(frame_paths: list[Path], video_path: Path, fps: int):
     if len(frame_paths) == 0:
         return
@@ -115,7 +128,7 @@ def serialize_args(args: argparse.Namespace) -> dict:
 
 
 def setup_logger(folder: Path | None = None, verbose: bool = False) -> logging.Logger:
-    logger = logging.getLogger("active_pretraining")
+    logger = logging.getLogger("adm")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.propagate = False
 
