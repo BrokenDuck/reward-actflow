@@ -1,0 +1,6 @@
+[submodule "packages/FlowMol-PyG"]
+	path = packages/FlowMol-PyG
+	url = git@github.com:BrokenDuck/FlowMol-PyG.git
+[submodule "packages/diffusiongym"]
+	path = packages/diffusiongym
+	url = git@github.com:BrokenDuck/diffusiongym.git
