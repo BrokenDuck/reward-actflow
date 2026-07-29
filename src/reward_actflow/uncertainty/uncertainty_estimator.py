@@ -46,7 +46,7 @@ class FlowFeatureExtractor(nn.Module, Generic[D]):
         parts = name.split(".")
         for p in parts:
             if p.isdigit():
-                module = module[int(p)]  # type: ignore
+                module = module[int(p)]
             else:
                 module = getattr(module, p)
 
@@ -87,7 +87,7 @@ class FlowFeatureExtractor(nn.Module, Generic[D]):
 
 class UncertaintyEstimator(Reward[D]):
     """Abstract reward based on uncertainty estimates.
-    
+
     Parameters
     ----------
     feat_extractor : FlowFeatureExtractor[D]
@@ -150,9 +150,11 @@ class UncertaintyEstimator(Reward[D]):
         pass
 
     @abstractmethod
-    def _mean_and_uncertainty(self, feats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """"Returns the mean and uncertainty for a given input.
-        
+    def _mean_and_uncertainty(
+        self, feats: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """ "Returns the mean and uncertainty for a given input.
+
         Parameters
         ----------
         feats : torch.Tensor
@@ -172,7 +174,9 @@ class UncertaintyEstimator(Reward[D]):
         kwargs = dict_to_device(kwargs, self.device)
         return self.feat_extractor(latent, **kwargs)
 
-    def mean_and_uncertainty(self, latent: D, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def mean_and_uncertainty(
+        self, latent: D, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         feats = self._get_feats(latent, **kwargs)
         return self._mean_and_uncertainty(feats)
 
@@ -200,11 +204,17 @@ class UncertaintyEstimator(Reward[D]):
         feats_tensor = torch.cat(feats, dim=0)
         labels_tensor = torch.cat(labels, dim=0)
 
-        labels_tensor = (labels_tensor - labels_tensor.mean()) / (labels_tensor.std() + 1e-8)
+        labels_tensor = (labels_tensor - labels_tensor.mean()) / (
+            labels_tensor.std() + 1e-8
+        )
         labels_tensor = labels_tensor.to(self.device)
 
         self._update_estimator(feats_tensor, labels_tensor)
 
-    def __call__(self, sample: D | None, latent: D, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def __call__(
+        self, sample: D | None, latent: D, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         mean, uncertainty = self.mean_and_uncertainty(latent, **kwargs)
-        return self.mean_weight * mean + uncertainty, torch.ones(len(latent), dtype=torch.bool)
+        return self.mean_weight * mean + uncertainty, torch.ones(
+            len(latent), dtype=torch.bool
+        )

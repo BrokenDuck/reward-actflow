@@ -21,6 +21,6 @@ class RewardGradient(nn.Module, Generic[D]):
         xt = xt.requires_grad()
         x1 = self.env.pred_final(xt, t, **kwargs)
         # For our purposes, we do not need a postprocessed sample
-        r, _ = self.reward(None, x1, **kwargs)  # type: ignore
+        r, _ = self.reward(None, x1, **kwargs)
         sigma = self.env.memoryless_schedule(xt, t)
         return sigma * self.env.reward_scale * xt.gradient(r)

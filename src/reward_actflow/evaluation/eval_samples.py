@@ -9,8 +9,8 @@ from pathlib import Path
 from diffusiongym.utils import index_dict
 import polars as pl
 
-from adm.setups import setups as problem_setups
-from adm.utils import setup_logger
+from reward_actflow.setups import setups as problem_setups
+from reward_actflow.utils import setup_logger
 
 
 def main(args):
@@ -34,16 +34,20 @@ def main(args):
     samples, kwargs = problem_setup.load_samples(eval_dir)
 
     valids_file = eval_dir / "valids.pt"
-    valids = torch.load(valids_file) if valids_file.is_file() else torch.ones(len(samples), dtype=torch.bool)
+    valids = (
+        torch.load(valids_file)
+        if valids_file.is_file()
+        else torch.ones(len(samples), dtype=torch.bool)
+    )
 
     if args.do_global_metrics:
-        logger.info(f"Computing global metrics...")
+        logger.info("Computing global metrics...")
         global_metrics = problem_setup.compute_metrics(samples, kwargs)
         with open(eval_dir / "global_metrics.yaml", "w") as f:
             yaml.dump(global_metrics, f)
 
     if args.do_sample_metrics:
-        logger.info(f"Computing sample metrics...")
+        logger.info("Computing sample metrics...")
         sample_metrics_file = eval_dir / "sample_metrics.csv"
 
         # Compute and save sample metrics
@@ -52,13 +56,15 @@ def main(args):
             start, end = i, min(i + batch_size, len(samples))
             current_samples = samples[start:end]
             current_kwargs = index_dict(kwargs, start, end)
-            batch_metrics = problem_setup.compute_sample_metrics(current_samples, current_kwargs)
+            batch_metrics = problem_setup.compute_sample_metrics(
+                current_samples, current_kwargs
+            )
 
             data_rows = []
 
             for j, metrics in enumerate(batch_metrics):
                 sample_id = start + j
-                data_rows.append({ "sample_id": sample_id, **metrics })
+                data_rows.append({"sample_id": sample_id, **metrics})
 
             df_batch = pl.DataFrame(data_rows)
 
@@ -74,11 +80,15 @@ def main(args):
         n_samples = len(valids)
         full_range = pl.DataFrame({"sample_id": pl.arange(0, n_samples, eager=True)})
         missing = full_range.join(df.select("sample_id"), on="sample_id", how="anti")
-        missing = missing.with_columns([pl.Series("is_valid", valids[missing["sample_id"].to_numpy()].numpy())])
+        missing = missing.with_columns(
+            [pl.Series("is_valid", valids[missing["sample_id"].to_numpy()].numpy())]
+        )
 
         for col in df.columns:
             if col not in missing.columns:
-                missing = missing.with_columns(pl.lit(None).cast(df.schema[col]).alias(col))
+                missing = missing.with_columns(
+                    pl.lit(None).cast(df.schema[col]).alias(col)
+                )
 
         missing = missing.select(df.columns)
         df = pl.concat([df, missing])

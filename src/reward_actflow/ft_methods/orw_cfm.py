@@ -9,9 +9,9 @@ import logging
 from pathlib import Path
 import json
 
-from adm.setups import setups as problem_setups
-from adm.setups.problem_setup import ProblemSetup
-from adm.utils import Batch, filter_out_invalids, serialize_args
+from reward_actflow.setups import setups as problem_setups
+from reward_actflow.setups.problem_setup import ProblemSetup
+from reward_actflow.utils import Batch, filter_out_invalids, serialize_args
 
 
 def main(args):
@@ -21,11 +21,19 @@ def main(args):
     with open(exp_dir / "args.yaml", "r") as f:
         exp_args = yaml.safe_load(f)
 
-    problem_setup: ProblemSetup = problem_setups[exp_args["problem_setup"]](exp_args, device=device)
+    problem_setup: ProblemSetup = problem_setups[exp_args["problem_setup"]](
+        exp_args, device=device
+    )
     reward = reward_registry.get(args.reward).instantiate(**args.reward_args)
-    env = construct_env(problem_setup.base_model, reward, exp_args["num_steps"], args.reward_scale)  # type: ignore
+    env = construct_env(
+        problem_setup.base_model, reward, exp_args["num_steps"], args.reward_scale
+    )
 
-    ft_dir = args.dir / "fine_tuned" / f"{args.reward.split('/')[-1]}_{args.reward_scale}_{'last' if args.use_last_ckpt else 'base'}"
+    ft_dir = (
+        args.dir
+        / "fine_tuned"
+        / f"{args.reward.split('/')[-1]}_{args.reward_scale}_{'last' if args.use_last_ckpt else 'base'}"
+    )
     ft_dir.mkdir(parents=True, exist_ok=True)
 
     with open(ft_dir / "args.yaml", "w") as f:
@@ -71,7 +79,7 @@ def orw_cfm(
 
     opt = torch.optim.AdamW(env.base_model.parameters(), lr=lr)
 
-    # Track first and second moment 
+    # Track first and second moment
     r_ema_m1 = None
     r_ema_m2 = None
 
@@ -92,10 +100,10 @@ def orw_cfm(
         with torch.no_grad():
             if r_ema_m1 is None or r_ema_m2 is None:
                 r_ema_m1 = r.mean()
-                r_ema_m2 = (r ** 2).mean()
+                r_ema_m2 = (r**2).mean()
             else:
-                r_ema_m1 = (1-beta) * r_ema_m1 + beta * r.mean()
-                r_ema_m2 = (1-beta) * r_ema_m2 + beta * (r**2).mean()
+                r_ema_m1 = (1 - beta) * r_ema_m1 + beta * r.mean()
+                r_ema_m2 = (1 - beta) * r_ema_m2 + beta * (r**2).mean()
 
             r_ema_var = (r_ema_m2 - r_ema_m1**2).clamp_min(1e-6)
 
@@ -110,9 +118,13 @@ def orw_cfm(
             "r_min": sample.rewards[sample.valids].min(),
             "r_max": sample.rewards[sample.valids].max(),
             "valid": sample.valids.float().mean(),
-            "ess": (weights.sum() ** 2) / (weights.pow(2).sum() + 1e-8) / sample.valids.int().sum(),
+            "ess": (weights.sum() ** 2)
+            / (weights.pow(2).sum() + 1e-8)
+            / sample.valids.int().sum(),
         }
-        logging.info(f"(iter={it:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+        logging.info(
+            f"(iter={it:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}"
+        )
 
         train_base_model(
             env.base_model,
@@ -164,7 +176,7 @@ if __name__ == "__main__":
         "--reward_args",
         type=json.loads,
         default={},
-        help="JSON string, e.g. '{\"alpha\": 0.1, \"beta\": 2}'"
+        help='JSON string, e.g. \'{"alpha": 0.1, "beta": 2}\'',
     )
     parser.add_argument("--reward_scale", type=float, default=1.0)
     parser.add_argument("--samples_per_iter", type=int, default=2048)

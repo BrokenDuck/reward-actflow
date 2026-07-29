@@ -14,11 +14,21 @@ import yaml
 import time
 import csv
 
-from .inf_methods.dps import RewardGradient
-from .uncertainty import UncertaintyEstimator, FlowFeatureExtractor, uncertainty_estimators
-from .setups import setups as problem_setups
-from .setups.problem_setup import ProblemSetup
-from .utils import write_video, filter_out_invalids, Batch, serialize_args, setup_logger
+from reward_actflow.inf_methods.dps import RewardGradient
+from reward_actflow.uncertainty import (
+    UncertaintyEstimator,
+    FlowFeatureExtractor,
+    uncertainty_estimators,
+)
+from reward_actflow.setups import setups as problem_setups
+from reward_actflow.setups.problem_setup import ProblemSetup
+from reward_actflow.utils import (
+    write_video,
+    filter_out_invalids,
+    Batch,
+    serialize_args,
+    setup_logger,
+)
 
 
 @dataclass(frozen=True)
@@ -67,7 +77,9 @@ class ExploreConfig:
 
         # Validation
         if not (0 <= self.feat_timestep <= 1):
-            raise ValueError(f"feat_timestep must be in [0, 1], got {self.feat_timestep}")
+            raise ValueError(
+                f"feat_timestep must be in [0, 1], got {self.feat_timestep}"
+            )
 
         if self.dps_weight < 0:
             raise ValueError(f"dps_weight cannot be negative, got {self.dps_weight}")
@@ -78,7 +90,7 @@ class ExploreConfig:
             args = vars(args)
 
         # Map argparse flags to config names
-        name_mapping = { "dir": "folder" }
+        name_mapping = {"dir": "folder"}
 
         # We only take keys that exist in the dataclass fields
         config_fields = {f.name for f in ExploreConfig.__dataclass_fields__.values()}
@@ -119,12 +131,22 @@ class ExploreLoop(Generic[D]):
         self.uncertainty = uncertainty
         self.env = env
 
-        self.logger.info(f"base model parameters: {sum(p.numel() for p in self.base_model.parameters() if p.requires_grad):,}")
+        self.logger.info(
+            f"base model parameters: {sum(p.numel() for p in self.base_model.parameters() if p.requires_grad):,}"
+        )
 
         self._timings = {}
 
         # Create file and write headers
-        self.timing_heads = ["iteration", "eval", "sampling", "visualize", "finetune", "uncertainty_update", "checkpoint"]
+        self.timing_heads = [
+            "iteration",
+            "eval",
+            "sampling",
+            "visualize",
+            "finetune",
+            "uncertainty_update",
+            "checkpoint",
+        ]
         self.timing_path = self.config.folder / "timings.csv"
         with open(self.timing_path, "w", newline="") as f:
             csv.writer(f).writerow(self.timing_heads)
@@ -138,7 +160,9 @@ class ExploreLoop(Generic[D]):
 
     def _flush_timings(self, iteration: int):
         """Writes the stored timings to the CSV file."""
-        row = [iteration] + [self._timings.get(head, 0.0) for head in self.timing_heads[1:]]
+        row = [iteration] + [
+            self._timings.get(head, 0.0) for head in self.timing_heads[1:]
+        ]
         with open(self.timing_path, "a", newline="") as f:
             csv.writer(f).writerow(row)
 
@@ -259,7 +283,9 @@ class ExploreLoop(Generic[D]):
                 if use_guidance:
                     self.env.control_policy = RewardGradient(self.env, self.uncertainty)
 
-                sample = self.env.batch_sample(samples_per_iter, self.config.sample_batch_size)
+                sample = self.env.batch_sample(
+                    samples_per_iter, self.config.sample_batch_size
+                )
                 batch = Batch.from_sample(sample)
                 batch.latents = self.problem.postprocess_latents(batch)
                 batch.valids = self.problem.validity(batch.samples, batch.kwargs)
@@ -275,7 +301,9 @@ class ExploreLoop(Generic[D]):
                 self.visualize_iter(batch, i)
 
                 with torch.no_grad():
-                    mean, uncert = self.uncertainty.mean_and_uncertainty(batch.latents, **batch.kwargs)
+                    mean, uncert = self.uncertainty.mean_and_uncertainty(
+                        batch.latents, **batch.kwargs
+                    )
 
                 if self.config.mean_weight > 0:
                     metrics["pred_mean"] = mean.mean().item()
@@ -283,7 +311,9 @@ class ExploreLoop(Generic[D]):
                 metrics["uncertainty"] = uncert.mean().item()
                 metrics["biased_valid"] = batch.valids.float().mean().item()
                 metrics["max_vram"] = torch.cuda.max_memory_allocated() * 1e-9
-                self.logger.info(f"(iter={i:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+                self.logger.info(
+                    f"(iter={i:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}"
+                )
 
             # Update models with full buffer
             with self._timer("finetune"):
@@ -340,10 +370,14 @@ def setup_and_run(args: argparse.Namespace, reward: Reward, mean_weight: float):
     feat = feat_extractor(x, **kwargs)
 
     if not isinstance(feat, torch.Tensor):
-        raise TypeError(f"Feature extractor output must be a torch.Tensor, got {type(feat)}")
+        raise TypeError(
+            f"Feature extractor output must be a torch.Tensor, got {type(feat)}"
+        )
 
     if feat.ndim != 2:
-        raise ValueError(f"Feature extractor output must be a 2D tensor, got {feat.ndim}D tensor")
+        raise ValueError(
+            f"Feature extractor output must be a 2D tensor, got {feat.ndim}D tensor"
+        )
 
     uncertainty = uncertainty_estimators[args.uncertainty_estimator](
         feat_extractor,
@@ -361,7 +395,13 @@ def setup_and_run(args: argparse.Namespace, reward: Reward, mean_weight: float):
     logger = setup_logger(config.folder, args.verbose)
     logger.info("starting...")
 
-    loop = ExploreLoop(problem_setup=problem_setup, uncertainty=uncertainty, reward=reward, config=config, logger=logger)
+    loop = ExploreLoop(
+        problem_setup=problem_setup,
+        uncertainty=uncertainty,
+        reward=reward,
+        config=config,
+        logger=logger,
+    )
     loop.explore_loop(config.num_iters, config.samples_per_iter)
 
 
@@ -380,7 +420,9 @@ def build_parser(add_extra_args):
         sub = subparsers.add_parser(name)
 
         # Create nested uncertainty subparser first
-        uncertainty_subparsers = sub.add_subparsers(dest="uncertainty_estimator", required=True)
+        uncertainty_subparsers = sub.add_subparsers(
+            dest="uncertainty_estimator", required=True
+        )
 
         for u_name, u_cls in uncertainty_estimators.items():
             u_sub = uncertainty_subparsers.add_parser(u_name)

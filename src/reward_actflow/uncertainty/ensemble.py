@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from diffusiongym import D
 
-from .uncertainty_estimator import UncertaintyEstimator
+from reward_actflow.uncertainty.uncertainty_estimator import UncertaintyEstimator
 
 
 class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
@@ -16,10 +16,12 @@ class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
 
     def _construct_models(self):
         # 5 models in the ensemble
-        self.models = nn.ModuleList([
-            MLP(self.feat_dim, 1, hid_dim=100, p_dropout=0.1).to(self.device)
-            for _ in range(5)
-        ])
+        self.models = nn.ModuleList(
+            [
+                MLP(self.feat_dim, 1, hid_dim=100, p_dropout=0.1).to(self.device)
+                for _ in range(5)
+            ]
+        )
 
     def _update_estimator(self, feats: torch.Tensor, labels: torch.Tensor):
         # Re-initialize the models and train from scratch (very cheap so its fine)
@@ -39,7 +41,7 @@ class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
             y = labels[idx]
 
             model.train()
-            opt = torch.optim.Adam(model.parameters(), lr=1e-3) 
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             losses = torch.zeros(num_steps)
 
@@ -54,14 +56,16 @@ class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
                 losses[i] = loss.item()
 
                 if i > w:
-                    recent_min = losses[i-w+1:i+1].min() 
-                    overall_min = losses[:i-w+1].min()
+                    recent_min = losses[i - w + 1 : i + 1].min()
+                    overall_min = losses[: i - w + 1].min()
                     if overall_min <= recent_min:
                         break
 
             model.eval()
 
-    def _mean_and_uncertainty(self, feats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _mean_and_uncertainty(
+        self, feats: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         preds = torch.stack([m(feats) for m in self.models], dim=1)
         std, mean = torch.std_mean(preds, dim=1, correction=0)
         return mean, std

@@ -2,21 +2,27 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-from diffusiongym import DDTensor, BaseModel, OptimalTransportScheduler, Scheduler, Environment, Reward, reward_registry
+from diffusiongym import (
+    DDTensor,
+    BaseModel,
+    OptimalTransportScheduler,
+    Scheduler,
+    Environment,
+    Reward,
+)
 from diffusiongym.utils import train_base_model
 from diffusiongym.base_models.one_dim_gmm import MLP
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from pathlib import Path
-import math
 
-from .problem_setup import ProblemSetup
-from adm.uncertainty import UncertaintyEstimator
-from adm.utils import Batch
+from reward_actflow.setups.problem_setup import ProblemSetup
+from reward_actflow.uncertainty import UncertaintyEstimator
+from reward_actflow.utils import Batch
 
 
 class ToyProblemSetup(ProblemSetup[DDTensor]):
-    def __init__(self, args: dict[str, Any], device: Optional[torch.device]=None):
+    def __init__(self, args: dict[str, Any], device: Optional[torch.device] = None):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -59,19 +65,29 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
         y = torch.linspace(xmin, xmax, 100)
         X, Y = torch.meshgrid(x, y, indexing="ij")
         XY = torch.stack([X.flatten(), Y.flatten()], dim=-1)
-        Z, _ = uncertainty(DDTensor(XY).to(self.device), DDTensor(XY).to(self.device)) 
-        Z = Z.reshape(X.shape) 
+        Z, _ = uncertainty(DDTensor(XY).to(self.device), DDTensor(XY).to(self.device))
+        Z = Z.reshape(X.shape)
 
         fig, axes = plt.subplots(1, 2, figsize=(6, 3), constrained_layout=True)
-        im = axes[0].imshow(Z.T.cpu(), extent=(xmin, xmax, xmin, xmax), origin="lower", cmap="YlGn", aspect="equal") 
-        axes[0].set_title("Uncertainty") 
+        im = axes[0].imshow(
+            Z.T.cpu(),
+            extent=(xmin, xmax, xmin, xmax),
+            origin="lower",
+            cmap="YlGn",
+            aspect="equal",
+        )
+        axes[0].set_title("Uncertainty")
         fig.colorbar(im, ax=axes[0], shrink=0.8)
 
         data = batch.samples.data
         valid = batch.valids
 
-        axes[0].scatter(data[valid][:, 0].cpu(), data[valid][:, 1].cpu(), s=2, alpha=1.0)
-        axes[0].scatter(data[~valid][:, 0].cpu(), data[~valid][:, 1].cpu(), s=2, alpha=1.0)
+        axes[0].scatter(
+            data[valid][:, 0].cpu(), data[valid][:, 1].cpu(), s=2, alpha=1.0
+        )
+        axes[0].scatter(
+            data[~valid][:, 0].cpu(), data[~valid][:, 1].cpu(), s=2, alpha=1.0
+        )
 
         axes[0].set_xlim(xmin, xmax)
         axes[0].set_ylim(xmin, xmax)
@@ -96,19 +112,23 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
 
         V = self.validity(DDTensor(XY), {}).reshape(X.shape)
         for i in range(2):
-            axes[i].contour(X.cpu(), Y.cpu(), V.cpu(), levels=[0.5], colors="black", alpha=0.3)
+            axes[i].contour(
+                X.cpu(), Y.cpu(), V.cpu(), levels=[0.5], colors="black", alpha=0.3
+            )
 
         return fig
 
     def save_samples(self, samples: DDTensor, kwargs: dict, dir: Path) -> bool:
         pass
 
-    def load_samples(self, dir: Path) -> tuple[DDTensor, dict]:  # type: ignore
+    def load_samples(self, dir: Path) -> tuple[DDTensor, dict]:
         pass
 
 
 class XReward(Reward[DDTensor]):
-    def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def __call__(
+        self, sample: DDTensor, latent: DDTensor, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x = sample.data[:, 0]
         return x, torch.ones_like(x)
 
@@ -116,7 +136,7 @@ class XReward(Reward[DDTensor]):
 class ToyBaseModel(BaseModel[DDTensor]):
     output_type = "velocity"
 
-    def __init__(self, device: Optional[torch.device]=None):
+    def __init__(self, device: Optional[torch.device] = None):
         super().__init__(device)
         device = self.device
 
@@ -126,7 +146,9 @@ class ToyBaseModel(BaseModel[DDTensor]):
         data_mean = torch.tensor([-1, 1.5])
         data = data_mean.unsqueeze(0) + 0.1 * torch.randn(512, 2)
         opt = torch.optim.Adam(self.parameters(), lr=1e-3)
-        train_base_model(self, opt, [DDTensor(data)], steps=2500, batch_size=256, pbar=True)
+        train_base_model(
+            self, opt, [DDTensor(data)], steps=2500, batch_size=256, pbar=True
+        )
 
     @property
     def scheduler(self) -> Scheduler[DDTensor]:

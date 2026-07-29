@@ -18,6 +18,7 @@ dependencies = [
     "numpy>=2.4.6",
     "pandas>=3.0.5",
     "peft>=0.20.0",
+    "pillow>=12.3.0",
     "pyg-lib>=0.8.0",
     "pyiqa>=0.1.16",
     "scipy>=1.18.0",

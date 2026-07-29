@@ -2,7 +2,13 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from diffusiongym import reward_registry, construct_env, D, Environment, MemorylessNoiseSchedule
+from diffusiongym import (
+    reward_registry,
+    construct_env,
+    D,
+    Environment,
+    MemorylessNoiseSchedule,
+)
 from diffusiongym.molecules import DDGraph
 import argparse
 import yaml
@@ -10,9 +16,9 @@ import logging
 from pathlib import Path
 import json
 
-from adm.setups import setups as problem_setups
-from adm.setups.problem_setup import ProblemSetup
-from adm.utils import serialize_args
+from reward_actflow.setups import setups as problem_setups
+from reward_actflow.setups.problem_setup import ProblemSetup
+from reward_actflow.utils import serialize_args
 
 
 def main(args):
@@ -22,11 +28,19 @@ def main(args):
     with open(exp_dir / "args.yaml", "r") as f:
         exp_args = yaml.safe_load(f)
 
-    problem_setup: ProblemSetup = problem_setups[exp_args["problem_setup"]](exp_args, device=device)
+    problem_setup: ProblemSetup = problem_setups[exp_args["problem_setup"]](
+        exp_args, device=device
+    )
     reward = reward_registry.get(args.reward).instantiate(**args.reward_args)
-    env = construct_env(problem_setup.base_model, reward, exp_args["num_steps"], args.reward_scale)  # type: ignore
+    env = construct_env(
+        problem_setup.base_model, reward, exp_args["num_steps"], args.reward_scale
+    )
 
-    ft_dir = args.dir / "fine_tuned_rw_mle_test" / f"{args.reward.split('/')[-1]}_{args.reward_scale}_{'last' if args.use_last_ckpt else 'base'}"
+    ft_dir = (
+        args.dir
+        / "fine_tuned_rw_mle_test"
+        / f"{args.reward.split('/')[-1]}_{args.reward_scale}_{'last' if args.use_last_ckpt else 'base'}"
+    )
     ft_dir.mkdir(parents=True, exist_ok=True)
 
     with open(ft_dir / "args.yaml", "w") as f:
@@ -55,7 +69,9 @@ def reward_weighted_mle(
     log_every: Optional[int] = None,
     exp_dir: Optional[Path] = None,
 ):
-    env.base_model.scheduler.noise_schedule = MoleculeMemorylessNoiseSchedule(env.base_model.scheduler)  # type: ignore
+    env.base_model.scheduler.noise_schedule = MoleculeMemorylessNoiseSchedule(
+        env.base_model.scheduler
+    )
 
     if exp_dir is not None:
         exp_dir.mkdir(parents=True, exist_ok=True)
@@ -66,7 +82,7 @@ def reward_weighted_mle(
 
     opt = torch.optim.AdamW(env.base_model.parameters(), lr=lr)
 
-    # Track first and second moment 
+    # Track first and second moment
     r_ema_m1 = None
     r_ema_m2 = None
 
@@ -84,8 +100,8 @@ def reward_weighted_mle(
                 r_ema_m1 = r[v].mean()
                 r_ema_m2 = (r[v] ** 2).mean()
             else:
-                r_ema_m1 = (1-beta) * r_ema_m1 + beta * r[v].mean()
-                r_ema_m2 = (1-beta) * r_ema_m2 + beta * (r[v]**2).mean()
+                r_ema_m1 = (1 - beta) * r_ema_m1 + beta * r[v].mean()
+                r_ema_m2 = (1 - beta) * r_ema_m2 + beta * (r[v] ** 2).mean()
 
             r_ema_var = (r_ema_m2 - r_ema_m1**2).clamp_min(1e-6)
 
@@ -99,7 +115,13 @@ def reward_weighted_mle(
 
         opt.zero_grad()
 
-        for x_t, x_t_next, t0, t1, diffusion_t in zip(s.trajectory[:-1], s.trajectory[1:], s.timesteps[:-1], s.timesteps[1:], s.diffusions):
+        for x_t, x_t_next, t0, t1, diffusion_t in zip(
+            s.trajectory[:-1],
+            s.trajectory[1:],
+            s.timesteps[:-1],
+            s.timesteps[1:],
+            s.diffusions,
+        ):
             x_t = x_t.to(env.device)
             x_t_next = x_t_next.to(env.device)
             diffusion_t = diffusion_t.to(env.device)
@@ -110,7 +132,9 @@ def reward_weighted_mle(
             new_mean_t_next = x_t + dt * new_drift_t
 
             weight = torch.exp(env.reward_scale * r)
-            loss = weight * (((x_t_next - new_mean_t_next) / diffusion_t) ** 2).aggregate("mean")
+            loss = weight * (
+                ((x_t_next - new_mean_t_next) / diffusion_t) ** 2
+            ).aggregate("mean")
             loss = loss.mean()
             loss /= s.num_steps
 
@@ -132,7 +156,9 @@ def reward_weighted_mle(
             "r_max": s.rewards[s.valids].max(),
             "valid": s.valids.float().mean(),
         }
-        logging.info(f"(iter={it:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+        logging.info(
+            f"(iter={it:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}"
+        )
 
         if exp_dir is not None:
             torch.save(env.base_model.state_dict(), exp_dir / "last.pt")
@@ -141,7 +167,7 @@ def reward_weighted_mle(
 class MoleculeMemorylessNoiseSchedule(MemorylessNoiseSchedule[DDGraph]):
     def __call__(self, x: DDGraph, t: torch.Tensor) -> DDGraph:
         out = super().__call__(x, t)
-        out.graph.ndata["x_t"] = 0.1 * out.graph.ndata["x_t"]  # type: ignore
+        out.graph.ndata["x_t"] = 0.1 * out.graph.ndata["x_t"]
         return out
 
 
@@ -181,7 +207,7 @@ if __name__ == "__main__":
         "--reward_args",
         type=json.loads,
         default={},
-        help="JSON string, e.g. '{\"alpha\": 0.1, \"beta\": 2}'"
+        help='JSON string, e.g. \'{"alpha": 0.1, "beta": 2}\'',
     )
     parser.add_argument("--reward_scale", type=float, default=1.0)
     parser.add_argument("--samples_per_iter", type=int, default=64)

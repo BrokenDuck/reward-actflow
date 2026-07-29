@@ -6,8 +6,8 @@ from pathlib import Path
 from diffusiongym import DummyReward, construct_env
 from diffusiongym.utils import index_dict
 
-from adm.setups import setups as problem_setups
-from adm.utils import Batch, setup_logger
+from reward_actflow.setups import setups as problem_setups
+from reward_actflow.utils import Batch, setup_logger
 
 
 @torch.no_grad()
@@ -89,7 +89,9 @@ def main(args):
         # Log if we crossed a 5% boundary
         if (current_pct // 5) > (prev_pct // 5):
             display_pct = (current_pct // 5) * 5
-            logger.info(f"Progress: {display_pct}% ({n_valids_new}/{args.n_samples} valid samples)")
+            logger.info(
+                f"Progress: {display_pct}% ({n_valids_new}/{args.n_samples} valid samples)"
+            )
 
     batch = Batch.concat(batches)
     problem_setup.save_samples(batch.samples, batch.kwargs, folder)

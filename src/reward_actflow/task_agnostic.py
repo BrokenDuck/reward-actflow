@@ -1,6 +1,6 @@
 from diffusiongym import DummyReward
 
-from .explore import setup_and_run, build_parser
+from reward_actflow.explore import setup_and_run, build_parser
 
 
 def main(args):

@@ -11,9 +11,9 @@ from pathlib import Path
 import copy
 import json
 
-from adm.setups import setups as problem_setups
-from adm.setups.problem_setup import ProblemSetup
-from adm.utils import Batch, filter_out_invalids, serialize_args
+from reward_actflow.setups import setups as problem_setups
+from reward_actflow.setups.problem_setup import ProblemSetup
+from reward_actflow.utils import Batch, filter_out_invalids, serialize_args
 
 
 def main(args):
@@ -23,11 +23,19 @@ def main(args):
     with open(exp_dir / "args.yaml", "r") as f:
         exp_args = yaml.safe_load(f)
 
-    problem_setup: ProblemSetup = problem_setups[exp_args["problem_setup"]](exp_args, device=device)
+    problem_setup: ProblemSetup = problem_setups[exp_args["problem_setup"]](
+        exp_args, device=device
+    )
     reward = reward_registry.get(args.reward).instantiate(**args.reward_args)
-    env = construct_env(problem_setup.base_model, reward, exp_args["num_steps"], args.reward_scale)  # type: ignore
+    env = construct_env(
+        problem_setup.base_model, reward, exp_args["num_steps"], args.reward_scale
+    )
 
-    ft_dir = args.dir / "fine_tuned" / f"{args.reward.split('/')[-1]}_{args.reward_scale}_{'last' if args.use_last_ckpt else 'base'}"
+    ft_dir = (
+        args.dir
+        / "fine_tuned"
+        / f"{args.reward.split('/')[-1]}_{args.reward_scale}_{'last' if args.use_last_ckpt else 'base'}"
+    )
     ft_dir.mkdir(parents=True, exist_ok=True)
 
     with open(ft_dir / "args.yaml", "w") as f:
@@ -104,10 +112,21 @@ def diffusion_nft(
             "r_max": sample.rewards[sample.valids].max(),
             "valid": sample.valids.float().mean(),
         }
-        logging.info(f"(iter={it:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}")
+        logging.info(
+            f"(iter={it:05d}) {', '.join([f'{k}: {v:.2f}' for k, v in metrics.items()])}"
+        )
 
-        dataset = DDDataset([batch.latents.to(env.device)], [batch.kwargs], [r.to(env.device)])
-        loader = DataLoader(dataset, ft_batch_size, shuffle=True, collate_fn=dataset.collate, num_workers=0, pin_memory=False)
+        dataset = DDDataset(
+            [batch.latents.to(env.device)], [batch.kwargs], [r.to(env.device)]
+        )
+        loader = DataLoader(
+            dataset,
+            ft_batch_size,
+            shuffle=True,
+            collate_fn=dataset.collate,
+            num_workers=0,
+            pin_memory=False,
+        )
 
         env.base_model.train()
 
@@ -130,7 +149,8 @@ def diffusion_nft(
 
                 loss = torch.mean(
                     opt_prob * env.base_model.train_loss(x1, xt=xt, t=t, pred=pos_pred)
-                    + (1 - opt_prob) * env.base_model.train_loss(x1, xt=xt, t=t, pred=neg_pred)
+                    + (1 - opt_prob)
+                    * env.base_model.train_loss(x1, xt=xt, t=t, pred=neg_pred)
                 )
                 loss.backward()
                 opt.step()
@@ -139,7 +159,9 @@ def diffusion_nft(
         # ema step using eta
         with torch.no_grad():
             eta = eta_schedule(it)
-            for p_old, p_new in zip(env.policy.parameters(), env.base_model.parameters()):
+            for p_old, p_new in zip(
+                env.policy.parameters(), env.base_model.parameters()
+            ):
                 p_old.data.mul_(eta).add_(p_new.data, alpha=1 - eta)
 
         if exp_dir is not None:
@@ -185,7 +207,7 @@ if __name__ == "__main__":
         "--reward_args",
         type=json.loads,
         default={},
-        help="JSON string, e.g. '{\"alpha\": 0.1, \"beta\": 2}'"
+        help='JSON string, e.g. \'{"alpha": 0.1, "beta": 2}\'',
     )
     parser.add_argument("--reward_scale", type=float, default=1.0)
     parser.add_argument("--samples_per_iter", type=int, default=64)

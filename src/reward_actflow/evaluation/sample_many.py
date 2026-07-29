@@ -5,8 +5,8 @@ from pathlib import Path
 from diffusiongym import DummyReward, construct_env
 from tqdm import trange
 
-from adm.setups import setups as problem_setups
-from adm.utils import Batch, setup_logger
+from reward_actflow.setups import setups as problem_setups
+from reward_actflow.utils import Batch, setup_logger
 
 
 @torch.no_grad()

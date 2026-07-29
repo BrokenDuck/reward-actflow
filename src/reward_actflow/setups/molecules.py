@@ -7,7 +7,7 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import Draw, AllChem, Crippen, QED
 from flowmol.data_processing.utils import build_edge_idxs
 from flowmol.analysis.molecule_builder import SampledMolecule, bond_type_to_idx
-from diffusiongym import  BaseModel, Environment
+from diffusiongym import BaseModel, Environment
 from diffusiongym.molecules import DDGraph, QM9BaseModel, GEOMBaseModel
 from diffusiongym.molecules.rewards.xtb import parallel_xtb
 from diffusiongym.molecules.rewards.utils import is_valid, is_not_fragmented
@@ -20,15 +20,15 @@ from argparse import ArgumentParser
 import gzip
 import os
 
-import adm.sa_scorer.sascorer as sascorer
-from adm.setups.problem_setup import ProblemSetup
-from adm.uncertainty import UncertaintyEstimator
-from adm.utils import Batch
+import reward_actflow.sa_scorer.sascorer as sascorer
+from reward_actflow.setups.problem_setup import ProblemSetup
+from reward_actflow.uncertainty import UncertaintyEstimator
+from reward_actflow.utils import Batch
 
 
 class MoleculeProblemSetup(ProblemSetup[DDGraph]):
     def __init__(self, dataset: str, args: dict, device: Optional[torch.device] = None):
-        RDLogger.DisableLog("rdApp.*")  # type: ignore
+        RDLogger.DisableLog("rdApp.*")
 
         self.geometry_opt: str = args["mol_geometry_opt"]
 
@@ -43,11 +43,18 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
             raise ValueError(f"Unknown dataset: {dataset}")
 
         self.atom_type_map = self.base_model.model.atom_type_map
-        self.atom_type_to_idx = { atom_type: i for i, atom_type in enumerate(self.atom_type_map) }
+        self.atom_type_to_idx = {
+            atom_type: i for i, atom_type in enumerate(self.atom_type_map)
+        }
 
     @classmethod
     def add_args(cls, parser: ArgumentParser):
-        parser.add_argument("--mol_geometry_opt", type=str, choices=["none", "mmff", "uff", "gfn2"], default="mmff")
+        parser.add_argument(
+            "--mol_geometry_opt",
+            type=str,
+            choices=["none", "mmff", "uff", "gfn2"],
+            default="mmff",
+        )
 
     @property
     def base_model(self) -> BaseModel[DDGraph]:
@@ -96,7 +103,9 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         if self.geometry_opt != "none":
             graphs = []
             for g in dgl.unbatch(graph):
-                g = relax_positions(g, self.base_model.model.atom_type_map, self.geometry_opt)
+                g = relax_positions(
+                    g, self.base_model.model.atom_type_map, self.geometry_opt
+                )
                 graphs.append(g)
 
             graph = dgl.batch(graphs)
@@ -110,7 +119,9 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
     def postprocess_latents(self, batch: Batch[DDGraph]) -> DDGraph:
         return self._postprocess_graph(batch.latents)
 
-    def postprocess_features(self, latents: DDGraph, feats: torch.Tensor) -> torch.Tensor:
+    def postprocess_features(
+        self, latents: DDGraph, feats: torch.Tensor
+    ) -> torch.Tensor:
         # `feats` is a tensor of shape (num_nodes, feature_dim), which we want to take the mean over
         # for each graph in the batch. We have the indices that each node belongs to which graph in x.n_idx.
         device = latents.device
@@ -162,7 +173,9 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
                 e_idx[k] = bond_type_to_idx[bond_type]
 
             g.ndata["x_1"] = atom_positions
-            g.ndata["a_1"] = F.one_hot(atom_types_idx, num_classes=len(self.atom_type_map)).float()
+            g.ndata["a_1"] = F.one_hot(
+                atom_types_idx, num_classes=len(self.atom_type_map)
+            ).float()
             g.ndata["c_1"] = F.one_hot(atom_charges + 2, num_classes=6).float()
             g.edata["e_1"] = F.one_hot(e_idx, num_classes=5).float()
 
@@ -220,7 +233,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         perm = torch.randperm(result.numel(), device=result.device)
         result = result[perm]
 
-        return { "n_atoms": result }
+        return {"n_atoms": result}
 
     def save_samples(self, samples: DDGraph, kwargs: dict, dir: Path) -> bool:
         samples = self._postprocess_graph(samples)
@@ -247,7 +260,9 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
 
         mols = []
         with gzip.open(sdf_path, "rb") as f:
-            suppl = Chem.ForwardSDMolSupplier(f, sanitize=False, removeHs=False, strictParsing=False)
+            suppl = Chem.ForwardSDMolSupplier(
+                f, sanitize=False, removeHs=False, strictParsing=False
+            )
             for mol in suppl:
                 if mol is not None:
                     mols.append(mol)
@@ -266,19 +281,36 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
         D = 1 - K
         avg_pairwise_dist = D.sum() / (n * (n - 1))
 
-        return { "vendi": float(vendi_score), "avg_pairwise_dist": float(avg_pairwise_dist) }
+        return {
+            "vendi": float(vendi_score),
+            "avg_pairwise_dist": float(avg_pairwise_dist),
+        }
 
-    def compute_sample_metrics(self, samples: DDGraph, kwargs: dict) -> list[dict[str, Any]]:
+    def compute_sample_metrics(
+        self, samples: DDGraph, kwargs: dict
+    ) -> list[dict[str, Any]]:
         # In case these were not loaded from file, we need to relax geometry
         samples = self._postprocess_graph(samples)
         mols = self._graph_to_mols(samples)
 
-        valid_indices = [i for i, mol in enumerate(mols) if mol is not None and self._is_mol_valid(mol)]
+        valid_indices = [
+            i
+            for i, mol in enumerate(mols)
+            if mol is not None and self._is_mol_valid(mol)
+        ]
         valid_mols = [mols[i] for i in valid_indices]
         res = parallel_xtb(valid_mols)
 
-        metrics: list[dict[str, Any]] = [{ "is_valid": True } for _ in mols]
-        metric_names = ["energy", "homo", "lumo", "homo_lumo_gap", "dipole_moment", "polarizability", "heat_capacity"]
+        metrics: list[dict[str, Any]] = [{"is_valid": True} for _ in mols]
+        metric_names = [
+            "energy",
+            "homo",
+            "lumo",
+            "homo_lumo_gap",
+            "dipole_moment",
+            "polarizability",
+            "heat_capacity",
+        ]
         for mol, idx, xtb_res in zip(valid_mols, valid_indices, res):
             if xtb_res is None:
                 continue
@@ -286,7 +318,7 @@ class MoleculeProblemSetup(ProblemSetup[DDGraph]):
             for name in metric_names:
                 metrics[idx][name] = getattr(xtb_res, name)
             metrics[idx]["qed"] = QED.qed(mol)
-            metrics[idx]["logp"] = Crippen.MolLogP(mol)  # type: ignore
+            metrics[idx]["logp"] = Crippen.MolLogP(mol)
             metrics[idx]["sa_score"] = sascorer.calculateScore(mol)
 
         return metrics
@@ -302,7 +334,9 @@ class GEOMDrugsProblemSetup(MoleculeProblemSetup):
         super().__init__(dataset="geom_drugs", args=args, device=device)
 
 
-def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff") -> dgl.DGLGraph:
+def relax_positions(
+    g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff"
+) -> dgl.DGLGraph:
     g_relaxed = g.clone()
 
     if "x_1" not in g_relaxed.ndata.keys():
@@ -324,12 +358,12 @@ def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff"
     if alg == "mmff":
         # Sometimes it crashes in the middle of a run, so we guard with try-except
         try:
-            AllChem.MMFFOptimizeMolecule(mol)  # type: ignore
+            AllChem.MMFFOptimizeMolecule(mol)
         except:
             pass
     elif alg == "uff":
         try:
-            AllChem.UFFOptimizeMolecule(mol)  # type: ignore
+            AllChem.UFFOptimizeMolecule(mol)
         except:
             pass
     elif alg == "gfn2":
@@ -343,7 +377,7 @@ def relax_positions(g: dgl.DGLGraph, atom_type_map: list[str], alg: str = "mmff"
     positions = torch.from_numpy(mol.GetConformer().GetPositions())
 
     x_key = "x_1" if "x_1" in g.ndata.keys() else "x_t"
-    g.ndata[x_key] = positions.to(g.device).type_as(g.ndata[x_key])  # type: ignore
+    g.ndata[x_key] = positions.to(g.device).type_as(g.ndata[x_key])
 
     return g
 
@@ -376,7 +410,7 @@ def xtb_relax_geometry(mol: Chem.Mol) -> Chem.Mol | None:
             return None
 
         # Load optimized structure back into RDKit
-        opt_mol = Chem.MolFromXYZFile(str(output_file))  # type: ignore
+        opt_mol = Chem.MolFromXYZFile(str(output_file))
         if opt_mol is None:
             return None
 
@@ -384,6 +418,6 @@ def xtb_relax_geometry(mol: Chem.Mol) -> Chem.Mol | None:
         opt_conf = opt_mol.GetConformer()
         conf = mol.GetConformer()
         for i in range(mol.GetNumAtoms()):
-            conf.SetAtomPosition(i, opt_conf.GetAtomPosition(i))  # type: ignore
+            conf.SetAtomPosition(i, opt_conf.GetAtomPosition(i))
 
     return mol

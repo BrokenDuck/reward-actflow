@@ -28,9 +28,9 @@ class Batch(Generic[D]):
 
     @classmethod
     def from_sample(cls, sample: "Sample[T]") -> "Batch[T]":
-        return cls(  # type: ignore
-            samples=sample.sample,  # type: ignore
-            latents=sample.latent,  # type: ignore
+        return cls(
+            samples=sample.sample,
+            latents=sample.latent,
             rewards=sample.rewards,
             valids=sample.valids,
             kwargs=sample.kwargs,
@@ -45,7 +45,10 @@ class Batch(Generic[D]):
             latents=self.latents.to(device),
             rewards=self.rewards.to(device),
             valids=self.valids.to(device),
-            kwargs={k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in self.kwargs.items()},
+            kwargs={
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in self.kwargs.items()
+            },
         )
 
     def cpu(self) -> "Batch[D]":
@@ -55,8 +58,8 @@ class Batch(Generic[D]):
         return Batch(
             samples=self.samples[idx],
             latents=self.latents[idx],
-            rewards=self.rewards[idx:idx+1],
-            valids=self.valids[idx:idx+1],
+            rewards=self.rewards[idx : idx + 1],
+            valids=self.valids[idx : idx + 1],
             kwargs=index_dict(self.kwargs, idx, idx + 1),
         )
 
@@ -101,7 +104,7 @@ def write_video(frame_paths: list[Path], video_path: Path, fps: int):
 
     with imageio.get_writer(video_path, fps=fps, codec="libx264") as writer:
         for frame_path in frame_paths:
-            writer.append_data(imageio.imread(frame_path))  # type: ignore
+            writer.append_data(imageio.imread(frame_path))
 
 
 def serialize_args(args: argparse.Namespace) -> dict:
@@ -138,7 +141,9 @@ def setup_logger(folder: Path | None = None, verbose: bool = False) -> logging.L
     return logger
 
 
-def add_valid_border(images: torch.Tensor, valids: torch.Tensor, thickness: int = 2) -> torch.Tensor:
+def add_valid_border(
+    images: torch.Tensor, valids: torch.Tensor, thickness: int = 2
+) -> torch.Tensor:
     images = images.clone()
     if images.shape[1] == 1:
         images = torch.cat([images, images, images], dim=1)
@@ -168,20 +173,21 @@ class CLIP:
             pretrained="laion2b_s34b_b79k",
             device=device,
         )
-        self.model.eval()  # type: ignore
+        self.model.eval()
         self.tokenizer = open_clip.get_tokenizer("ViT-B-32")
 
     @torch.no_grad()
     def embed_images(self, images: list[Image.Image]) -> torch.Tensor:
-        images = [self.preprocess(img).unsqueeze(0) for img in images]  # type: ignore
-        feats = torch.cat([self.model.encode_image(img.to(self.device)) for img in images])  # type: ignore
+        images = [self.preprocess(img).unsqueeze(0) for img in images]
+        feats = torch.cat(
+            [self.model.encode_image(img.to(self.device)) for img in images]
+        )
         return feats / feats.norm(dim=-1, keepdim=True)
-
 
     @torch.no_grad()
     def embed_texts(self, texts: list[str]) -> torch.Tensor:
         tokenized_texts = self.tokenizer(texts).to(self.device)
-        feats = self.model.encode_text(tokenized_texts)  # type: ignore
+        feats = self.model.encode_text(tokenized_texts)
         return feats / feats.norm(dim=-1, keepdim=True)
 
     @torch.no_grad()

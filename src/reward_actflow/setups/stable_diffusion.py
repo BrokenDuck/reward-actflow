@@ -15,13 +15,13 @@ import shutil
 import zipfile
 import yaml
 
-from adm.setups.problem_setup import ProblemSetup
-from adm.uncertainty import UncertaintyEstimator
-from adm.utils import add_valid_border, CLIP, Batch, to_pil_images
+from reward_actflow.setups.problem_setup import ProblemSetup
+from reward_actflow.uncertainty import UncertaintyEstimator
+from reward_actflow.utils import add_valid_border, CLIP, Batch, to_pil_images
 
 
 class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
-    def __init__(self, args: dict[str, Any], device: Optional[torch.device]=None):
+    def __init__(self, args: dict[str, Any], device: Optional[torch.device] = None):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -58,7 +58,7 @@ class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
         self._base_model.eval()
 
         self.clip = CLIP(device)
-        self.topiq =  pyiqa.create_metric("topiq_nr", device=device)
+        self.topiq = pyiqa.create_metric("topiq_nr", device=device)
         self.niqe = pyiqa.create_metric("niqe", device=device)
         self.aes_reward = AestheticReward()
 
@@ -101,7 +101,9 @@ class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
     def feature_layer(self) -> str:
         return "unet.mid_block"
 
-    def postprocess_features(self, latents: DDTensor, feats: torch.Tensor) -> torch.Tensor:
+    def postprocess_features(
+        self, latents: DDTensor, feats: torch.Tensor
+    ) -> torch.Tensor:
         # If CFG, only use conditional features
         if feats.shape[0] == 2 * len(latents):
             feats, _ = feats.chunk(2)
@@ -132,11 +134,18 @@ class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
         kwargs_data = []
 
         for i in range(len(samples)):
-            save_image(samples[i].data.cpu(), sample_dir / f"sample_{i}.png", normalize=True, value_range=(0, 1))
-            kwargs_data.append({
-                "prompt": kwargs["prompt"][i],
-                "cfg_scale": kwargs["cfg_scale"][i].item(),
-            })
+            save_image(
+                samples[i].data.cpu(),
+                sample_dir / f"sample_{i}.png",
+                normalize=True,
+                value_range=(0, 1),
+            )
+            kwargs_data.append(
+                {
+                    "prompt": kwargs["prompt"][i],
+                    "cfg_scale": kwargs["cfg_scale"][i].item(),
+                }
+            )
 
         # save kwargs data as yaml file
         with open(dir / "kwargs.yaml", "w") as f:
@@ -156,8 +165,12 @@ class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
             zip_ref.extractall(sample_dir)
 
         # load images
-        img_paths = sorted(sample_dir.glob("sample_*.png"), key=lambda x: int(x.stem.split("_")[1]))
-        imgs = torch.stack([read_image(str(path)) for path in img_paths]).float() / 255.0
+        img_paths = sorted(
+            sample_dir.glob("sample_*.png"), key=lambda x: int(x.stem.split("_")[1])
+        )
+        imgs = (
+            torch.stack([read_image(str(path)) for path in img_paths]).float() / 255.0
+        )
         samples = DDTensor(imgs)
 
         # load kwargs data
@@ -172,12 +185,15 @@ class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
         return samples, kwargs
 
     def eval_sampling_kwargs(self, n: int) -> dict[str, Any]:
-        return { "prompt": ["An impressionist painting"] * n, "cfg_scale": torch.full((n,), 4.0) }
+        return {
+            "prompt": ["An impressionist painting"] * n,
+            "cfg_scale": torch.full((n,), 4.0),
+        }
 
     def compute_metrics(self, samples: DDTensor, kwargs: dict) -> dict[str, float]:
         img_list = to_pil_images(samples)
         feats = self.clip.embed_images(img_list).cpu()
-        return { "vendi": vendi.score_X(feats) }
+        return {"vendi": vendi.score_X(feats)}
 
     # def compute_sample_metrics(self, samples: DDTensor, kwargs: dict) -> list[dict[str, float]]:
     #     return dict()
