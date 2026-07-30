@@ -60,7 +60,7 @@ class FlowFeatureExtractor(nn.Module, Generic[D]):
 
         self._hook = target.register_forward_hook(hook_fn)
 
-    def forward(self, x1: D, **kwargs: Any) -> torch.Tensor:
+    def forward(self, x1: D, **kwargs) -> torch.Tensor:
         if self.layer == "input":
             return self.postprocess(x1, x1)
 
@@ -169,13 +169,13 @@ class UncertaintyEstimator(Reward[D]):
         """
         pass
 
-    def _get_feats(self, latent: D, **kwargs: Any) -> torch.Tensor:
+    def _get_feats(self, latent: D, **kwargs) -> torch.Tensor:
         latent = latent.to(self.device)
         kwargs = dict_to_device(kwargs, self.device)
         return self.feat_extractor(latent, **kwargs)
 
     def mean_and_uncertainty(
-        self, latent: D, **kwargs: Any
+        self, latent: D, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         feats = self._get_feats(latent, **kwargs)
         return self._mean_and_uncertainty(feats)
@@ -212,7 +212,7 @@ class UncertaintyEstimator(Reward[D]):
         self._update_estimator(feats_tensor, labels_tensor)
 
     def __call__(
-        self, sample: D | None, latent: D, **kwargs: Any
+        self, sample: D | None, latent: D, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         mean, uncertainty = self.mean_and_uncertainty(latent, **kwargs)
         return self.mean_weight * mean + uncertainty, torch.ones(

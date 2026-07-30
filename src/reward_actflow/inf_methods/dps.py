@@ -17,7 +17,7 @@ class RewardGradient(nn.Module, Generic[D]):
         self.reward = reward
 
     @torch.enable_grad()
-    def forward(self, xt: D, t: torch.Tensor, **kwargs: Any) -> D:
+    def forward(self, xt: D, t: torch.Tensor, **kwargs) -> D:
         xt = xt.requires_grad()
         x1 = self.env.pred_final(xt, t, **kwargs)
         # For our purposes, we do not need a postprocessed sample

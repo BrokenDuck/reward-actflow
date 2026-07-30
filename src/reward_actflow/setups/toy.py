@@ -127,7 +127,7 @@ class ToyProblemSetup(ProblemSetup[DDTensor]):
 
 class XReward(Reward[DDTensor]):
     def __call__(
-        self, sample: DDTensor, latent: DDTensor, **kwargs: Any
+        self, sample: DDTensor, latent: DDTensor, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x = sample.data[:, 0]
         return x, torch.ones_like(x)
@@ -154,8 +154,8 @@ class ToyBaseModel(BaseModel[DDTensor]):
     def scheduler(self) -> Scheduler[DDTensor]:
         return self._scheduler
 
-    def sample_p0(self, n: int, **kwargs: Any) -> tuple[DDTensor, dict[str, Any]]:
+    def sample_p0(self, n: int, **kwargs) -> tuple[DDTensor, dict[str, Any]]:
         return DDTensor(torch.randn(n, 2, device=self.device)), {}
 
-    def forward(self, x: DDTensor, t: torch.Tensor, **kwargs: Any) -> DDTensor:
+    def forward(self, x: DDTensor, t: torch.Tensor, **kwargs) -> DDTensor:
         return DDTensor(self.model(x.data, t))
