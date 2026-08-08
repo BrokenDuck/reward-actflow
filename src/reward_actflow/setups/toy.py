@@ -1,161 +1,148 @@
-from typing import Any, Optional
-
-import numpy as np
-import torch
-from diffusiongym import (
-    DDTensor,
-    BaseModel,
-    OptimalTransportScheduler,
-    Scheduler,
-    Environment,
-    Reward,
-)
-from diffusiongym.utils import train_base_model
-from diffusiongym.base_models.one_dim_gmm import MLP
-from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
+from argparse import ArgumentParser
 from pathlib import Path
+from typing import Any
 
+import torch
+from diffusiongym import FineTuningSetup
+from diffusiongym.types import DDTensor
+from matplotlib.figure import Figure
+
+import reward_actflow.toy  # noqa: F401  (registers actflow/toy)
 from reward_actflow.setups.problem_setup import ProblemSetup
+from reward_actflow.toy.reward import TOY_REWARDS
+from reward_actflow.toy.validity import base_training_data, staircase_validity
+from reward_actflow.toy.visualize import (
+    coverage_metrics,
+    plot_actflow_r_iteration,
+    plot_iteration,
+    sample_model,
+)
 from reward_actflow.uncertainty import UncertaintyEstimator
 from reward_actflow.utils import Batch
 
 
 class ToyProblemSetup(ProblemSetup[DDTensor]):
-    def __init__(self, args: dict[str, Any], device: Optional[torch.device] = None):
+    """2-D staircase region, explored from a tight blob inside its top slab."""
+
+    def __init__(self, args: dict[str, Any], device: torch.device | None = None):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self._base_model = ToyBaseModel(device=device)
         self.device = device
+        self.args = args
+
+    @classmethod
+    def add_args(cls, parser: ArgumentParser):
+        parser.add_argument(
+            "--toy_pretrain_steps",
+            type=int,
+            default=2500,
+            help="Rectified-flow steps used to pretrain the base model.",
+        )
+        parser.add_argument(
+            "--toy_checkpoint",
+            type=Path,
+            default=None,
+            help="Cache path for the pretrained base model weights.",
+        )
+        parser.add_argument("--toy_width", type=int, default=128)
+        parser.add_argument("--toy_depth", type=int, default=3)
+        parser.add_argument(
+            "--toy_reward",
+            type=str,
+            choices=tuple(TOY_REWARDS),
+            default="linear",
+            help=(
+                "Black-box task reward for ActFlow-R. 'linear' increases in x "
+                "and is maximised (within the valid set) on bottom's far right "
+                "edge; 'bump' is a Gaussian centred there instead, non-zero "
+                "only near the target."
+            ),
+        )
 
     @property
-    def base_model(self) -> BaseModel[DDTensor]:
-        return self._base_model
+    def modality_id(self) -> str:
+        return "actflow/toy"
+
+    @property
+    def modality_kwargs(self) -> dict[str, Any]:
+        return {
+            "pretrain_steps": self.args.get("toy_pretrain_steps", 2500),
+            "checkpoint": self.args.get("toy_checkpoint"),
+            "width": self.args.get("toy_width", 128),
+            "depth": self.args.get("toy_depth", 3),
+        }
 
     def validity(self, samples: DDTensor, kwargs: dict[str, Any]) -> torch.Tensor:
-        x = samples.data[:, 0] + 0.5
-        y = samples.data[:, 1]
-
-        top = (x >= -2) & (x <= 1) & (y >= 1) & (y <= 2)
-        middle = (x >= -2) & (x <= -1) & (y >= -1) & (y <= 1)
-        bottom = (x >= -2) & (x <= 3) & (y >= -2) & (y <= -1)
-        inside = top | middle | bottom
-        return inside.bool()
+        return staircase_validity(samples.data)
 
     @property
     def feature_layer(self) -> str:
+        # The problem is 2-D, so the sample itself is the representation; there
+        # is nothing a hidden layer could add.
         return "input"
 
-    def postprocess_features(self, latents: DDTensor, feats: DDTensor) -> torch.Tensor:
+    def postprocess_features(self, latents: DDTensor, feats: Any) -> torch.Tensor:
         return feats.data
 
     @torch.no_grad()
     def visualize_sample(
         self,
-        env: Environment[DDTensor],
+        setup: FineTuningSetup,
         uncertainty: UncertaintyEstimator[DDTensor],
         batch: Batch[DDTensor],
-    ) -> Figure:
-        xmin = -3.5
-        xmax = 3.5
-        delta = 0.05
-
-        x = torch.linspace(xmin, xmax, 100)
-        y = torch.linspace(xmin, xmax, 100)
-        X, Y = torch.meshgrid(x, y, indexing="ij")
-        XY = torch.stack([X.flatten(), Y.flatten()], dim=-1)
-        Z, _ = uncertainty(DDTensor(XY).to(self.device), DDTensor(XY).to(self.device))
-        Z = Z.reshape(X.shape)
-
-        fig, axes = plt.subplots(1, 2, figsize=(6, 3), constrained_layout=True)
-        im = axes[0].imshow(
-            Z.T.cpu(),
-            extent=(xmin, xmax, xmin, xmax),
-            origin="lower",
-            cmap="YlGn",
-            aspect="equal",
+    ) -> tuple[Figure, dict[str, float]]:
+        return plot_iteration(
+            setup,
+            uncertainty,
+            batch.samples.data,
+            batch.valids,
         )
-        axes[0].set_title("Uncertainty")
-        fig.colorbar(im, ax=axes[0], shrink=0.8)
-
-        data = batch.samples.data
-        valid = batch.valids
-
-        axes[0].scatter(
-            data[valid][:, 0].cpu(), data[valid][:, 1].cpu(), s=2, alpha=1.0
-        )
-        axes[0].scatter(
-            data[~valid][:, 0].cpu(), data[~valid][:, 1].cpu(), s=2, alpha=1.0
-        )
-
-        axes[0].set_xlim(xmin, xmax)
-        axes[0].set_ylim(xmin, xmax)
-
-        many_samples = env.sample(50_000, pbar=False).sample.data
-        H, _, _ = np.histogram2d(
-            many_samples[:, 0].cpu().numpy(),
-            many_samples[:, 1].cpu().numpy(),
-            bins=100,
-            density=True,
-            range=[[xmin, xmax], [xmin, xmax]],
-        )
-        support = H >= 0.01
-
-        axes[1].imshow(
-            support.T,
-            extent=(xmin, xmax, xmin, xmax),
-            origin="lower",
-            cmap="binary",
-        )
-        axes[1].set_title(r"Model Support (p >= 0.01)")
-
-        V = self.validity(DDTensor(XY), {}).reshape(X.shape)
-        for i in range(2):
-            axes[i].contour(
-                X.cpu(), Y.cpu(), V.cpu(), levels=[0.5], colors="black", alpha=0.3
-            )
-
-        return fig
 
     def save_samples(self, samples: DDTensor, kwargs: dict, dir: Path) -> bool:
-        pass
+        dir.mkdir(parents=True, exist_ok=True)
+        torch.save(samples.data.detach().cpu(), dir / "samples.pt")
+        return True
 
     def load_samples(self, dir: Path) -> tuple[DDTensor, dict]:
-        pass
+        return DDTensor(torch.load(dir / "samples.pt", map_location="cpu")), {}
 
+    def compute_metrics(self, samples: DDTensor, kwargs: dict) -> dict[str, float]:
+        return coverage_metrics(samples.data.detach().cpu())
 
-class XReward(Reward[DDTensor]):
-    def __call__(
-        self, sample: DDTensor, latent: DDTensor, **kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        x = sample.data[:, 0]
-        return x, torch.ones_like(x)
+    def task_reward(self, samples: DDTensor, kwargs: dict[str, Any]) -> torch.Tensor:
+        reward_fn = TOY_REWARDS[self.args.get("toy_reward", "linear")]
+        return reward_fn(samples.data)
 
+    def anchor_latents(self, n: int, device: torch.device) -> DDTensor:
+        # Sample space *is* latent space here (`IdentityCodec`), so this can
+        # feed `base_training_data`'s raw coordinates straight through; a
+        # setup with a real codec would need to encode first.
+        return DDTensor(base_training_data(n, device=device))
 
-class ToyBaseModel(BaseModel[DDTensor]):
-    output_type = "velocity"
+    def diagnostic_coordinates(self, latents: DDTensor) -> torch.Tensor:
+        # The problem is already 2-D, so the raw coordinates are the fixed
+        # descriptor — same reasoning as feature_layer == "input".
+        return latents.data
 
-    def __init__(self, device: Optional[torch.device] = None):
-        super().__init__(device)
-        device = self.device
-
-        self._scheduler = OptimalTransportScheduler()
-        self.model = MLP(2, 2).to(device)
-
-        data_mean = torch.tensor([-1, 1.5])
-        data = data_mean.unsqueeze(0) + 0.1 * torch.randn(512, 2)
-        opt = torch.optim.Adam(self.parameters(), lr=1e-3)
-        train_base_model(
-            self, opt, [DDTensor(data)], steps=2500, batch_size=256, pbar=True
+    @torch.no_grad()
+    def visualize_reward_sample(
+        self,
+        setup: FineTuningSetup,
+        uncertainty: UncertaintyEstimator[DDTensor],
+        reward_uncertainty: UncertaintyEstimator[DDTensor],
+        anchors: DDTensor,
+        batch: Batch[DDTensor],
+    ) -> tuple[Figure, dict[str, float]]:
+        reward_fn = TOY_REWARDS[self.args.get("toy_reward", "linear")]
+        return plot_actflow_r_iteration(
+            setup,
+            uncertainty,
+            reward_fn,
+            anchors.data,
+            batch.samples.data,
+            batch.valids,
         )
 
-    @property
-    def scheduler(self) -> Scheduler[DDTensor]:
-        return self._scheduler
 
-    def sample_p0(self, n: int, **kwargs) -> tuple[DDTensor, dict[str, Any]]:
-        return DDTensor(torch.randn(n, 2, device=self.device)), {}
-
-    def forward(self, x: DDTensor, t: torch.Tensor, **kwargs) -> DDTensor:
-        return DDTensor(self.model(x.data, t))
+__all__ = ["ToyProblemSetup", "sample_model"]

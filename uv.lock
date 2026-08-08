@@ -181,22 +181,6 @@ wheels = [
 ]
 
 [[package]]
-name = "biopython"
-version = "1.87"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/df/3e/3c6aa8b2a7e6b791a34407736db32f59657001f0446ada31db73a3e0b7d5/biopython-1.87.tar.gz", hash = "sha256:8456c803459b679a9712422e5a7fd9809f2f089bf69bb085f3b077946ac9bdbf", size = 19855264, upload-time = "2026-03-30T11:28:29.823Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5c/4b/00b8005c24f7c36d8bdffae3354194a2221716004e39029528be923adeae/biopython-1.87-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:e05ef5d632c319ab3ef77705c74061190d0792b07e1f2b9eee867401b2758e7e", size = 2680946, upload-time = "2026-03-30T11:38:16.872Z" },
-    { url = "https://files.pythonhosted.org/packages/6b/55/59115001469e8b3decc8362e1e6e8201acd56cafab95f4f29f4d9994fb4c/biopython-1.87-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:772539297fa16a78f38651c793f53f8c11bd18317b111982e72cf30a6e57512a", size = 3220661, upload-time = "2026-03-30T11:38:20.091Z" },
-    { url = "https://files.pythonhosted.org/packages/92/ea/dc2840df6f676d69e898792a0cd6f1217754333ec0003ad3ed5bc7c75da7/biopython-1.87-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6d221b2e08e7e89713fdbfb15c8ea6744e908d59f672cd2b6fcf9ed47910d05e", size = 3246766, upload-time = "2026-03-30T11:38:23.384Z" },
-    { url = "https://files.pythonhosted.org/packages/6d/98/e7d0e9ed7509798286d6b043fb10a078616aff7c740ad0df506551992b09/biopython-1.87-cp313-cp313-win32.whl", hash = "sha256:fab1b12f6bc4646b7f56b4c390ecff685f02b5b29e3a0c10477195bb49fe62f8", size = 2709036, upload-time = "2026-03-30T11:38:28.822Z" },
-    { url = "https://files.pythonhosted.org/packages/93/6e/50d9e4625d687696b3d44bba0d6ab41fe99eee74c97d5d6c5b00c20c03ad/biopython-1.87-cp313-cp313-win_amd64.whl", hash = "sha256:01ee30203bd4b2145cdfe2878499e549a7087f897a6f4d1ebd9de30790123140", size = 2743974, upload-time = "2026-03-30T11:38:26.38Z" },
-]
-
-[[package]]
 name = "bitsandbytes"
 version = "0.50.0"
 source = { registry = "https://pypi.org/simple" }
@@ -425,31 +409,8 @@ name = "diffusiongym"
 version = "0.1.0"
 source = { editable = "packages/diffusiongym" }
 dependencies = [
-    { name = "datasets" },
-    { name = "diffusers" },
-    { name = "flowmol" },
-    { name = "meeko" },
-    { name = "numpy" },
-    { name = "open-clip-torch" },
-    { name = "pandas" },
-    { name = "polars" },
-    { name = "prody" },
-    { name = "pyarrow" },
-    { name = "pydantic" },
-    { name = "pyg-lib" },
-    { name = "pytorch-geometric" },
-    { name = "pyyaml" },
-    { name = "rdkit" },
-    { name = "rdkit-stubs" },
-    { name = "scipy" },
     { name = "torch" },
-    { name = "torch-scatter" },
-    { name = "torch-sparse" },
-    { name = "torchdata" },
-    { name = "torchvision" },
     { name = "tqdm" },
-    { name = "transformers" },
-    { name = "typing-extensions" },
 ]
 
 [package.dev-dependencies]
@@ -459,31 +420,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "datasets", specifier = ">=5.0.0" },
-    { name = "diffusers", specifier = ">=0.39.0" },
-    { name = "flowmol", editable = "packages/FlowMol-PyG" },
-    { name = "meeko", specifier = ">=0.7.1" },
-    { name = "numpy", specifier = ">=2.4.6" },
-    { name = "open-clip-torch", specifier = ">=3.3.0" },
-    { name = "pandas", specifier = ">=3.0.5" },
-    { name = "polars", specifier = ">=1.43.1" },
-    { name = "prody", specifier = ">=2.6.1" },
-    { name = "pyarrow", specifier = ">=25.0.0" },
-    { name = "pydantic", specifier = ">=2.13.4" },
-    { name = "pyg-lib", specifier = ">=0.8.0", index = "https://data.pyg.org/whl/torch-2.12.0+cu130.html" },
-    { name = "pytorch-geometric", specifier = ">=0.0.2" },
-    { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "rdkit", specifier = ">=2026.3.4" },
-    { name = "rdkit-stubs", specifier = ">=0.8" },
-    { name = "scipy", specifier = ">=1.18.0" },
     { name = "torch", specifier = "<2.13", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torch-scatter", specifier = ">=2.1.2", index = "https://data.pyg.org/whl/torch-2.12.0+cu130.html" },
-    { name = "torch-sparse", specifier = ">=0.6.18", index = "https://data.pyg.org/whl/torch-2.12.0+cu130.html" },
-    { name = "torchdata", specifier = ">=0.11.0" },
-    { name = "torchvision", specifier = ">=0.27.1", index = "https://download.pytorch.org/whl/cu130" },
     { name = "tqdm", specifier = ">=4.70.0" },
-    { name = "transformers", specifier = ">=5.14.1" },
-    { name = "typing-extensions", specifier = ">=4.16.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -1081,15 +1019,6 @@ wheels = [
 ]
 
 [[package]]
-name = "meeko"
-version = "0.7.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/46/9d/342bc5d09ba070496738e6b7dd37e2918ea8264df3a99bb1ed8a5a464dda/meeko-0.7.1.tar.gz", hash = "sha256:e3f4ca3a66db17a95d75905fa7a1bfb73971d2f16ec52eb68e5226bafe120b2d", size = 1427070, upload-time = "2025-10-23T00:08:06.492Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cb/c8/19f80438c2f285a109a42fde50a41ec7c06d7dfd257954da8d9c4e17677d/meeko-0.7.1-py3-none-any.whl", hash = "sha256:e50f5fdb9f94f44e6ee20616936cf033be9c93c7825bd69493a9cd9a3c5dc28d", size = 293954, upload-time = "2025-10-23T00:08:05.168Z" },
-]
-
-[[package]]
 name = "mpmath"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1384,25 +1313,6 @@ wheels = [
 ]
 
 [[package]]
-name = "open-clip-torch"
-version = "3.3.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "ftfy" },
-    { name = "huggingface-hub" },
-    { name = "regex" },
-    { name = "safetensors" },
-    { name = "timm" },
-    { name = "torch" },
-    { name = "torchvision" },
-    { name = "tqdm" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/4a/1f/2bc9795047fa2c1ad2567ef78ce6dfc9a7b763fa534acee09a94da2a5b8f/open_clip_torch-3.3.0.tar.gz", hash = "sha256:904b1a9f909df8281bb3de60ab95491cd2994a509177ea4f9d6292a84fe24d6d", size = 1503380, upload-time = "2026-02-27T00:32:46.74Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/37/b5/41c315ccd94ca332ead3e832e83eee343ab245005c3e43d9d3e75eae34eb/open_clip_torch-3.3.0-py3-none-any.whl", hash = "sha256:c549ad5ed6bfc119cc11105033c0a2b9d7a2a4afeb40a58a09aab3da1a0043ce", size = 1547268, upload-time = "2026-02-27T00:32:44.902Z" },
-]
-
-[[package]]
 name = "openai-clip"
 version = "1.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1553,34 +1463,6 @@ wheels = [
 ]
 
 [[package]]
-name = "polars"
-version = "1.43.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "polars-runtime-32" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/32/79/720f4901230992f359653717e7cc3596731ed36e1a27be351d128ee0c3b7/polars-1.43.1.tar.gz", hash = "sha256:cb07ff3ad61c7b28043e6176e5fdb04a294346920b7f033deeb84116b4911883", size = 750058, upload-time = "2026-07-27T12:07:58.288Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f3/7c/d74a56d5afae8e91924aad91cba621b286a05307e88569ecab666b3055b3/polars-1.43.1-py3-none-any.whl", hash = "sha256:f6ecd9184956f46442ddfcf6185423401475bbeffea59e238de8b9ecedacf16c", size = 846844, upload-time = "2026-07-27T12:06:33.913Z" },
-]
-
-[[package]]
-name = "polars-runtime-32"
-version = "1.43.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/60/44/390c9e9eef393991d907b7067264ddaa685b550a5bab94991765459a5e64/polars_runtime_32-1.43.1.tar.gz", hash = "sha256:2931c71fce2080ade2fc743207b3d70ea659f694e0273b6bacfe551ad6ce43e0", size = 3093618, upload-time = "2026-07-27T12:07:59.492Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/72/a5/72c075ff95b31807c3cf497757bdd87f81b5b8869e60a22ec532238bac99/polars_runtime_32-1.43.1-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:ddc7bca81e3616b74eba597bff09acbe3567e5b66798cc5305adc2e91a36e31e", size = 53084414, upload-time = "2026-07-27T12:06:36.283Z" },
-    { url = "https://files.pythonhosted.org/packages/b3/8f/a34347323459116becbc3b6223bc55b25a1be705d6064decac6b7aa0c769/polars_runtime_32-1.43.1-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:3bdaeb8b017be11d7d2f8a938ae98cb4135f90de451771c2bac4d21dca2f7cf4", size = 47514709, upload-time = "2026-07-27T12:06:39.63Z" },
-    { url = "https://files.pythonhosted.org/packages/83/7e/a0a22740388facc22f2faa81787b4150231a22dad42ad02b2c6efdba0d0a/polars_runtime_32-1.43.1-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:def1c19a339903ab39f1d134a69a9e8b02feb4f800f547809fbfed458ccb135e", size = 51351657, upload-time = "2026-07-27T12:06:44.701Z" },
-    { url = "https://files.pythonhosted.org/packages/34/f1/4a07318711eeb3a27c62c916751ca45f18df6b0891d18aba68ffd9c18a76/polars_runtime_32-1.43.1-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4f323e5c4aa0f068c2c911bd01f1ecdc25c1f3a501879b29550a41ab95490965", size = 57289250, upload-time = "2026-07-27T12:06:48.173Z" },
-    { url = "https://files.pythonhosted.org/packages/26/74/c6b55dbb4db2574a9478bf1c2aa04624ea924fc44dc14b64050be462db7e/polars_runtime_32-1.43.1-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:b93d4bf59dcb0bac68ab2458890f1e8431d17369e59efc88625f0d92b22cad92", size = 51505657, upload-time = "2026-07-27T12:06:51.557Z" },
-    { url = "https://files.pythonhosted.org/packages/43/2e/12e987b0f311f20e41f904acc452824af3009579d60c878a5435ae1e9f0a/polars_runtime_32-1.43.1-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:977b4620d837f3ca0d131f858ac1bd72e2ae10a5e85a6cc27fddc71fbdb5005d", size = 55189721, upload-time = "2026-07-27T12:06:54.68Z" },
-    { url = "https://files.pythonhosted.org/packages/3a/f6/5bfba6f40a08b2b1bbe0507e9cc638ebada2dceaece45f9d87a905c57de5/polars_runtime_32-1.43.1-cp310-abi3-win_amd64.whl", hash = "sha256:fa557938e9113c12d59c56df8d7f7e1a411cc1954df0dafbb05900136c6329e7", size = 52566672, upload-time = "2026-07-27T12:06:57.725Z" },
-    { url = "https://files.pythonhosted.org/packages/f9/5e/41df901e2684e8857bdffd458c8157d237c701df9f3f922d101075f97724/polars_runtime_32-1.43.1-cp310-abi3-win_arm64.whl", hash = "sha256:cc186bad9f33b71f66ee6cc3ba2146d64315a120b0e988814d6fb1a37f0cc9e9", size = 46575356, upload-time = "2026-07-27T12:07:00.856Z" },
-]
-
-[[package]]
 name = "posebusters"
 version = "0.6.5"
 source = { registry = "https://pypi.org/simple" }
@@ -1610,18 +1492,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/25/3a/ddb78f32a0814e66b
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fb/49/bc925106abcdac498074f2cbe6137e94e09f418dd2b7775df5b577dc0313/pre_commit-4.6.1-py2.py3-none-any.whl", hash = "sha256:0e3b2942510d1fb34eec167a3ec57331bf8442122f1153a9fb8b58f5c49b2717", size = 226186, upload-time = "2026-07-21T20:56:57.064Z" },
 ]
-
-[[package]]
-name = "prody"
-version = "2.6.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "biopython" },
-    { name = "numpy" },
-    { name = "pyparsing" },
-    { name = "scipy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/09/bd/2fbeee84c1f314d9fc502c4bf434eafc83d375aa53a4a46e9574b41e665b/prody-2.6.1.tar.gz", hash = "sha256:911a8ca3ea7c5f8cd1a9c632e7d7f6e09ea1937db84d147030d08ff8c44b200b", size = 35099850, upload-time = "2025-08-19T18:18:12.444Z" }
 
 [[package]]
 name = "propcache"
@@ -1890,15 +1760,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pytorch-geometric"
-version = "0.0.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/41/bf/b79d44cc362965bf8670a6e7e5918241224edc3b409aa76ff5b783935b2f/pytorch_geometric-0.0.2.tar.gz", hash = "sha256:68cce81bf1338f93d79dd66c9e8d9b3bb7bff283d8f8009e7fa34f156a739cb0", size = 4761, upload-time = "2026-04-02T11:19:54.943Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f5/dc/7b24d31828aa2acebe6ca3fc21b780867c8ee10da7fb9280af58bf96760b/pytorch_geometric-0.0.2-py3-none-any.whl", hash = "sha256:4b030fe692e4db90e17d09137390ad4f7b994b6e46f735028071874523d1f212", size = 5289, upload-time = "2026-04-02T11:19:53.486Z" },
-]
-
-[[package]]
 name = "pytorch-lightning"
 version = "2.6.5"
 source = { registry = "https://pypi.org/simple" }
@@ -1948,15 +1809,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/cc/b4/157e9c1dd85ad8d9da1f386b6a1a819b2f39e480821e08e0d09a54d2fba4/rdkit-2026.3.4-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:19634f932126c300d0fb0e02287d9eea601f43262a8980645df16c7dd55ba1a7", size = 35868890, upload-time = "2026-07-16T10:12:57.545Z" },
     { url = "https://files.pythonhosted.org/packages/be/d9/f5ea74bc526f66f4d30da562eb76d69a56b6286aa4f775650d124cfec0f4/rdkit-2026.3.4-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:98cb809bc8e3f7168c7909670a418096830c95d5b386e4b124d1381f9730e5c1", size = 37413646, upload-time = "2026-07-16T10:13:01.489Z" },
     { url = "https://files.pythonhosted.org/packages/b1/c4/48b6935e235fb09b6e36fcd12a5c3056dac9affbc051cb994f4e67eb6531/rdkit-2026.3.4-cp313-cp313-win_amd64.whl", hash = "sha256:1f6fd3e9ee43211b9458268a0a21a5c3db7d27d2aa2eef9cb837dc4302d4426d", size = 24730115, upload-time = "2026-07-16T10:13:05.241Z" },
-]
-
-[[package]]
-name = "rdkit-stubs"
-version = "0.8"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/af/e0/67632bd3811b1d24b9eb912912321003ad7ab02b0ac93dd6c955840ec537/rdkit-stubs-0.8.tar.gz", hash = "sha256:2af5a1dcccdc85e598fda9b7f7ad3cc8bd6bc32fc55414a98d9fa69f85c12549", size = 101706, upload-time = "2024-09-19T18:43:50.549Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/0f/90088510d4758e0ee475ae1fc7f96e7bccd0e31f24107567075482b2fe9e/rdkit_stubs-0.8-py3-none-any.whl", hash = "sha256:1d58bcc604181b52713d62d5904386b1682c42b9694ddb20ceb81d3b896ccbd0", size = 186615, upload-time = "2024-09-19T18:43:49.101Z" },
 ]
 
 [[package]]
@@ -2497,19 +2349,6 @@ dependencies = [
 ]
 wheels = [
     { url = "https://data.pyg.org/whl/torch-2.12.0%2Bcu130/torch_sparse-0.6.18%2Bpt212cu130-cp313-cp313-linux_x86_64.whl" },
-]
-
-[[package]]
-name = "torchdata"
-version = "0.11.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "requests" },
-    { name = "torch" },
-    { name = "urllib3" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/95/d4/af694ef718aedbe95a72760ab9ff7a6a7a44ace2d7f70c27bfeb67c5c503/torchdata-0.11.0-py3-none-any.whl", hash = "sha256:52b940fbbe0e00fb21cabddf528449d1bec5bfb0d0823b7487b15f951658ee33", size = 61968, upload-time = "2025-02-20T22:26:30.666Z" },
 ]
 
 [[package]]

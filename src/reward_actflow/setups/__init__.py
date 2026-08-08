@@ -1,11 +1,12 @@
-from .toy import ToyProblemSetup
-from .molecules import QM9ProblemSetup, GEOMDrugsProblemSetup
-from .stable_diffusion import StableDiffusionProblemSetup
+from reward_actflow.setups.problem_setup import ProblemSetup
+from reward_actflow.setups.toy import ToyProblemSetup
 
-
-setups = {
+# `molecules.py` and `stable_diffusion.py` still target the pre-rewrite
+# diffusiongym API (`Environment`, `BaseModel`, `diffusiongym.molecules`) and do
+# not import. They are left in place, unregistered, until they are ported to
+# `ModalityProvider` the way `reward_actflow/toy/providers.py` is.
+setups: dict[str, type[ProblemSetup]] = {
     "toy": ToyProblemSetup,
-    "qm9": QM9ProblemSetup,
-    "geom_drugs": GEOMDrugsProblemSetup,
-    "stable_diffusion": StableDiffusionProblemSetup,
 }
+
+__all__ = ["ProblemSetup", "ToyProblemSetup", "setups"]

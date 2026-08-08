@@ -1,8 +1,9 @@
-from reward_actflow.uncertainty.uncertainty_estimator import UncertaintyEstimator
-from reward_actflow.uncertainty.gp import GPUncertaintyEstimator
 from reward_actflow.uncertainty.ensemble import EnsembleUncertaintyEstimator
-from reward_actflow.uncertainty.uncertainty_estimator import FlowFeatureExtractor
-
+from reward_actflow.uncertainty.gp import GPUncertaintyEstimator
+from reward_actflow.uncertainty.uncertainty_estimator import (
+    FlowFeatureExtractor,
+    UncertaintyEstimator,
+)
 
 uncertainty_estimators = {
     "gp": GPUncertaintyEstimator,
@@ -11,7 +12,7 @@ uncertainty_estimators = {
 
 
 __all__ = [
-    "UncertaintyEstimator",
     "FlowFeatureExtractor",
+    "UncertaintyEstimator",
     "uncertainty_estimators",
 ]

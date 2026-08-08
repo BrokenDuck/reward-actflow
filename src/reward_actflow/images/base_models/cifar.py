@@ -1,0 +1,50 @@
+"""Pre-trained base model for CIFAR-10."""
+
+from typing import TYPE_CHECKING, Any, cast
+
+import torch
+from diffusers.pipelines.ddpm.pipeline_ddpm import DDPMPipeline
+
+from diffusiongym import BaseModel, DDTensor, DiffusionScheduler
+from diffusiongym.registry import base_model_registry
+
+if TYPE_CHECKING:
+    from diffusers.models.unets.unet_2d import UNet2DModel
+
+
+@base_model_registry.register("images/cifar")
+class CIFARBaseModel(BaseModel[DDTensor]):
+    """Pre-trained diffusion model on CIFAR-10 32x32.
+
+    Uses the `google/ddpm-cifar10-32` model from the `diffusers` library.
+    """
+
+    output_type = "epsilon"
+
+    def __init__(self, device: torch.device | None):
+        super().__init__(device)
+
+        pipe = DDPMPipeline.from_pretrained("google/ddpm-cifar10-32").to(device)
+        self.unet: UNet2DModel = pipe.unet
+
+        pipe.scheduler.alphas_cumprod = pipe.scheduler.alphas_cumprod.to(device)
+        self._scheduler = DiffusionScheduler(pipe.scheduler.alphas_cumprod)
+
+    @property
+    def scheduler(self) -> DiffusionScheduler:
+        """Scheduler used for sampling."""
+        return self._scheduler
+
+    def sample_p0(self, n: int, **kwargs) -> tuple[DDTensor, dict[str, Any]]:
+        """Sample n datapoints from the base distribution :math:`p_0`."""
+        return DDTensor(torch.randn(n, 3, 32, 32, device=self.device)), kwargs
+
+    def postprocess(self, x: DDTensor) -> DDTensor:
+        """Convert to [0, 1]."""
+        return DDTensor(((x.data + 1) / 2).clamp(0, 1))
+
+    def forward(self, x: DDTensor, t: torch.Tensor, **kwargs) -> DDTensor:
+        r"""Forward pass, outputting :math:`\epsilon(x_t, t)`."""
+        k = self.scheduler.model_input(t)
+        output = cast("torch.Tensor", self.unet(x.data, k, **kwargs).sample)
+        return DDTensor(output)

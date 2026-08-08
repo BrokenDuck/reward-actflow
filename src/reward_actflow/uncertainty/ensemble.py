@@ -1,14 +1,18 @@
 import torch
-import torch.nn as nn
-from diffusiongym import D
+from diffusiongym.types import DDBatch
+from torch import nn
 
 from reward_actflow.uncertainty.uncertainty_estimator import UncertaintyEstimator
 
 
-class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
+class EnsembleUncertaintyEstimator[D: DDBatch](UncertaintyEstimator[D]):
     """Uncertainty estimator based on an ensemble of MLPs.
 
     This is the same setup as in ALDE (https://www.nature.com/articles/s41467-025-55987-8).
+
+    Reports the ensemble *standard deviation*, the same scale
+    `GPUncertaintyEstimator` reports, so reward knobs (beta, eta, ...) transfer
+    between the two backends.
     """
 
     def _init_estimator(self):
@@ -66,7 +70,10 @@ class EnsembleUncertaintyEstimator(UncertaintyEstimator[D]):
     def _mean_and_uncertainty(
         self, feats: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        preds = torch.stack([m(feats) for m in self.models], dim=1)
+        # Each member emits (n, 1); stacking gives (n, num_members, 1) and the
+        # trailing singleton has to go, or the reward comes out (n, 1) and
+        # broadcasts against the (n,) verifier mask into an (n, n) matrix.
+        preds = torch.stack([m(feats) for m in self.models], dim=1).squeeze(-1)
         std, mean = torch.std_mean(preds, dim=1, correction=0)
         return mean, std
 

@@ -1,0 +1,168 @@
+\documentclass[a4paper]{article}
+\usepackage[margin=2cm]{geometry}
+
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{amsfonts}
+
+\title{ActFlow-R: Minimal Algorithm}
+\author{jmaillefaud}
+\date{August 2026}
+
+% ---------------------------------------------------------------------------
+% Notation macros
+% ---------------------------------------------------------------------------
+\newcommand{\sig}{\operatorname{sig}}
+\newcommand{\lcb}{\operatorname{lcb}}
+\newcommand{\ucb}{\operatorname{ucb}}
+\newcommand{\Dbuf}{\mathcal{D}}                        % validity buffer
+\newcommand{\Ebuf}{\mathcal{E}}                        % reward buffer
+\newcommand{\Anch}{\mathcal{P}}                        % anchor pool
+\newcommand{\Xbatch}{\mathcal{X}}
+\newcommand{\UpdateFlow}{\textsc{UpdateFlow}}
+\newcommand{\algcomment}[1]{\hfill\textcolor{gray}{$\triangleright$ \small #1}}
+
+\begin{document}
+\maketitle
+
+% ===========================================================================
+\begin{algorithm}[t]
+\caption{Active Flow Expansion for Reward Discovery (\textsc{ActFlow-R})}
+\label{alg:actflow-r}
+\begin{algorithmic}[1]
+\Require Flow model $\mu_{\theta_0}$; black-box verifier $\tilde v$; black-box reward $\tilde r$;
+         representation timestep $s\in(0,1)$; explore schedule $\{\zeta_t\}$;
+         optimism $\beta^r$; tilt temperature $\eta$; anchor fraction $\lambda$;
+         batch size $B$; iterations $T$
+
+\State $\Dbuf_0\gets\emptyset$, \quad $\Ebuf_0\gets\emptyset$
+\State $\Anch\gets p_{\mathrm{data}}$ \textbf{ if available, else } $\{x^{(i)}\sim p^{\theta_0}_1\}_{i=1}^{N_{\mathrm{a}}}$
+       \algcomment{frozen anchor pool; never refreshed from $\theta_t$}
+
+\For{$t=0,1,\dots,T-1$}
+
+  \State Fit validity uncertainty $\sigma^v_t$ from $\Dbuf_t$
+         \algcomment{as in \textsc{ActFlow}}
+
+  \State Fit reward surrogate $(\mu^r_t,\sigma^r_t)$ from $\Ebuf_t$
+         \algcomment{GP over $\mathcal{Z}_{s}$; \emph{valid points only}}
+
+  \State $a_t(x)\;\gets\;\zeta_t\,\sigma^v_t\big(\phi^t_{s}(x)\big)
+         \;+\;(1-\zeta_t)\big(\mu^r_t+\beta^r\sigma^r_t\big)\big(\phi^t_{s}(x)\big)$
+         \algcomment{optimism in the acquisition}
+
+  \State Self-generate:
+         $\displaystyle \Xbatch_{t+1}\sim\tilde p_t\in
+         \arg\max_{q}\;\mathbb{E}_{x\sim q}\big[a_t(x)\big]-\beta\,\mathrm{KL}\big(q\,\|\,p^{\theta_t}_1\big)$
+
+  \State Query verifier: $y\gets\tilde v(x)$, $x\in\Xbatch_{t+1}$;\quad
+         $\Dbuf_{t+1}\gets\Dbuf_t\cup\{(x,y)\}$
+
+  \State Query reward: $u\gets\tilde r(x)$, $x\in\Xbatch^{+}_{t+1}$;\quad
+         $\Ebuf_{t+1}\gets\Ebuf_t\cup\{(x,u)\}$
+
+  \State $w(x)\gets\exp\!\big(\lcb^r_t(\phi^t_{s}(x))\,/\,\eta\big)$, \quad $x\in\Dbuf^{+}_{t+1}$
+         \algcomment{pessimism in the update}
+
+  \State $\theta_{t+1}\gets\UpdateFlow\big(\theta_t,\;\Dbuf^{+}_{t+1},\;\Anch,\;w,\;\lambda\big)$
+
+\EndFor
+
+\State \Return $\mu_{\theta_T}$
+\end{algorithmic}
+\end{algorithm}
+
+% ===========================================================================
+\begin{algorithm}[t]
+\caption{\UpdateFlow: arithmetic-mixture replay}
+\label{alg:updateflow}
+\begin{algorithmic}[1]
+\Require Parameters $\theta$; verified-valid buffer $\Dbuf^{+}$; anchor pool $\Anch$;
+         weights $w$; anchor fraction $\lambda$; batch size $n$; steps $N_{\mathrm{step}}$;
+         clip ratio $G$
+\For{$1,\dots,N_{\mathrm{step}}$}
+  \State $U_{\mathrm{a}}\gets\lambda n$ points drawn uniformly from $\Anch$
+         \algcomment{old component: fixed, so its energy shifts by a constant}
+  \State $U_{\mathrm{d}}\gets(1-\lambda)n$ points drawn from $\Dbuf^{+}$ with prob.\ $\propto w$
+         \algcomment{new component: reward-tilted}
+  \State $\bar w\gets$ clip$\big(w|_{U_{\mathrm{d}}},\,1/G,\,G\big)$, normalised to mean $1$;
+         \quad $\bar w\gets 1$ on $U_{\mathrm{a}}$
+  \State $g\gets\nabla_\theta\,\frac{1}{n}\sum_{x\in U_{\mathrm{a}}\cup U_{\mathrm{d}}}\bar w(x)\,\ell(\theta;x)$
+         \algcomment{$\ell$ = standard flow-matching loss (WDCE if discrete)}
+  \State $\theta\gets\textsc{AdamStep}(\theta,g)$
+\EndFor
+\State \Return $\theta$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{What \UpdateFlow{} implements.}
+Each minibatch is a \emph{composition of two sources} rather than a reweighting of one pool,
+so the induced target is the arithmetic mixture
+\[
+  p^{\theta_{t+1}}_1 \;\approx\; \lambda\,p_{\Anch} \;+\; (1-\lambda)\,q_t ,
+  \qquad q_t \propto w \cdot \hat p_{\Dbuf^{+}_{t+1}} ,
+\]
+in contrast to the geometric tilt $p^{\theta_t}_1 e^{r/\beta}$ targeted by RL-style
+fine-tuning, which cannot place mass outside $\mathrm{supp}(p^{\theta_t}_1)$.
+Because $\Anch$ is frozen, the energy of the pre-trained region is preserved up to the
+additive constant $\log\frac{1}{\lambda}$, while newly verified regions enter additively.
+This yields the monotonicity the recursion of Sec.~2.2 assumes but does not establish:
+$p^{\theta_{t+1}}_1\ge\lambda\,p_{\Anch}$ gives
+$\Omega^{\tau}_{\theta_0}\subseteq\Omega^{\lambda\tau}_{\theta_{t+1}}$ for all $t$.
+Setting $\lambda=0$, $w\equiv1$ recovers Alg.~1 of the base method with $\alpha_t=0$.
+
+% ===========================================================================
+\clearpage
+\appendix
+\section*{Appendix: conditional extensions}
+
+\begin{verbatim}
+Each extension below is OFF by default. Turn one on only against the stated
+observation, and ablate it in isolation.
+
+(A) SECOND (COVERAGE) HEAD
+    Symptom: valid-cluster count falls while mean reward rises.
+    Change:  maintain psi (reward-tilted) and theta (validity-only, w = 1).
+             Sample a fraction rho_t of each batch from theta.
+             Re-anchor psi <- theta at block boundaries.
+
+(B) ARCHIVE / CELL-UNIFORM REPLAY
+    Symptom: coverage plateaus early; replay visibly acquisition-biased
+             (per-cell density ratios vs. pre-trained model drift).
+    Change:  bin D+ into cells of radius r_trn in a FIXED domain descriptor
+             (Morgan / ESM / PeptideCLM -- not phi_s, which drifts).
+             Draw cells first, then a member uniformly within the cell.
+             Mass then scales with packing number, not visit count,
+             and no volume estimate is required.
+
+(C) SEPARATE REPRESENTATION TIMESTEPS
+    Symptom: reward GP fits poorly at s_v (check held-out R^2).
+    Change:  use s_r for the reward surrogate, s_v for validity.
+
+(D) REWARD LEVEL SCHEDULE + TWO-TIMESCALE GATE
+    Symptom: model concentrates on one mode instead of several.
+    Change:  w(x) <- exp((lcb^r - c_t)_+ / eta_t); raise c_t (e.g. 60th
+             percentile of E) only when max_{Omega^tau} sigma^v <= eps/(2 beta),
+             and anneal eta_t downward at the same times.
+
+(E) COST-AWARE REWARD SELECTION
+    Symptom: reward queries are the actual bottleneck (docking, assay).
+    Change:  query only k < B points per round, chosen greedily by
+             sigma^r(z)^2 / cost(x) with fantasy updates.
+
+(F) SOFT VALIDITY GATE
+    Symptom: expansion stalls at a low-validity corridor.
+    Change:  multiply a_t by pi_t(x) = sig(kappa [lcb^v(phi(x)) - h]).
+             Soft, not hard: hard filtering reproduces REC-F's coverage loss.
+
+DIAGNOSTICS TO LOG REGARDLESS
+    - valid-cluster count at TWO radii (train radius != eval radius)
+    - effective sample size of w
+    - best reward at distance > d from p_data
+    - per-cell density ratio vs. pre-trained model (motivates B)
+\end{verbatim}
+
+\end{document}

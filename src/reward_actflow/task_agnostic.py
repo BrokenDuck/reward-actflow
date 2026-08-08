@@ -1,14 +1,19 @@
-from diffusiongym import DummyReward
+"""Task-agnostic ActFlow: expand the flow model over the verifier's valid set.
 
-from reward_actflow.explore import setup_and_run, build_parser
+The reward carries no task objective beyond validity, so the surrogate is fitted
+on verifier outcomes and the acquisition is pure (validity-gated) uncertainty.
+"""
+
+from reward_actflow.explore import build_parser, setup_and_run
 
 
 def main(args):
-    setup_and_run(args, reward=DummyReward(), mean_weight=0)
+    setup_and_run(args)
 
 
 def add_extra_args(parser):
-    # Baselines
+    # Baselines. Each resolves to a reward gate in `ExploreConfig`: dropping the
+    # verifier leaves `r = sigma`, dropping the surrogate leaves `r = 1[v(x)]`.
     parser.add_argument("--no_uncertainty", action="store_true")
     parser.add_argument("--no_verifier", action="store_true")
 

@@ -17,7 +17,8 @@ import yaml
 
 from reward_actflow.setups.problem_setup import ProblemSetup
 from reward_actflow.uncertainty import UncertaintyEstimator
-from reward_actflow.utils import add_valid_border, CLIP, Batch, to_pil_images
+from reward_actflow.images.utils import CLIP, add_valid_border, to_pil_images
+from reward_actflow.utils import Batch
 
 
 class StableDiffusionProblemSetup(ProblemSetup[DDTensor]):
